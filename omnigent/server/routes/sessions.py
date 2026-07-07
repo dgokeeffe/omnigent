@@ -6068,9 +6068,9 @@ async def _validate_session_workspace(
     See ``designs/SESSION_WORKSPACE_SELECTION.md`` for the full
     semantic spec.
 
-    The caller's host ownership is checked BEFORE the ``host.stat``
-    round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
+    The caller's host access is checked BEFORE the ``host.stat``
+    round-trip the validation performs, so a caller without ``use``
+    never reaches the host (raises 403/404 via ``resolve_host_access``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.
@@ -6126,21 +6126,27 @@ async def _validate_session_workspace(
             code=ErrorCode.INTERNAL_ERROR,
         )
 
-    # Authorize host ownership FIRST — before loading the agent spec or
-    # the host.stat round-trip below. A non-owner must be rejected
-    # (403/404 via the shared resolve_host_owner) before we touch the
-    # host or even read the agent bundle (cross-user host probe). The
-    # returned host also gives the display name for error messages.
-    from omnigent.server.routes._host_launch import resolve_host_owner
+    # Authorize host access FIRST — before loading the agent spec or
+    # the host.stat round-trip below. A caller without `use` must be
+    # rejected (403/404 via the shared resolve_host_access) before we
+    # touch the host or even read the agent bundle (cross-user host
+    # probe). Browsing the host filesystem requires `use` — the same
+    # privilege as launching on it. The returned host also gives the
+    # display name for error messages.
+    from omnigent.server.routes._host_launch import resolve_host_access
 
     host_name: str | None = None
     host_store_inst = getattr(request.app.state, "host_store", None)
-    if host_store_inst is not None:
+    host_permission_store_inst = getattr(request.app.state, "host_permission_store", None)
+    permission_store_inst = getattr(request.app.state, "permission_store", None)
+    if host_store_inst is not None and host_permission_store_inst is not None:
         host = await asyncio.to_thread(
-            resolve_host_owner,
+            resolve_host_access,
             user_id=user_id,
             host_id=host_id,
             host_store=host_store_inst,
+            host_permission_store=host_permission_store_inst,
+            permission_store=permission_store_inst,
         )
         host_name = host.name
 
@@ -14231,7 +14237,12 @@ def create_sessions_router(
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
+            host_permission_store_inst = getattr(request.app.state, "host_permission_store", None)
+            if (
+                host_registry is not None
+                and host_store_inst is not None
+                and host_permission_store_inst is not None
+            ):
                 from omnigent.host.frames import (
                     HostLaunchRunnerFrame,
                     encode_host_frame,
@@ -14248,6 +14259,7 @@ def create_sessions_router(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
+                    host_permission_store=host_permission_store_inst,
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)

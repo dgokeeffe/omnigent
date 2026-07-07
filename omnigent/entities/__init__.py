@@ -25,7 +25,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.file import StoredFile
 from omnigent.entities.pagination import PagedList
-from omnigent.entities.permission import ResolvedAccess, SessionPermission
+from omnigent.entities.permission import HostPermission, ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -49,6 +49,7 @@ __all__ = [
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "HostPermission",
     "ItemData",
     "LoadedAgent",
     "MessageData",

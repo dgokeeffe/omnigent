@@ -148,6 +148,9 @@ try:
         SqlAlchemyConversationStore,
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
@@ -212,6 +215,7 @@ try:
         permission_store=permission_store,
         policy_store=policy_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(DB_URI),
         auth_provider=auth_provider,
     )
 

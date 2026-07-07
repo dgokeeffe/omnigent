@@ -20,6 +20,7 @@ from omnigent.server import app as server_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 
 
 @pytest.mark.asyncio
@@ -156,6 +157,7 @@ def _build_liveness_app(
         conversation_store=conversation_store,
         artifact_store=artifact_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         agent_cache=AgentCache(
             artifact_store=artifact_store,
             cache_dir=tmp_path / "cache",
@@ -450,6 +452,7 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
         conversation_store=conversation_store,
         artifact_store=artifact_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         agent_cache=AgentCache(
             artifact_store=artifact_store,
             cache_dir=tmp_path / "cache",
@@ -1013,6 +1016,7 @@ def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyP
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
     )
 

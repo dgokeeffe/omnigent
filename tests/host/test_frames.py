@@ -986,3 +986,16 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+def test_shutdown_frame_round_trip() -> None:
+    """host.shutdown encodes and decodes with its optional reason."""
+    from omnigent.host.frames import HostShutdownFrame
+
+    decoded = decode_host_frame(encode_host_frame(HostShutdownFrame(reason="shut down by admin")))
+    assert isinstance(decoded, HostShutdownFrame)
+    assert decoded.reason == "shut down by admin"
+
+    bare = decode_host_frame(encode_host_frame(HostShutdownFrame()))
+    assert isinstance(bare, HostShutdownFrame)
+    assert bare.reason is None

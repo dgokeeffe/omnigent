@@ -26,7 +26,7 @@ import {
   normalizeWorkspacePath,
   sessionsSharingDirectory,
 } from "./NewChatDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { canLaunchOnHost, isSharedHost, useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -46,6 +46,24 @@ function HostLabel({ host }: { host: Host }) {
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
       <span className="font-mono text-xs">{host.name}</span>
+      {isSharedHost(host) && (
+        <span
+          className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+          data-testid="host-shared-badge"
+          title={`Shared by ${host.owner}`}
+        >
+          Shared
+        </span>
+      )}
+      {!canLaunchOnHost(host) && (
+        <span
+          className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+          data-testid="host-view-only-badge"
+          title="View-only access — you cannot launch on this host"
+        >
+          View only
+        </span>
+      )}
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -303,6 +321,9 @@ export function ResumeWithDirectoryDialog({
                     <SelectItem
                       key={host.host_id}
                       value={host.host_id}
+                      // View-only shared hosts are visible but not launch
+                      // targets — a launch needs `use`.
+                      disabled={!canLaunchOnHost(host)}
                       data-testid={`resume-dir-host-option-${host.host_id}`}
                     >
                       <HostLabel host={host} />

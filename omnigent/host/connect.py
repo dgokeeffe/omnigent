@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostShutdownFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -478,6 +479,16 @@ class HostConnectError(Exception):
 
     The message is the full, user-facing explanation including the
     suggested fix; it is printed verbatim by :func:`run_host_process`.
+    """
+
+
+class HostShutdownRequested(Exception):
+    """The server ordered this host to shut down (``host.shutdown``).
+
+    Raised out of the frame dispatch so the reconnect loop in
+    :meth:`HostProcess.run` exits cleanly instead of treating the
+    ensuing disconnect as transient and reconnecting. The message is
+    the server-provided reason, if any.
     """
 
 
@@ -1621,6 +1632,12 @@ class HostProcess:
                     backoff = _RECONNECT_BASE_S
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     break
+                except HostShutdownRequested as exc:
+                    # Server-ordered stop: exit the loop instead of
+                    # reconnecting — that's the whole difference between
+                    # a shutdown and an ordinary tunnel drop.
+                    print(f"Host shut down by server: {exc}", flush=True)
+                    break
                 except HostConnectError:
                     # Permanent failure (auth / authorization / outdated
                     # server). Do NOT back off and retry — propagate so
@@ -1933,6 +1950,15 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostShutdownFrame):
+            # Server-ordered shutdown (owner/admin action). Terminate the
+            # runners here so they die even if process teardown is
+            # interrupted, then raise the control signal — run()'s finally
+            # re-runs cleanup, which is a no-op on the emptied map.
+            reason = frame.reason or "shut down by server request"
+            _logger.info("Received host.shutdown: %s", reason)
+            self._cleanup_runners()
+            raise HostShutdownRequested(reason)
 
 
 def run_host_process(

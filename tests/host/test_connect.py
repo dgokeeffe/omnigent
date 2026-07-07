@@ -2364,3 +2364,27 @@ def test_run_host_process_announces_session_log_dir_on_start(
 
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+
+
+async def test_dispatch_shutdown_terminates_runners_and_raises(tmp_path: Path) -> None:
+    """
+    Verify a host.shutdown frame terminates every tracked runner and
+    raises HostShutdownRequested so the reconnect loop exits instead
+    of treating the disconnect as transient.
+    """
+    from omnigent.host.connect import HostShutdownRequested
+    from omnigent.host.frames import HostShutdownFrame
+
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host._runners["runner_shut"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-s.log")
+
+    with pytest.raises(HostShutdownRequested, match="maintenance"):
+        await host._dispatch_host_frame(object(), HostShutdownFrame(reason="maintenance"))
+
+    assert proc.poll() is not None, "Runner must be terminated on shutdown"
+    assert host._runners == {}

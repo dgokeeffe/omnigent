@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
 
@@ -41,5 +41,39 @@ export function useAdminHosts(options: { enabled?: boolean } = {}) {
     enabled,
     staleTime: 10_000,
     refetchInterval: enabled ? 10_000 : false,
+  });
+}
+
+async function shutdownHost(hostId: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/shutdown`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    // Surface the server's detail (e.g. "host is offline") — it's the
+    // actionable part of a 4xx here.
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status line.
+    }
+    throw new Error(detail);
+  }
+}
+
+/**
+ * Shut a host down (owner-or-admin; the server enforces). On success
+ * the host daemon exits and the disconnect path marks it offline, so
+ * the fleet list is invalidated to pick the flip up on its next fetch.
+ */
+export function useShutdownHost() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: shutdownHost,
+    onSuccess: () => {
+      // Prefix-matches both the fleet view and the pickers' queries.
+      void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+    },
   });
 }

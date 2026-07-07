@@ -6,7 +6,7 @@
 // The server-side contract (?all=true admin gating, fleet fields) is
 // pinned by tests/server/integration/test_hosts_api.py.
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HostsPage } from "./HostsPage";
 import type { AdminHost } from "@/hooks/useAdminHosts";
@@ -14,7 +14,10 @@ import * as adminHosts from "@/hooks/useAdminHosts";
 import * as isAdminHook from "@/hooks/useIsAdmin";
 
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: vi.fn() }));
-vi.mock("@/hooks/useAdminHosts", () => ({ useAdminHosts: vi.fn() }));
+vi.mock("@/hooks/useAdminHosts", () => ({
+  useAdminHosts: vi.fn(),
+  useShutdownHost: vi.fn(),
+}));
 
 function host(overrides: Partial<AdminHost> = {}): AdminHost {
   return {
@@ -31,6 +34,8 @@ function host(overrides: Partial<AdminHost> = {}): AdminHost {
   };
 }
 
+const shutdownMutate = vi.fn();
+
 function mockQuery(result: { data?: AdminHost[]; error?: Error | null; isLoading?: boolean }) {
   vi.mocked(adminHosts.useAdminHosts).mockReturnValue({
     data: result.data,
@@ -38,6 +43,10 @@ function mockQuery(result: { data?: AdminHost[]; error?: Error | null; isLoading
     isLoading: result.isLoading ?? false,
     refetch: vi.fn(),
   } as unknown as ReturnType<typeof adminHosts.useAdminHosts>);
+  vi.mocked(adminHosts.useShutdownHost).mockReturnValue({
+    mutateAsync: shutdownMutate,
+    isPending: false,
+  } as unknown as ReturnType<typeof adminHosts.useShutdownHost>);
 }
 
 afterEach(() => {
@@ -97,5 +106,37 @@ describe("HostsPage table", () => {
     mockQuery({ data: undefined, error: new Error("403 Forbidden") });
     render(<HostsPage />);
     expect(screen.getByRole("alert")).toHaveTextContent("Could not load hosts.");
+  });
+});
+
+describe("HostsPage shutdown", () => {
+  it("shuts a host down only after the confirm dialog", async () => {
+    vi.mocked(isAdminHook.useIsAdmin).mockReturnValue(true);
+    mockQuery({ data: [host()] });
+    shutdownMutate.mockResolvedValue(undefined);
+    render(<HostsPage />);
+
+    fireEvent.click(screen.getByRole("button", { name: /shut down/i }));
+    // Dialog open, nothing sent yet — and the bound-session warning shows.
+    expect(shutdownMutate).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(/3 sessions are bound/)).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Shut down" }));
+    await waitFor(() => expect(shutdownMutate).toHaveBeenCalledWith("host_abc123"));
+  });
+
+  it("disables the shutdown action for offline and managed-sandbox hosts", () => {
+    vi.mocked(isAdminHook.useIsAdmin).mockReturnValue(true);
+    mockQuery({
+      data: [
+        host({ host_id: "host_off", name: "off-box", status: "offline" }),
+        host({ host_id: "host_sbx", name: "sbx-box", sandbox_provider: "modal" }),
+      ],
+    });
+    render(<HostsPage />);
+    const buttons = screen.getAllByRole("button", { name: /shut down/i });
+    expect(buttons).toHaveLength(2);
+    for (const b of buttons) expect(b).toBeDisabled();
   });
 });

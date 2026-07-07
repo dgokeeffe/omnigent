@@ -25,7 +25,12 @@ vi.mock("./WorkspacePicker", () => ({
   WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   isNavigablePath: () => false,
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  // Keep the real pure helpers (canLaunchOnHost / isSharedHost) — only
+  // the data hook is stubbed.
+  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  useHosts: vi.fn(),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),

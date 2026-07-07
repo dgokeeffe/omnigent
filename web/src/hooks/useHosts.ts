@@ -19,6 +19,38 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  /**
+   * Whether the current user owns this host. A shared host returned by
+   * `/v1/hosts` (granted, not owned) is `false`. Optional/absent on
+   * older servers — treat absent as "unknown ownership", which the UI
+   * renders the same as owned (no "Shared" badge) for back-compat.
+   */
+  owned_by_current_user?: boolean;
+  /**
+   * The current user's effective access on this host: `"view"`,
+   * `"use"`, `"manage"`, or `"owner"`. Absent on older servers. A
+   * `"view"`-only host is visible but not a valid launch target (a
+   * launch needs `use`).
+   */
+  permission_level?: "view" | "use" | "manage" | "owner" | null;
+}
+
+/**
+ * Whether a host can be launched on (a runner spawned / workspace
+ * browsed). Owner/use/manage can; a `view`-only shared host cannot.
+ * Absent `permission_level` (older server) is treated as launchable so
+ * the picker keeps working against servers without host sharing.
+ */
+export function canLaunchOnHost(host: Host): boolean {
+  return host.permission_level !== "view";
+}
+
+/**
+ * Whether a host is shared with the current user (not owned by them).
+ * Absent `owned_by_current_user` (older server) is treated as owned.
+ */
+export function isSharedHost(host: Host): boolean {
+  return host.owned_by_current_user === false;
 }
 
 interface HostsResponse {

@@ -21,7 +21,12 @@ vi.mock("react-router-dom", async (importOriginal) => {
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  // Keep the real pure helpers (canLaunchOnHost / isSharedHost) — only
+  // the data hook is stubbed.
+  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  useHosts: vi.fn(),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));

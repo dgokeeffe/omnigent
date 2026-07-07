@@ -41,7 +41,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/identity")>()),
   authenticatedFetch: vi.fn(),
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  // Keep the real pure helpers (canLaunchOnHost / isSharedHost) — only
+  // the data hook is stubbed.
+  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  useHosts: vi.fn(),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),

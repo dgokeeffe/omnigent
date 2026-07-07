@@ -432,6 +432,11 @@ def create_hosts_router(
             if not await asyncio.to_thread(_is_admin_caller, user_id):
                 raise HTTPException(status_code=403, detail="admin privileges required")
             hosts = await asyncio.to_thread(host_store.list_all_hosts)
+            # Enumerating every owner's hosts (owner emails, names, load)
+            # is a security-relevant read, not just a mutation — audit it
+            # so an admin sweeping the fleet leaves a trail. Target is the
+            # fleet itself; count lets a reviewer size the disclosure.
+            audit_event("host.fleet.list", actor=user_id, target="*", host_count=len(hosts))
         else:
             hosts = await asyncio.to_thread(host_store.list_hosts_for, viewer)
 

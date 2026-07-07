@@ -37,6 +37,7 @@ from omnigent.host.frames import (
 )
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
@@ -294,6 +295,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    admin_list: AdminList | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -308,6 +310,10 @@ def create_hosts_router(
     :param permission_store: Session permission store, used to verify
         the caller owns the session a runner is launched for. ``None``
         disables the session-owner check (single-user/local).
+    :param admin_list: File/config admin roster, unioned with the
+        ``users.is_admin`` flag for the admin fleet view — the same
+        union ``/v1/me`` reports, so the UI's admin chrome and this
+        gate never disagree. ``None`` checks the DB flag only.
     :param agent_store: Agent store used to resolve a session's agent
         for workspace-boundary validation on runner launch (W6). When
         ``None`` (non-production wiring), the boundary check is skipped;
@@ -318,24 +324,79 @@ def create_hosts_router(
     """
     router = APIRouter()
 
+    def _is_admin_caller(user_id: str | None) -> bool:
+        """Whether the caller may use admin-scoped host reads/actions.
+
+        Mirrors ``/v1/me``'s admin computation — the DB ``users.is_admin``
+        flag unioned with the admin-list file/config roster — so the gate
+        here never under-reports relative to the admin chrome the SPA
+        shows. Single-user mode (no permission store) is always allowed:
+        every host on such a server belongs to the sole local user.
+
+        :param user_id: The authenticated caller, or ``None`` when auth
+            is disabled (single-user).
+        :returns: ``True`` when admin-scoped access is allowed.
+        """
+        if permission_store is None:
+            return True
+        if user_id is None:
+            return False
+        if permission_store.is_admin(user_id):
+            return True
+        return admin_list is not None and admin_list.is_admin(user_id)
+
     @router.get("/hosts")
-    async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_hosts(
+        request: Request,
+        all: bool = Query(default=False),
+    ) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
 
         Returns both online and offline hosts, with live runner
         information for online hosts.
 
+        With ``?all=true`` (admin only) the owner filter is dropped and
+        every registered host is returned, each with the extra fleet
+        fields ``created_at``, ``last_seen``, and ``session_count`` —
+        the admin Hosts page's data source.
+
         :param request: The incoming request (for auth).
+        :param all: When ``True``, return every host across all owners
+            (requires admin).
         :returns: ``{"hosts": [...]}`` with host details.
+        :raises HTTPException: 401 unauthenticated; 403 when ``all=true``
+            and the caller is not an admin.
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
         # server's hosts are owned by the reserved "local" user.
         user_id = require_user(request, auth_provider)
-        if user_id is None:
+        if all:
+            # Fail closed: the unfiltered fleet view exposes every
+            # owner's hosts, so a non-admin gets 403 rather than a
+            # silently owner-filtered response they might mistake for
+            # the full fleet.
+            if not await asyncio.to_thread(_is_admin_caller, user_id):
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            hosts = await asyncio.to_thread(host_store.list_all_hosts)
+        elif user_id is None:
             hosts = await asyncio.to_thread(host_store.list_hosts, "local")
         else:
             hosts = await asyncio.to_thread(host_store.list_hosts, user_id)
+
+        # Sessions bound per host — the "what would a shutdown affect"
+        # signal on the admin page. Only computed for the fleet view;
+        # the picker payload stays unchanged (additive/opt-in).
+        session_counts: dict[str, int] = {}
+        if all:
+
+            def _count_sessions() -> dict[str, int]:
+                return {
+                    h.host_id: len(conversation_store.list_conversations_by_host_id(h.host_id))
+                    for h in hosts
+                }
+
+            session_counts = await asyncio.to_thread(_count_sessions)
 
         # One clock for the whole batch so every host is classified
         # against a consistent "now" (host_is_live's documented idiom).
@@ -351,21 +412,26 @@ def create_hosts_router(
             # A stored "online" is only trusted if the host was seen
             # recently: a crashed host never runs set_offline and would
             # otherwise show as online forever in the picker.
-            result.append(
-                {
-                    "host_id": host.host_id,
-                    "name": host.name,
-                    "owner": host.owner,
-                    "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
-                    "sandbox_provider": host.sandbox_provider,
-                    "configured_harnesses": host.configured_harnesses,
-                }
-            )
+            entry: dict[str, Any] = {
+                "host_id": host.host_id,
+                "name": host.name,
+                "owner": host.owner,
+                "status": "online" if host_is_live(host, now=now) else "offline",
+                # Non-None marks a server-managed sandbox host (e.g.
+                # "modal"). Clients use it to hide sandbox-backed
+                # hosts from manual host pickers — they are launch
+                # targets the server creates on demand, not
+                # user-connectable machines.
+                "sandbox_provider": host.sandbox_provider,
+                "configured_harnesses": host.configured_harnesses,
+            }
+            if all:
+                # updated_at doubles as last-seen: written on connect,
+                # disconnect, and every tunnel heartbeat tick.
+                entry["created_at"] = host.created_at
+                entry["last_seen"] = host.updated_at
+                entry["session_count"] = session_counts.get(host.host_id, 0)
+            result.append(entry)
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")

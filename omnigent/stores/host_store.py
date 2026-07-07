@@ -593,6 +593,21 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_all_hosts(self) -> list[Host]:
+        """
+        List every registered host across all owners.
+
+        Backs the admin fleet view (``GET /v1/hosts?all=true``) — the
+        caller is responsible for admin-gating; this read has no
+        authorization of its own. Ordered like :meth:`list_hosts`
+        (``updated_at`` descending, most recently active first).
+
+        :returns: List of :class:`Host` entities for every owner.
+        """
+        with self._session() as session:
+            rows = session.query(SqlHost).order_by(SqlHost.updated_at.desc()).all()
+            return [_row_to_host(row) for row in rows]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.

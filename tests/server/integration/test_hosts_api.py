@@ -1243,3 +1243,90 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+# ── Admin fleet view (?all=true) ────────────────────────
+
+
+async def test_list_all_hosts_admin_sees_every_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify GET /v1/hosts?all=true returns every owner's hosts to an
+    admin, with the fleet-only fields (created_at, last_seen,
+    session_count) present.
+    """
+    app, _reg, host_store, conv_store = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_a", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_b", "bob-laptop", "bob@test.com")
+    # Two sessions bound to alice's host so session_count has signal.
+    for _ in range(2):
+        conv = conv_store.create_conversation(agent_id=None)
+        conv_store.set_host_id(conv.id, "host_fleet_a", "/tmp/ws")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            params={"all": "true"},
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+    hosts = {h["host_id"]: h for h in resp.json()["hosts"]}
+    assert {"host_fleet_a", "host_fleet_b"} <= set(hosts), (
+        f"Admin should see every owner's hosts, got {set(hosts)}."
+    )
+    fleet_a = hosts["host_fleet_a"]
+    assert fleet_a["owner"] == "alice@test.com"
+    assert fleet_a["session_count"] == 2
+    assert isinstance(fleet_a["created_at"], int)
+    assert isinstance(fleet_a["last_seen"], int)
+
+
+async def test_list_all_hosts_403_non_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify GET /v1/hosts?all=true fails closed (403) for a non-admin —
+    NOT a silently owner-filtered 200 they could mistake for the fleet.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_fleet_c", "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            params={"all": "true"},
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403, (
+        f"Expected 403 for non-admin ?all=true, got {resp.status_code}. "
+        "The admin fleet view must fail closed."
+    )
+
+
+async def test_list_all_hosts_plain_list_unchanged_for_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the default (no ?all) listing stays owner-scoped even for
+    an admin, and carries none of the fleet-only fields — the picker
+    payload is unchanged by the admin feature (additive/opt-in).
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_d", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_e", "admin-laptop", "admin@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            "/v1/hosts",
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+    hosts = resp.json()["hosts"]
+    assert {h["host_id"] for h in hosts} == {"host_fleet_e"}
+    assert "session_count" not in hosts[0]
+    assert "last_seen" not in hosts[0]

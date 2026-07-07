@@ -2253,6 +2253,9 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                # Same roster /v1/me consults, so the admin fleet view
+                # authorizes exactly the users the SPA shows it to.
+                admin_list=admin_list,
             ),
             prefix="/v1",
             tags=["hosts"],

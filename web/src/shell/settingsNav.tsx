@@ -14,6 +14,7 @@ import {
   KeyboardIcon,
   PaletteIcon,
   PanelRightOpenIcon,
+  ServerIcon,
   ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
@@ -34,6 +35,7 @@ export type SettingsSectionId =
   | "account"
   | "members"
   | "policies"
+  | "hosts"
   | "archived"
   | "cli";
 
@@ -44,6 +46,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "account",
   "members",
   "policies",
+  "hosts",
   "archived",
   "cli",
 ];
@@ -108,6 +111,7 @@ export function settingsNavGroups(
       items: [
         { id: "members", label: "Members", icon: UsersIcon },
         { id: "policies", label: "Policies", icon: ShieldCheckIcon },
+        { id: "hosts", label: "Hosts", icon: ServerIcon },
       ],
     });
   }

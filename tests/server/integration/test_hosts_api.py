@@ -684,6 +684,26 @@ def multi_user_app(
     # Stash the stores so tests can set up session and host grants.
     app.state.permission_store = permission_store
     app.state.host_permission_store = host_permission_store
+
+    # Same OmnigentError → JSON handler create_app installs, so auth
+    # failures (require_user raises OmnigentError, not HTTPException)
+    # surface as 401 responses instead of raising through the client.
+    from omnigent.errors import OmnigentError
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(request: object, exc: OmnigentError) -> JSONResponse:
+        """Convert OmnigentError to the production JSON error shape.
+
+        :param request: The incoming request (unused).
+        :param exc: The application error raised by the route.
+        :returns: The same JSON body create_app's handler produces.
+        """
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     app.include_router(
         # local_single_user=False: this fixture models a deployed
         # multi-user server, so host_id re-own must be refused (the
@@ -1704,3 +1724,103 @@ async def test_private_hosts_stay_private_with_no_grants(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts", headers={"x-test-user": "alice@test.com"})
         assert {h["host_id"] for h in resp.json()["hosts"]} == {"host_alice"}
+
+
+# ── M6 hardening: unauthenticated fail-closed + audit trail ─────────
+
+
+async def test_new_endpoints_401_unauthenticated(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Every new endpoint fails closed with 401 when the caller presents
+    no identity at all (auth provider configured, header absent) — an
+    anonymous caller must never fall through to the single-user path.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_a", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_hard_a", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for method, url, kwargs in [
+            ("GET", "/v1/hosts?all=true", {}),
+            ("POST", "/v1/hosts/host_hard_a/shutdown", {}),
+            ("GET", "/v1/hosts/host_hard_a/permissions", {}),
+            ("PUT", "/v1/hosts/host_hard_a/permissions/bob@test.com", {"json": {"level": "use"}}),
+            ("DELETE", "/v1/hosts/host_hard_a/permissions/bob@test.com", {}),
+        ]:
+            resp = await client.request(method, url, **kwargs)
+            assert resp.status_code == 401, (
+                f"{method} {url} must 401 for an unauthenticated caller, got {resp.status_code}"
+            )
+
+
+async def test_stranger_cannot_read_grant_list(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    GET /v1/hosts/{id}/permissions fails closed (403) for a caller with
+    no manage-level access — the grant list names principals and must
+    not be enumerable by a mere `use` grantee or a stranger.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_b", "alice-laptop", "alice@test.com")
+    _grant_host(app, "user@test.com", "host_hard_b", 2)  # use, not manage
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for caller in ("stranger@test.com", "user@test.com"):
+            resp = await client.get(
+                "/v1/hosts/host_hard_b/permissions",
+                headers={"x-test-user": caller},
+            )
+            assert resp.status_code == 403, f"{caller} must not read the grant list"
+
+
+async def test_audit_trail_for_shutdown_grant_revoke(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Shutdown, grant, and revoke each emit an omnigent.audit entry
+    carrying actor + target (C-N3), so an operator can reconstruct who
+    did what from the server log alone.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_hard_c", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_hard_c", "alice@test.com")
+
+    with caplog.at_level("INFO", logger="omnigent.audit"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.put(
+                "/v1/hosts/host_hard_c/permissions/bob@test.com",
+                json={"level": "use"},
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.delete(
+                "/v1/hosts/host_hard_c/permissions/bob@test.com",
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.post(
+                "/v1/hosts/host_hard_c/shutdown",
+                headers={"x-test-user": "alice@test.com"},
+            )
+
+    entries = [
+        _json.loads(r.message.removeprefix("audit: "))
+        for r in caplog.records
+        if r.name == "omnigent.audit"
+    ]
+    by_action = {e["action"]: e for e in entries}
+    assert set(by_action) == {
+        "host.permission.grant",
+        "host.permission.revoke",
+        "host.shutdown",
+    }
+    for entry in entries:
+        assert entry["actor"] == "alice@test.com"
+        assert entry["target"] == "host_hard_c"
+    assert by_action["host.permission.grant"]["principal"] == "bob@test.com"
+    assert by_action["host.permission.grant"]["level"] == "use"
+    assert by_action["host.permission.revoke"]["principal"] == "bob@test.com"

@@ -205,6 +205,11 @@ try:
     # provider always wins over the enable switch).
     os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
     auth_provider = create_auth_provider()
+    # Declarative admin roster: identities here are promoted to
+    # users.is_admin on their next login (additive, never demotes) —
+    # the same `admins:` knob the OSS server config exposes. Set per
+    # deploy via `deploy.py --admins ...` → the OMNIGENT_ADMINS env var.
+    admins = [a.strip() for a in os.environ.get("OMNIGENT_ADMINS", "").split(",") if a.strip()]
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -217,6 +222,7 @@ try:
         host_store=host_store,
         host_permission_store=SqlAlchemyHostPermissionStore(DB_URI),
         auth_provider=auth_provider,
+        admins=admins,
     )
 
     if __name__ == "__main__":

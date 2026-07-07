@@ -1257,6 +1257,12 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
+        # Admin first, via the same roster union every other admin gate
+        # on this router uses (_is_admin_caller). check_host_access's own
+        # admin bypass reads only the DB flag, which the admin-list file
+        # can't flip in header mode (no login event runs the promotion).
+        if await asyncio.to_thread(_is_admin_caller, user_id):
+            return user_id
         if not await asyncio.to_thread(
             check_host_access,
             user_id,

@@ -13,7 +13,8 @@
  */
 
 import { useState } from "react";
-import { PowerIcon, RefreshCwIcon } from "lucide-react";
+import { PowerIcon, RefreshCwIcon, Share2Icon } from "lucide-react";
+import { HostSharesDialog } from "@/components/HostSharesDialog";
 import { PageScroll } from "@/components/PageScroll";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,7 @@ export function HostsPage() {
   const { data: hosts, error, isLoading, refetch } = useAdminHosts({ enabled: isAdmin });
   const shutdown = useShutdownHost();
   const [shutdownCandidate, setShutdownCandidate] = useState<AdminHost | null>(null);
+  const [sharesTarget, setSharesTarget] = useState<AdminHost | null>(null);
 
   async function onConfirmShutdown() {
     if (shutdownCandidate === null) return;
@@ -102,7 +104,12 @@ export function HostsPage() {
             </thead>
             <tbody>
               {hosts.map((h) => (
-                <HostRow key={h.host_id} host={h} onShutdown={() => setShutdownCandidate(h)} />
+                <HostRow
+                  key={h.host_id}
+                  host={h}
+                  onShutdown={() => setShutdownCandidate(h)}
+                  onManageShares={() => setSharesTarget(h)}
+                />
               ))}
             </tbody>
           </table>
@@ -118,6 +125,18 @@ export function HostsPage() {
           <RefreshCwIcon /> Refresh
         </Button>
       </div>
+
+      {/* ── Share management ─────────────────────────────────── */}
+      {sharesTarget !== null && (
+        <HostSharesDialog
+          hostId={sharesTarget.host_id}
+          hostName={sharesTarget.name}
+          open
+          onOpenChange={(open) => {
+            if (!open) setSharesTarget(null);
+          }}
+        />
+      )}
 
       {/* ── Shutdown confirmation ────────────────────────────── */}
       <Dialog
@@ -165,7 +184,15 @@ export function HostsPage() {
   );
 }
 
-function HostRow({ host, onShutdown }: { host: AdminHost; onShutdown: () => void }) {
+function HostRow({
+  host,
+  onShutdown,
+  onManageShares,
+}: {
+  host: AdminHost;
+  onShutdown: () => void;
+  onManageShares: () => void;
+}) {
   const online = host.status === "online";
   return (
     <tr className="border-t border-border">
@@ -198,6 +225,19 @@ function HostRow({ host, onShutdown }: { host: AdminHost; onShutdown: () => void
         {formatEpoch(host.last_seen)}
       </td>
       <td className="px-3 py-2 text-right align-middle">
+        <Button
+          variant="ghost"
+          size="xs"
+          title={
+            host.sandbox_provider
+              ? "Managed sandbox hosts cannot be shared"
+              : "Manage who can use this host"
+          }
+          onClick={onManageShares}
+          disabled={Boolean(host.sandbox_provider)}
+        >
+          <Share2Icon /> Shares
+        </Button>
         {/* Offline hosts have no tunnel to signal; managed sandbox hosts
             are torn down by the server's own lifecycle, not this action. */}
         <Button

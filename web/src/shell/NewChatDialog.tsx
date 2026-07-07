@@ -80,7 +80,7 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { canLaunchOnHost, isSharedHost, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -289,6 +289,24 @@ function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
           <span className="truncate text-xs">{host.name}</span>
+          {isSharedHost(host) && (
+            <span
+              className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+              data-testid="host-shared-badge"
+              title={`Shared by ${host.owner}`}
+            >
+              Shared
+            </span>
+          )}
+          {!canLaunchOnHost(host) && (
+            <span
+              className="shrink-0 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"
+              data-testid="host-view-only-badge"
+              title="View-only access — you cannot launch on this host"
+            >
+              View only
+            </span>
+          )}
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -3238,20 +3256,26 @@ export function NewChatLandingScreen() {
                       No hosts connected yet.
                     </div>
                   )}
-                  {onlineHosts.map((host) => (
-                    <DropdownMenuItem
-                      key={host.host_id}
-                      onSelect={() => selectHost(host.host_id)}
-                      data-testid={`new-chat-landing-host-${host.host_id}`}
-                      data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-xs data-[active=true]:bg-accent/60"
-                    >
-                      <HostOption
-                        host={host}
-                        subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
-                      />
-                    </DropdownMenuItem>
-                  ))}
+                  {onlineHosts.map((host) => {
+                    // View-only shared hosts are visible but not launch
+                    // targets — browsing/launching needs `use`.
+                    const launchable = canLaunchOnHost(host);
+                    return (
+                      <DropdownMenuItem
+                        key={host.host_id}
+                        disabled={!launchable}
+                        onSelect={launchable ? () => selectHost(host.host_id) : undefined}
+                        data-testid={`new-chat-landing-host-${host.host_id}`}
+                        data-active={host.host_id === selectedHostId ? "true" : undefined}
+                        className="text-xs data-[active=true]:bg-accent/60"
+                      >
+                        <HostOption
+                          host={host}
+                          subtitle={host.host_id === thisMachineHostId ? "this machine" : undefined}
+                        />
+                      </DropdownMenuItem>
+                    );
+                  })}
                   {offlineHosts.map((host) => {
                     // This machine, offline: make the row itself the connect
                     // affordance instead of a disabled entry + a duplicate "Run

@@ -1824,3 +1824,44 @@ async def test_audit_trail_for_shutdown_grant_revoke(
     assert by_action["host.permission.grant"]["principal"] == "bob@test.com"
     assert by_action["host.permission.grant"]["level"] == "use"
     assert by_action["host.permission.revoke"]["principal"] == "bob@test.com"
+
+
+async def test_audit_trail_for_fleet_view(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The admin fleet enumeration (?all=true) is a security-relevant read
+    across every owner, so it emits an omnigent.audit entry with the
+    actor and a host count — an owner-scoped listing does NOT.
+    """
+    import json as _json
+
+    app, _reg, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_fleet_audit_a", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect("host_fleet_audit_b", "bob-laptop", "bob@test.com")
+
+    with caplog.at_level("INFO", logger="omnigent.audit"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Owner-scoped read: no audit.
+            await client.get("/v1/hosts", headers={"x-test-user": "alice@test.com"})
+            # Fleet read: audited.
+            await client.get(
+                "/v1/hosts",
+                params={"all": "true"},
+                headers={"x-test-user": "admin@test.com"},
+            )
+
+    entries = [
+        _json.loads(r.message.removeprefix("audit: "))
+        for r in caplog.records
+        if r.name == "omnigent.audit"
+    ]
+    fleet_entries = [e for e in entries if e["action"] == "host.fleet.list"]
+    assert len(fleet_entries) == 1, (
+        f"expected exactly one fleet-list audit entry, got {[e['action'] for e in entries]}"
+    )
+    assert fleet_entries[0]["actor"] == "admin@test.com"
+    assert fleet_entries[0]["host_count"] >= 2

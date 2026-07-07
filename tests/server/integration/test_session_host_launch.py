@@ -48,6 +48,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import SqlAlchemyHostPermissionStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 
@@ -115,6 +116,7 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
 
 
@@ -1281,6 +1283,7 @@ async def test_health_reports_online_for_host_on_other_replica(
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
     assert app_b.state.host_registry.get(_HOST_ID) is None, (
         "test setup is broken: replica B's host registry should be empty."

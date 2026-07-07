@@ -33,11 +33,13 @@ from omnigent.host.frames import (
     HostCreateDirFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostShutdownFrame,
     encode_host_frame,
 )
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.admin_list import AdminList
+from omnigent.server.audit import audit_event
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
@@ -747,6 +749,69 @@ def create_hosts_router(
             "runner_id": runner_id,
             "status": "launching",
         }
+
+    @router.post("/hosts/{host_id}/shutdown")
+    async def shutdown_host(request: Request, host_id: str) -> dict[str, str]:
+        """Shut down a host: terminate its runners and exit the daemon.
+
+        Owner-or-admin gated. Sends ``host.shutdown`` over the tunnel;
+        the daemon terminates its runners and exits instead of
+        reconnecting, and the tunnel's existing disconnect path then
+        deregisters the connection and marks the host offline in the DB.
+        Fire-and-forget: the offline flip lands via that disconnect
+        path, so callers observe it on their next poll.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host to shut down, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"status": "shutting_down"}``.
+        :raises HTTPException: 404 unknown host, 403 when the caller is
+            neither the owner nor an admin, 400 for server-managed
+            sandbox hosts, 409 when the host has no live connection.
+        """
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner/admin check below as None.
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if (
+            user_id is not None
+            and host.owner != user_id
+            and not await asyncio.to_thread(_is_admin_caller, user_id)
+        ):
+            raise HTTPException(status_code=403, detail="not your host")
+        # Managed sandbox hosts are created/terminated by the server's
+        # own lifecycle (provider API, not the tunnel); routing them
+        # through a daemon-exit frame would leave the provider-side
+        # sandbox running. Out of scope here.
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="managed sandbox hosts are terminated by the server automatically",
+            )
+
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        actor_label = user_id if user_id is not None else "server operator"
+        frame = encode_host_frame(HostShutdownFrame(reason=f"shut down by {actor_label}"))
+        try:
+            host_registry.send_text(conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="host connection was replaced",
+            ) from exc
+
+        audit_event(
+            "host.shutdown",
+            actor=user_id,
+            target=host_id,
+            host_name=host.name,
+            host_owner=host.owner,
+        )
+        return {"status": "shutting_down"}
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(

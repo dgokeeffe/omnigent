@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.db.utils import now_epoch
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -1330,3 +1331,142 @@ async def test_list_all_hosts_plain_list_unchanged_for_admin(
     assert {h["host_id"] for h in hosts} == {"host_fleet_e"}
     assert "session_count" not in hosts[0]
     assert "last_seen" not in hosts[0]
+
+
+# ── Host shutdown (POST /v1/hosts/{id}/shutdown) ────────────────────────
+
+
+def _register_live_conn(registry: HostRegistry, host_id: str, owner: str) -> object:
+    """Register a fake live connection so send_text enqueues frames.
+
+    :param registry: The registry under test.
+    :param host_id: Host identifier to register.
+    :param owner: Owner identity for the connection.
+    :returns: The registered HostConnection (queue readable by tests).
+    """
+    hello = HostHelloFrame(version="0", frame_protocol_version=1, name=host_id)
+    return registry.register(host_id, ws=object(), hello=hello, owner=owner)
+
+
+async def test_shutdown_host_owner_sends_frame(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the owner can shut their host down: 200, and a
+    host.shutdown frame is enqueued on the host's tunnel.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_a", "alice-laptop", "alice@test.com")
+    conn = _register_live_conn(registry, "host_shut_a", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_a/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "shutting_down"}
+    frame = _json.loads(conn.outbound_queue.get_nowait())
+    assert frame["kind"] == "host.shutdown"
+    assert "alice@test.com" in frame["reason"]
+
+
+async def test_shutdown_host_admin_non_owner_allowed(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify an admin who does NOT own the host can still shut it down
+    (the operator reclaim path).
+    """
+    app, registry, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect("host_shut_b", "alice-laptop", "alice@test.com")
+    _register_live_conn(registry, "host_shut_b", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_b/shutdown",
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+
+
+async def test_shutdown_host_403_non_owner_non_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown fails closed for a caller who is neither the owner
+    nor an admin — and no frame reaches the host.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_c", "alice-laptop", "alice@test.com")
+    conn = _register_live_conn(registry, "host_shut_c", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_c/shutdown",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403
+    assert conn.outbound_queue.empty(), "No shutdown frame may be sent on a refused request"
+
+
+async def test_shutdown_host_409_offline(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown returns 409 when the host has no live tunnel —
+    there is nothing to signal.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_shut_d", "alice-laptop", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_d/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 409
+
+
+async def test_shutdown_host_404_unknown(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Verify shutdown returns 404 for an unknown host id."""
+    app, _reg, _hs, _cs = multi_user_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_nonexistent/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 404
+
+
+async def test_shutdown_host_400_managed_sandbox(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown refuses managed sandbox hosts (400) — they are
+    torn down via the provider API, not a daemon-exit frame.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.register_managed_host(
+        host_id="host_shut_e",
+        name="sandbox-e",
+        owner="alice@test.com",
+        token="tok-shut-e",
+        provider="modal",
+        sandbox_id="sb-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    _register_live_conn(registry, "host_shut_e", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/host_shut_e/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 400

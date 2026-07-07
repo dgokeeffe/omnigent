@@ -12,17 +12,41 @@
  * what actually enforces.
  */
 
-import { RefreshCwIcon } from "lucide-react";
+import { useState } from "react";
+import { PowerIcon, RefreshCwIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { type AdminHost, useAdminHosts } from "@/hooks/useAdminHosts";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { showToast } from "@/components/ui/toast";
+import { type AdminHost, useAdminHosts, useShutdownHost } from "@/hooks/useAdminHosts";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { cn } from "@/lib/utils";
 
 export function HostsPage() {
   const isAdmin = useIsAdmin();
   const { data: hosts, error, isLoading, refetch } = useAdminHosts({ enabled: isAdmin });
+  const shutdown = useShutdownHost();
+  const [shutdownCandidate, setShutdownCandidate] = useState<AdminHost | null>(null);
+
+  async function onConfirmShutdown() {
+    if (shutdownCandidate === null) return;
+    const target = shutdownCandidate;
+    try {
+      await shutdown.mutateAsync(target.host_id);
+      showToast(`Shutting down ${target.name} — it will show offline shortly.`);
+    } catch (e) {
+      showToast(`Could not shut down ${target.name}: ${e instanceof Error ? e.message : e}`);
+    }
+    setShutdownCandidate(null);
+  }
 
   // Non-admin: hard stop. Server would also 403, this is just UX.
   // `useIsAdmin` reports false while identity is still resolving, so a
@@ -73,11 +97,12 @@ export function HostsPage() {
                 <th className="px-3 py-2 font-medium">Harnesses</th>
                 <th className="px-3 py-2 font-medium">Sessions</th>
                 <th className="px-3 py-2 font-medium">Last seen</th>
+                <th className="px-3 py-2 text-right font-medium">Actions</th>
               </tr>
             </thead>
             <tbody>
               {hosts.map((h) => (
-                <HostRow key={h.host_id} host={h} />
+                <HostRow key={h.host_id} host={h} onShutdown={() => setShutdownCandidate(h)} />
               ))}
             </tbody>
           </table>
@@ -93,11 +118,54 @@ export function HostsPage() {
           <RefreshCwIcon /> Refresh
         </Button>
       </div>
+
+      {/* ── Shutdown confirmation ────────────────────────────── */}
+      <Dialog
+        open={shutdownCandidate !== null}
+        onOpenChange={(open) => {
+          if (shutdown.isPending) return;
+          if (!open) setShutdownCandidate(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Shut down {shutdownCandidate?.name}?</DialogTitle>
+            <DialogDescription>
+              The host daemon will terminate its runners and exit — it will not reconnect until
+              someone restarts it on the host machine.
+              {shutdownCandidate !== null && shutdownCandidate.session_count > 0 && (
+                <>
+                  {" "}
+                  {shutdownCandidate.session_count} session
+                  {shutdownCandidate.session_count === 1 ? " is" : "s are"} bound to this host; any
+                  active runs will be interrupted.
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => setShutdownCandidate(null)}
+              disabled={shutdown.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => void onConfirmShutdown()}
+              disabled={shutdown.isPending}
+            >
+              {shutdown.isPending ? "Shutting down…" : "Shut down"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </PageScroll>
   );
 }
 
-function HostRow({ host }: { host: AdminHost }) {
+function HostRow({ host, onShutdown }: { host: AdminHost; onShutdown: () => void }) {
   const online = host.status === "online";
   return (
     <tr className="border-t border-border">
@@ -128,6 +196,25 @@ function HostRow({ host }: { host: AdminHost }) {
       <td className="px-3 py-2 align-middle tabular-nums">{host.session_count}</td>
       <td className="px-3 py-2 align-middle text-muted-foreground">
         {formatEpoch(host.last_seen)}
+      </td>
+      <td className="px-3 py-2 text-right align-middle">
+        {/* Offline hosts have no tunnel to signal; managed sandbox hosts
+            are torn down by the server's own lifecycle, not this action. */}
+        <Button
+          variant="ghost"
+          size="xs"
+          title={
+            host.sandbox_provider
+              ? "Managed sandbox hosts are terminated automatically"
+              : !online
+                ? "Host is offline"
+                : "Shut down this host"
+          }
+          onClick={onShutdown}
+          disabled={!online || Boolean(host.sandbox_provider)}
+        >
+          <PowerIcon /> Shut down
+        </Button>
       </td>
     </tr>
   );

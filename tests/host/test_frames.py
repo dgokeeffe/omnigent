@@ -126,6 +126,51 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+    # Default when unset — today's behavior.
+    assert decoded.prefer_binding_token_mint is False
+
+
+def test_launch_runner_frame_prefer_binding_token_mint_round_trip() -> None:
+    """
+    Verify prefer_binding_token_mint=True survives encode → decode.
+
+    This flag steers a guest-on-shared-host runner to authenticate as
+    the session owner; if it were dropped on the wire, the guest
+    session's spec callbacks would 404 as they do today.
+    """
+    original = HostLaunchRunnerFrame(
+        request_id="req_002",
+        binding_token="tok",
+        workspace="/ws",
+        prefer_binding_token_mint=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.prefer_binding_token_mint is True
+
+
+def test_launch_runner_frame_missing_prefer_flag_defaults_false() -> None:
+    """
+    Verify a frame from an OLD server (field absent) decodes to False.
+
+    Wire compatibility (FR-004 / SC-005): a new host receiving a
+    launch frame produced before this field existed must degrade to
+    today's host-owner-credential behavior, not error.
+    """
+    from omnigent.host.frames import HostFrameKind
+
+    old_frame = json.dumps(
+        {
+            "kind": HostFrameKind.LAUNCH_RUNNER.value,
+            "request_id": "req_003",
+            "binding_token": "tok",
+            "workspace": "/ws",
+            "harness": None,
+        }
+    )
+    decoded = decode_host_frame(old_frame)
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.prefer_binding_token_mint is False
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:

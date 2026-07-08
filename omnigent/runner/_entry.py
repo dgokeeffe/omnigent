@@ -321,6 +321,7 @@ def _make_auth_token_factory(
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
+    from omnigent.runner.identity import RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR
 
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
@@ -393,6 +394,25 @@ def _make_auth_token_factory(
             if oidc_token:
                 return oidc_token
         return _sdk_token()
+
+    # Guest-on-shared-host: the server set OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT
+    # because this session's owner differs from the host owner. Prefer the
+    # binding-token mint (acting as the SESSION owner) OVER the inherited
+    # host-owner credential — the host-owner credential can't read the guest
+    # session's spec, so its callbacks 404. This is the only case where the
+    # mint is chosen ahead of an available user credential; every other path
+    # keeps the historical order (user credential first, mint as fallback).
+    # Falls through to that order if the binding token is somehow absent
+    # (safe degrade — never abort the launch here).
+    if resolved_server_url and os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        try:
+            binding_token = _runner_tunnel_binding_token_from_env()
+        except RuntimeError:
+            binding_token = None
+        if binding_token is not None:
+            mint_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
+            if mint_factory is not None:
+                return mint_factory
 
     # Probe once to check if a user credential is available.
     try:

@@ -223,6 +223,114 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     assert factory() == "managed-jwt"
 
 
+def test_make_auth_token_factory_prefers_mint_when_flag_set_over_user_cred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag set + binding token → mint wins even when a user cred resolves.
+
+    This is the guest-on-shared-host case (US1): the inherited host-owner
+    credential WOULD resolve, but it can't read the guest session's spec,
+    so the runner must instead authenticate as the session owner via the
+    binding-token mint. Asserts the mint is chosen ahead of the (available)
+    inherited credential.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer inherited-host-owner-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+    # An inherited user credential IS available (would normally win).
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token",
+        lambda mint_url, server_url, binding_token: ("session-owner-jwt", time.time() + 1800),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    # Mint chosen ahead of the inherited host-owner credential.
+    assert factory() == "session-owner-jwt"
+
+
+def test_make_auth_token_factory_flag_unset_keeps_user_cred_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag UNSET keeps today's order (user credential first), even with a token.
+
+    Owner-on-own-host (US2 regression guard): the server never sets the
+    flag when session owner == host owner, so the runner must use its
+    inherited credential exactly as before — not mint.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer inherited-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
+    monkeypatch.delenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "inherited-token"
+
+
+def test_make_auth_token_factory_flag_set_no_binding_token_safe_degrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag set but NO binding token → fall through, do not crash (FR-007).
+
+    Safe degrade: if the runner is told to prefer the mint but has no
+    binding token to mint against, it must fall back to the normal order
+    (here, the inherited credential) rather than raising and aborting the
+    launch.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer fallback-token"}
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "fallback-token"
+
+
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

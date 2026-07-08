@@ -41,6 +41,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
@@ -1289,6 +1290,40 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
+    # The prefer-mint flag is NOT set unless explicitly requested.
+    assert RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR not in env
+
+
+def test_build_runner_env_sets_prefer_mint_flag_when_requested() -> None:
+    """
+    ``prefer_binding_token_mint=True`` stamps the runner env flag so the
+    runner authenticates its server callbacks as the session owner (the
+    guest-on-shared-host case); ``False`` (the default) leaves it unset so
+    the runner keeps today's inherited-credential behavior.
+    """
+    base = {"PATH": "/usr/bin", "HOME": "/home/alice"}
+
+    on = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        prefer_binding_token_mint=True,
+    )
+    assert on[RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR] == "1"
+
+    off = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        prefer_binding_token_mint=False,
+    )
+    assert RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR not in off
 
 
 def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:

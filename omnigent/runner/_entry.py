@@ -321,7 +321,6 @@ def _make_auth_token_factory(
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
-    from omnigent.runner.identity import RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR
 
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
@@ -404,15 +403,14 @@ def _make_auth_token_factory(
     # keeps the historical order (user credential first, mint as fallback).
     # Falls through to that order if the binding token is somehow absent
     # (safe degrade — never abort the launch here).
-    if resolved_server_url and os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
-        try:
-            binding_token = _runner_tunnel_binding_token_from_env()
-        except RuntimeError:
-            binding_token = None
-        if binding_token is not None:
-            mint_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
-            if mint_factory is not None:
-                return mint_factory
+    # NOTE: the prefer-flag does NOT force the owner-JWT mint here. In header
+    # mode the mint endpoint 302s/400s (no cookie secret), which would break
+    # the tunnel bearer this factory also feeds → runner_failed_to_start. The
+    # flag instead drives the binding-token HEADER on the callback client (see
+    # create_app's server_client), which the server matches to conv.runner_id
+    # to grant read — no minted credential, no auth-mode dependency. The tunnel
+    # keeps authenticating with the host owner's credential (below), which the
+    # server accepts for the tunnel.
 
     # Probe once to check if a user credential is available.
     try:

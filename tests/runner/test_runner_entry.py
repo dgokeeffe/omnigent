@@ -223,16 +223,16 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     assert factory() == "managed-jwt"
 
 
-def test_make_auth_token_factory_prefers_mint_when_flag_set_over_user_cred(
+def test_make_auth_token_factory_flag_does_not_force_mint_over_user_cred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Flag set + binding token → mint wins even when a user cred resolves.
+    """Flag set does NOT force the owner-JWT mint for the tunnel/callback bearer.
 
-    This is the guest-on-shared-host case (US1): the inherited host-owner
-    credential WOULD resolve, but it can't read the guest session's spec,
-    so the runner must instead authenticate as the session owner via the
-    binding-token mint. Asserts the mint is chosen ahead of the (available)
-    inherited credential.
+    The prefer flag drives the binding-token HEADER on the callback client
+    (feature 002), NOT a token mint here. Forcing the mint would break the
+    tunnel bearer in header mode (the mint 302s/400s → runner_failed_to_start).
+    So even with the flag set, an available inherited credential still wins in
+    _make_auth_token_factory; the header path grants read separately.
 
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
@@ -246,22 +246,17 @@ def test_make_auth_token_factory_prefers_mint_when_flag_set_over_user_cred(
     monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
     monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
-    # An inherited user credential IS available (would normally win).
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
         "omnigent.inner.databricks_executor._resolve_databricks_auth",
         lambda profile=None: (_DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"),
     )
-    monkeypatch.setattr(
-        "omnigent.runner._entry._mint_managed_owner_token",
-        lambda mint_url, server_url, binding_token: ("session-owner-jwt", time.time() + 1800),
-    )
 
     factory = _make_auth_token_factory()
 
     assert factory is not None
-    # Mint chosen ahead of the inherited host-owner credential.
-    assert factory() == "session-owner-jwt"
+    # Inherited credential still wins — the flag did NOT force a mint.
+    assert factory() == "inherited-host-owner-token"
 
 
 def test_make_auth_token_factory_flag_unset_keeps_user_cred_first(

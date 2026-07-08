@@ -14488,7 +14488,12 @@ def create_sessions_router(
         # require_access + get_permission_level + snapshot-get_conversation
         # sequence, which made ~5-6 separate store round-trips.
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -20361,7 +20366,12 @@ def create_sessions_router(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:
@@ -20412,7 +20422,12 @@ def create_sessions_router(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:

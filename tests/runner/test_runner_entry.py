@@ -1755,3 +1755,75 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+def _run_create_app_capturing_client_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str]:
+    """Drive create_app() with fakes and return the server_client headers.
+
+    Monkeypatches httpx.AsyncClient to capture the headers kwarg the runner's
+    callback client is built with, plus the minimal set of runner dependencies
+    so create_app() constructs without real I/O.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _CapturingAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args
+            captured["headers"] = dict(kwargs.get("headers") or {})
+
+        async def aclose(self) -> None:
+            pass
+
+    class _FakePM:
+        def __init__(self) -> None: ...
+        async def start(self) -> None: ...
+        async def shutdown(self) -> None: ...
+
+    def _tr_factory(*, conversation_link_base_url: str | None = None) -> _TrackingTerminalRegistry:
+        return _TrackingTerminalRegistry(conversation_link_base_url=conversation_link_base_url)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _CapturingAsyncClient)
+    monkeypatch.setattr(entry_mod.httpx, "Client", _TrackingSyncClient)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakePM
+    )
+    monkeypatch.setattr("omnigent.terminals.TerminalRegistry", _tr_factory)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    entry_mod.create_app()
+    return captured["headers"]
+
+
+def test_server_client_attaches_binding_token_when_prefer_flag_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the prefer flag + a binding token, the callback client sends the
+    tunnel-token header (feature 002 — header-mode guest access)."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok-123")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", "1")
+
+    headers = _run_create_app_capturing_client_headers(monkeypatch)
+
+    assert headers.get(RUNNER_TUNNEL_TOKEN_HEADER) == "bind-tok-123"
+
+
+def test_server_client_omits_binding_token_without_prefer_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the prefer flag, the callback client does NOT send the tunnel
+    token (own-host / ordinary runs are unchanged)."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-tok-123")
+    monkeypatch.delenv("OMNIGENT_RUNNER_PREFER_BINDING_TOKEN_MINT", raising=False)
+
+    headers = _run_create_app_capturing_client_headers(monkeypatch)
+
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in headers

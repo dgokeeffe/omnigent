@@ -25,8 +25,10 @@ from fastapi import Request
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.server.auth import (
     LEVEL_OWNER,
+    LEVEL_READ,
     RESERVED_USER_LOCAL,
     AuthProvider,
 )
@@ -256,6 +258,7 @@ def _require_access_and_level_sync(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    runner_binding_token: str | None = None,
 ) -> SessionAccess:
     """Synchronous core of :func:`require_access_and_level`.
 
@@ -284,6 +287,24 @@ def _require_access_and_level_sync(
     """
     if permission_store is None:
         return SessionAccess(level=None, conversation=None)
+
+    # Runner self-access: a runner may READ its own bound session's spec/config
+    # by presenting its tunnel binding token, verified by matching the
+    # token-derived runner id against the session's recorded runner_id. This
+    # needs no auth-mode secret (unlike the cookie-mode owner-JWT mint), so it
+    # works in header/proxy mode where a guest-on-shared-host runner has no
+    # readable user identity. Scoped to this one session and to read only
+    # (never yields a user_id, never satisfies > read); a non-match falls
+    # through to the normal checks below (fail closed).
+    if runner_binding_token and required_level <= LEVEL_READ:
+        conv = conversation_store.get_conversation(conversation_id)
+        if (
+            conv is not None
+            and conv.runner_id is not None
+            and token_bound_runner_id(runner_binding_token.strip()) == conv.runner_id
+        ):
+            return SessionAccess(level=LEVEL_READ, conversation=conv)
+
     if user_id is None:
         raise OmnigentError(
             "Authentication required",
@@ -354,6 +375,7 @@ async def require_access_and_level(
     required_level: int,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
+    runner_binding_token: str | None = None,
 ) -> SessionAccess:
     """Authorize a caller and resolve their display level in one threaded pass.
 
@@ -381,6 +403,7 @@ async def require_access_and_level(
         required_level,
         permission_store,
         conversation_store,
+        runner_binding_token,
     )
 
 

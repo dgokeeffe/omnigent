@@ -922,6 +922,25 @@ def create_app(
     # token cache); otherwise build our own.
     if auth_token_factory is None:
         auth_token_factory = _make_auth_token_factory()
+    _callback_headers = {
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+        **databricks_request_headers(server_url),
+    }
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session it doesn't own the host of, attach the tunnel binding token so the
+    # server can grant read on THIS session by matching the token-derived runner
+    # id against the session's runner_id. Works in header/proxy auth mode, where
+    # no owner token can be minted. Gated by the flag so the token isn't sent on
+    # ordinary own-host runs.
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _binding_token = _runner_tunnel_binding_token_from_env()
+        if _binding_token:
+            _callback_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _binding_token
     server_client = httpx.AsyncClient(
         base_url=server_url,
         auth=_RunnerDatabricksAuth(auth_token_factory),
@@ -934,7 +953,7 @@ def create_app(
         #
         # The workspace-routing header (empty unless a ?o= selector was
         # recorded for this server) routes these callbacks to the workspace.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, **databricks_request_headers(server_url)},
+        headers=_callback_headers,
         timeout=httpx.Timeout(5.0, read=None),
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the

@@ -18776,7 +18776,12 @@ def create_sessions_router(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:

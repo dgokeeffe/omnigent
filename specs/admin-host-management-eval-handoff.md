@@ -24,11 +24,30 @@ local-only (never pushed).
 |---|---|
 | D-S1 CI green + PR open | ✅ PR #1 ready (not draft); CI/E2E/web/Lint/Integration/UI-Snapshot/Windows all green. The 2 red checks are non-code: `Maintainer Approval` (pull_request_target governance gate, repo-owner clears in UI) and `E2E UI Required` (AI-judge gateway infra flake — `E2E UI Tests` itself passed). |
 | D-S3 CoDA's own share_and_launch | ✅ grant leg 200 from CoDA's real code (`coding-agents` → `POST /api/omnigent-host/share`); launch leg 422 = documented CoDA-side empty-body shape mismatch, out of scope (CoDA follow-up). |
-| D-S6 audit lines in prod logs | ✅ grant+revoke observed via `databricks apps logs omnigent-daveok -p lakemeter` (actor/target/principal/level). Browser `/logz` stream is Okta-walled; CLI logs are the equivalent. |
+| D-S6 audit lines in prod logs | ✅ grant+revoke observed via `databricks apps logs omnigent-daveok -p lakemeter` (actor/target/principal/level). Browser `/logz` stream is Okta-walled; CLI logs are the equivalent. 2026-07-08: shutdown + fleet.list audit legs also observed live (local rigs, PR comment transcripts). |
 | D-S7 review + isolation + upstream | ✅ fresh-context review: no cross-user vuln, no High/Critical; 1 fix applied (host.fleet.list audit, commit 0178515d); isolation paragraph + fork-vs-upstream decision both in PR body. |
-| **D-S2 admin screens in a browser** | ⚠️ component-tested only; live browser render BLOCKED on Okta. See E2' below for the Okta-free half. |
-| **D-S4 second human grantee** | ❌ needs a willing lakemeter colleague (not Okta — a person). Deferred. |
-| **D-S5 new-build remote shutdown over ingress** | ⚠️ SPLIT: remote endpoint proven today (200 + frame enqueued over the ingress); new-build daemon-exit proven locally last session. The composed "new-build daemon exits over the Apps ingress" never ran — the CoDA-restart route is blocked (see below). |
+| **D-S2 admin screens in a browser** | ⚠️ data contracts ✅ live (2026-07-08: fleet fields asserted programmatically, Shares GET/PUT/DELETE loop on the CoDA host, shutdown 200 — PR body "Verification phase" + comment transcripts). Residual is pixels only: screenshots pending FastPass. |
+| **D-S4 second human grantee** | ❌ needs a willing lakemeter colleague (not Okta — a person). Deferred. Mechanics fully covered with synthetic identities via the header-auth rig (2026-07-08); the residual is purely a second *human* on the deployed app. |
+| **D-S5 new-build remote shutdown over ingress** | ⚠️→✅-composed (2026-07-08): new-build daemon-exit proven with the full 4-part signature against a local server+host from branch source (transcript in PR comment); ingress transport proven via the deployed endpoint enqueue. Only the single composed observation "new-build daemon exits over the Apps ingress" remains, pending FastPass (stale CoDA binary needs an interactive terminal to clear). |
+
+## Verification phase progress — 2026-07-08 session (Okta-free)
+
+Tasks A–C from "Next moves" all ran; results folded into the PR body
+("Verification phase — 2026-07-08 session") and full transcripts posted as a PR
+comment. Task D skipped deliberately: no code changed this session, so the
+D-S7 fresh-context review still covers the diff.
+
+Beyond the plan: a **live multi-user authorization suite** closed two gaps the
+plan had written off as colleague-dependent — a local server in
+`OMNIGENT_AUTH_PROVIDER=header` mode (the deployed app's auth path) + admins
+roster file + five curl identities + a real host daemon tunneled through a
+header-injecting proxy (stand-in for the Apps ingress). Observed live:
+non-admin 403 / unauth 401 on `?all=true`; view-sees-but-cannot-browse/launch;
+use-browses-over-tunnel + launch passes host gate; revoke→gone; shutdown 403
+even at `use`; and admin-shuts-down-another-user's-host end-to-end with the
+`actor≠host_owner` audit line. Deployed CoDA host: old-build shutdown observed
+as a tunnel bounce + reconnect ≈30 s (documented no-op, still healthy); David's
+`use` grant restored (documented demo state).
 
 ## Why the CoDA-restart route for D-S5 is dead (don't retry it)
 

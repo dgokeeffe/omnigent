@@ -14246,6 +14246,15 @@ def create_sessions_router(
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                # Guest on a shared / externally-owned host (session owner !=
+                # host owner): tell the runner to authenticate its server
+                # callbacks with its binding token (matched to the session's
+                # runner_id) instead of the host-owner credential, which can't
+                # read a guest session's spec (404). Equal owners (own-host)
+                # leave this False → unchanged.
+                prefer_binding_token_mint = (
+                    user_id is not None and conn.owner is not None and user_id != conn.owner
+                )
                 launch_frame = encode_host_frame(
                     HostLaunchRunnerFrame(
                         request_id=request_id,
@@ -14257,6 +14266,7 @@ def create_sessions_router(
                         # spawning. None (agent not resolvable) skips the
                         # host-side check.
                         harness=resp.harness,
+                        prefer_binding_token_mint=prefer_binding_token_mint,
                     )
                 )
                 host_registry.send_text(conn, launch_frame)

@@ -238,14 +238,16 @@ _BINDING_TOKEN = "test-binding-token-xyz"
 async def test_binding_token_grants_read_on_own_session_without_user(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """A runner reads its OWN bound session with the binding token, no user_id.
+    """A runner reads AND posts events on its OWN bound session, no user_id.
 
     The header-mode case (US1): user_id is None (no readable identity), but the
-    token's derived runner id matches conv.runner_id → read granted.
+    token's derived runner id matches conv.runner_id → the runner gets its
+    self-access level (EDIT: read the spec + post events/usage back).
     """
     conv = conv_store.create_conversation()
     conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))
 
+    # A read requirement (spec fetch) is satisfied ...
     access = await require_access_and_level(
         None,
         conv.id,
@@ -254,10 +256,21 @@ async def test_binding_token_grants_read_on_own_session_without_user(
         conv_store,
         runner_binding_token=_BINDING_TOKEN,
     )
-
-    assert access.level == LEVEL_READ
+    assert access.level == LEVEL_EDIT
     assert access.conversation is not None
     assert access.conversation.id == conv.id
+
+    # ... and so is an edit requirement (POST /events, the transcript/usage
+    # forwarder), so the agent's responses reach the web transcript.
+    access_edit = await require_access_and_level(
+        None,
+        conv.id,
+        LEVEL_EDIT,
+        perm_store,
+        conv_store,
+        runner_binding_token=_BINDING_TOKEN,
+    )
+    assert access_edit.level == LEVEL_EDIT
 
 
 @pytest.mark.asyncio
@@ -286,13 +299,14 @@ async def test_binding_token_does_not_grant_other_session(
 
 
 @pytest.mark.asyncio
-async def test_binding_token_cannot_satisfy_above_read(
+async def test_binding_token_cannot_satisfy_above_edit(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """A matching binding token does NOT satisfy a > LEVEL_READ requirement (US2).
+    """A matching binding token does NOT satisfy a > LEVEL_EDIT requirement (US2).
 
-    Even for its own session, the grant is read-only; an edit/owner requirement
-    falls through to the normal deny.
+    The grant caps at EDIT (read spec + post events on its own session); a
+    manage/owner requirement (delete the session, change its sharing) falls
+    through to the normal deny — the runner can't escalate on its own session.
     """
     conv = conv_store.create_conversation()
     conv_store.replace_runner_id(conv.id, token_bound_runner_id(_BINDING_TOKEN))

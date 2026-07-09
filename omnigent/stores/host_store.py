@@ -786,10 +786,10 @@ class HostStore:
         Managed-host teardown: removes the host from the picker AND
         revokes its launch token in one operation (the row IS the
         credential). Explicitly nulls ``conversations.host_id`` for any
-        sessions still bound to this host — the DB no longer cascades
-        this via FK, and deletes the host's sharing grants. No-op when
-        the row does not exist — deletion is invoked from best-effort
-        cleanup paths that may race.
+        sessions still bound to this host and deletes the host's sharing
+        grants — the DB no longer cascades either via FK. No-op when the
+        row does not exist — deletion is invoked from best-effort cleanup
+        paths that may race.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         """

@@ -787,6 +787,16 @@ def create_hosts_router(
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
+        # When the launching user (the session owner) is not the host owner —
+        # a shared / externally-owned host, e.g. a service-principal-owned
+        # Databricks App host serving another user's session — tell the runner
+        # to authenticate its server callbacks with its tunnel binding token
+        # (matched against the session's runner_id) instead of the host-owner
+        # credential, which can't read a guest session's spec (404). Equal
+        # owners (own-host, the common case) leave this False → unchanged.
+        prefer_binding_token_mint = (
+            user_id is not None and conn.owner is not None and user_id != conn.owner
+        )
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -794,6 +804,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                prefer_binding_token_mint=prefer_binding_token_mint,
             )
         )
         try:

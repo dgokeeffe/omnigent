@@ -110,6 +110,15 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param prefer_binding_token_mint: When ``True``, the runner should
+        authenticate its server callbacks with the binding-token owner
+        mint (acting as the SESSION owner) instead of the inherited
+        host-owner credential. The server sets this only when the
+        session owner differs from the host owner — the shared /
+        externally-owned-host case (e.g. a service-principal-owned host
+        serving another user's session), where the host-owner credential
+        cannot read the guest session's spec. ``False`` (the default, and
+        what an older server omits) keeps the host-owner credential path.
     """
 
     request_id: str
@@ -117,6 +126,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    prefer_binding_token_mint: bool = False
 
 
 @dataclass
@@ -616,6 +626,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "prefer_binding_token_mint": frame.prefer_binding_token_mint,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -916,6 +927,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        prefer_binding_token_mint=_optional_bool(msg, "prefer_binding_token_mint"),
     )
 
 
@@ -1247,6 +1259,26 @@ def _required_bool(msg: dict[str, Any], key: str) -> bool:
     val = msg.get(key)
     if not isinstance(val, bool):
         raise ValueError(f"frame missing required bool field: {key!r}")
+    return val
+
+
+def _optional_bool(msg: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Return an optional boolean field, defaulting when absent.
+
+    Absent is the wire-compat case (a frame from an older peer that
+    predates the field), so it must default rather than raise.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"prefer_binding_token_mint"``.
+    :param default: Value when the key is absent.
+    :returns: The boolean value, or *default* when absent.
+    :raises ValueError: If the field is present but not a bool.
+    """
+    if key not in msg:
+        return default
+    val = msg[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"frame field must be a bool: {key!r}")
     return val
 
 

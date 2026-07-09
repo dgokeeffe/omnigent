@@ -6217,6 +6217,7 @@ async def _launch_runner_on_host(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    permission_store: PermissionStore | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6234,6 +6235,12 @@ async def _launch_runner_on_host(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param permission_store: Permission store, used to resolve the session
+        owner so the frame can tell the runner to authenticate its
+        callbacks as the session owner when that owner differs from the
+        host owner (the shared / externally-owned-host case). ``None``
+        skips the resolution → the flag stays ``False`` (today's
+        host-owner-credential behavior).
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -6263,6 +6270,18 @@ async def _launch_runner_on_host(
         )
         return _HostLaunchAttempt(runner_id=new_runner_id)
     request_id = secrets.token_hex(8)
+    # When the session owner differs from the host owner (a shared /
+    # externally-owned host, e.g. a service-principal-owned Databricks App
+    # host serving another user's session), tell the runner to authenticate
+    # its server callbacks as the SESSION owner via the binding-token mint —
+    # the host-owner credential can't read a guest session's spec, so its
+    # spec callbacks 404 and the native terminal fails to start. Equal owners
+    # (the common own-host case) leave this False → today's behavior.
+    session_owner = _get_session_owner_id(conv.id, permission_store)
+    host_owner = host_conn.owner
+    prefer_binding_token_mint = (
+        session_owner is not None and host_owner is not None and session_owner != host_owner
+    )
     launch_future: asyncio.Future[dict[str, str | None]] = (
         asyncio.get_running_loop().create_future()
     )
@@ -6277,6 +6296,7 @@ async def _launch_runner_on_host(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            prefer_binding_token_mint=prefer_binding_token_mint,
         )
     )
     try:
@@ -14293,6 +14313,15 @@ def create_sessions_router(
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                # Guest on a shared / externally-owned host (session owner !=
+                # host owner): tell the runner to authenticate its server
+                # callbacks with its binding token (matched to the session's
+                # runner_id) instead of the host-owner credential, which can't
+                # read a guest session's spec (404). Equal owners (own-host)
+                # leave this False → unchanged.
+                prefer_binding_token_mint = (
+                    user_id is not None and conn.owner is not None and user_id != conn.owner
+                )
                 launch_frame = encode_host_frame(
                     HostLaunchRunnerFrame(
                         request_id=request_id,
@@ -14304,6 +14333,7 @@ def create_sessions_router(
                         # spawning. None (agent not resolvable) skips the
                         # host-side check.
                         harness=resp.harness,
+                        prefer_binding_token_mint=prefer_binding_token_mint,
                     )
                 )
                 host_registry.send_text(conn, launch_frame)
@@ -14535,7 +14565,12 @@ def create_sessions_router(
         # require_access + get_permission_level + snapshot-get_conversation
         # sequence, which made ~5-6 separate store round-trips.
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -16018,8 +16053,17 @@ def create_sessions_router(
             ``tool_name``.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Use the level-aware helper so the runner's tunnel binding token can
+        # authorize a guest approval prompt on a shared externally-owned host
+        # (header auth mode has no mintable owner identity). The resolved level
+        # is unused here; this route only needs READ.
+        await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         try:
             payload = await request.json()
@@ -16345,7 +16389,12 @@ def create_sessions_router(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
@@ -18815,7 +18864,12 @@ def create_sessions_router(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:
@@ -19581,6 +19635,7 @@ def create_sessions_router(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        permission_store=getattr(request.app.state, "permission_store", None),
                     )
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
@@ -20453,7 +20508,12 @@ def create_sessions_router(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:
@@ -20504,7 +20564,12 @@ def create_sessions_router(
         """
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:

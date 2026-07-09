@@ -5404,6 +5404,23 @@ async def _auto_create_claude_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     _runner_headers = databricks_request_headers(server_url, bearer_token=_auth_token)
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session it doesn't own the host of, attach the tunnel binding token so the
+    # transcript forwarder's POST /events is authorized against THIS session by
+    # matching the token-derived runner id against the session's runner_id.
+    # Header/proxy auth mode has no owner token to mint; the flag gates the
+    # header so it isn't sent on ordinary own-host runs. Mirrors _entry.py's
+    # server_client and the spec-callback GET routes.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _binding_token = _runner_tunnel_binding_token_from_env()
+        if _binding_token:
+            _runner_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _binding_token
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_launcher import resolve_claude_launch

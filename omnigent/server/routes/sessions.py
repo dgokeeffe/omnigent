@@ -15979,8 +15979,17 @@ def create_sessions_router(
             ``tool_name``.
         """
         user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Use the level-aware helper so the runner's tunnel binding token can
+        # authorize a guest approval prompt on a shared externally-owned host
+        # (header auth mode has no mintable owner identity). The resolved level
+        # is unused here; this route only needs READ.
+        await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         try:
             payload = await request.json()
@@ -16306,7 +16315,12 @@ def create_sessions_router(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:

@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostShutdownFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -63,6 +64,7 @@ from omnigent.onboarding.harness_readiness import (
 from omnigent.runner.identity import (
     RUNNER_ID_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
@@ -471,6 +473,16 @@ class HostConnectError(Exception):
     """
 
 
+class HostShutdownRequested(Exception):
+    """The server ordered this host to shut down (``host.shutdown``).
+
+    Raised out of the frame dispatch so the reconnect loop in
+    :meth:`HostProcess.run` exits cleanly instead of treating the
+    ensuing disconnect as transient and reconnecting. The message is
+    the server-provided reason, if any.
+    """
+
+
 def _build_runner_env(
     base_env: Mapping[str, str],
     *,
@@ -479,6 +491,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    prefer_binding_token_mint: bool = False,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -502,6 +515,12 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param prefer_binding_token_mint: When ``True``, set the env flag that
+        tells the runner to authenticate its server callbacks via the
+        binding-token mint (session-owner identity) instead of the
+        inherited host-owner credential. Set by the server on the
+        ``host.launch_runner`` frame only when the session owner differs
+        from the host owner.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -522,6 +541,8 @@ def _build_runner_env(
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if prefer_binding_token_mint:
+        env[RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR] = "1"
     return env
 
 
@@ -1050,6 +1071,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            prefer_binding_token_mint=frame.prefer_binding_token_mint,
         )
 
         try:
@@ -1611,6 +1633,12 @@ class HostProcess:
                     backoff = _RECONNECT_BASE_S
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     break
+                except HostShutdownRequested as exc:
+                    # Server-ordered stop: exit the loop instead of
+                    # reconnecting — that's the whole difference between
+                    # a shutdown and an ordinary tunnel drop.
+                    print(f"Host shut down by server: {exc}", flush=True)
+                    break
                 except HostConnectError:
                     # Permanent failure (auth / authorization / outdated
                     # server). Do NOT back off and retry — propagate so
@@ -1923,6 +1951,15 @@ class HostProcess:
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostShutdownFrame):
+            # Server-ordered shutdown (owner/admin action). Terminate the
+            # runners here so they die even if process teardown is
+            # interrupted, then raise the control signal — run()'s finally
+            # re-runs cleanup, which is a no-op on the emptied map.
+            reason = frame.reason or "shut down by server request"
+            _logger.info("Received host.shutdown: %s", reason)
+            self._cleanup_runners()
+            raise HostShutdownRequested(reason)
 
 
 def run_host_process(

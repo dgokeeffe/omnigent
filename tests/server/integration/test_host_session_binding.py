@@ -35,6 +35,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
@@ -100,13 +103,19 @@ def binding_app(
     registry = HostRegistry()
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
+    host_permission_store = SqlAlchemyHostPermissionStore(db_uri)
     app = FastAPI()
     app.include_router(
         create_host_tunnel_router(registry, host_store),
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=host_permission_store,
+        ),
         prefix="/v1",
     )
     return app, registry, host_store, conv_store
@@ -262,6 +271,7 @@ async def managed_session_env(
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         # The production YAML parse path: its modal factory resolves
         # ModalSandboxLauncher at call time, which the test substitutes
         # via install_fake_modal_launcher.
@@ -595,6 +605,7 @@ async def test_managed_session_create_without_config_fails_clearly(
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
     )
     async with AsyncClient(
         transport=ASGITransport(app=app),

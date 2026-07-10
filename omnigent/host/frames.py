@@ -55,6 +55,7 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    SHUTDOWN = "host.shutdown"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -109,6 +110,15 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param prefer_binding_token_mint: When ``True``, the runner should
+        authenticate its server callbacks with the binding-token owner
+        mint (acting as the SESSION owner) instead of the inherited
+        host-owner credential. The server sets this only when the
+        session owner differs from the host owner — the shared /
+        externally-owned-host case (e.g. a service-principal-owned host
+        serving another user's session), where the host-owner credential
+        cannot read the guest session's spec. ``False`` (the default, and
+        what an older server omits) keeps the host-owner credential path.
     """
 
     request_id: str
@@ -116,6 +126,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    prefer_binding_token_mint: bool = False
 
 
 @dataclass
@@ -173,6 +184,26 @@ class HostStopRunnerResultFrame:
     request_id: str
     status: str
     error: str | None = None
+
+
+@dataclass
+class HostShutdownFrame:
+    """Server → host: terminate all runners and exit the host process.
+
+    Sent by the owner/admin-triggered ``POST /v1/hosts/{id}/shutdown``.
+    Unlike a plain tunnel close — which the daemon treats as transient
+    and reconnects from — this tells the daemon to stop for good: it
+    terminates its runners and exits instead of re-entering the
+    reconnect loop. Older hosts that don't know the kind ignore it
+    (the dispatch drops unrecognized frames), so shutdown degrades to
+    a no-op rather than an error against them.
+
+    :param reason: Optional human-readable cause for the daemon's
+        log, e.g. ``"shut down by admin"``. ``None`` logs a generic
+        message.
+    """
+
+    reason: str | None = None
 
 
 @dataclass
@@ -537,6 +568,7 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostShutdownFrame
 )
 
 
@@ -594,6 +626,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "prefer_binding_token_mint": frame.prefer_binding_token_mint,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -622,6 +655,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostShutdownFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SHUTDOWN.value,
+                "reason": frame.reason,
             }
         )
     if isinstance(frame, HostRunnerExitedFrame):
@@ -855,6 +895,8 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.SHUTDOWN:
+            return _decode_shutdown(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -885,6 +927,7 @@ def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        prefer_binding_token_mint=_optional_bool(msg, "prefer_binding_token_mint"),
     )
 
 
@@ -929,6 +972,17 @@ def _decode_stop_runner_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_shutdown(msg: dict[str, Any]) -> HostShutdownFrame:
+    """Decode a host.shutdown frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.shutdown frame.
+    """
+    return HostShutdownFrame(
+        reason=_optional_nullable_str(msg, "reason"),
     )
 
 
@@ -1205,6 +1259,26 @@ def _required_bool(msg: dict[str, Any], key: str) -> bool:
     val = msg.get(key)
     if not isinstance(val, bool):
         raise ValueError(f"frame missing required bool field: {key!r}")
+    return val
+
+
+def _optional_bool(msg: dict[str, Any], key: str, default: bool = False) -> bool:
+    """Return an optional boolean field, defaulting when absent.
+
+    Absent is the wire-compat case (a frame from an older peer that
+    predates the field), so it must default rather than raise.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"prefer_binding_token_mint"``.
+    :param default: Value when the key is absent.
+    :returns: The boolean value, or *default* when absent.
+    :raises ValueError: If the field is present but not a bool.
+    """
+    if key not in msg:
+        return default
+    val = msg[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"frame field must be a bool: {key!r}")
     return val
 
 

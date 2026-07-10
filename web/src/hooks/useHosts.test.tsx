@@ -3,7 +3,7 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { useHosts } from "./useHosts";
+import { canLaunchOnHost, isSharedHost, useHosts, type Host } from "./useHosts";
 
 const fetchMock = vi.fn();
 
@@ -198,5 +198,35 @@ describe("useHosts", () => {
 
     expect(result.current.error).toBeInstanceOf(Error);
     expect((result.current.error as Error).message).toContain("503");
+  });
+});
+
+// The picker labels shared hosts and disables view-only ones as launch
+// targets. Both behaviors are driven by these two pure helpers, which
+// every picker (NewChatDialog / ForkSessionDialog /
+// ResumeWithDirectoryDialog) shares.
+describe("host sharing helpers", () => {
+  const base: Host = {
+    host_id: "host_x",
+    name: "host",
+    owner: "app-sp@example",
+    status: "online",
+  };
+
+  it("treats a non-owned host as shared", () => {
+    expect(isSharedHost({ ...base, owned_by_current_user: false })).toBe(true);
+    expect(isSharedHost({ ...base, owned_by_current_user: true })).toBe(false);
+    // Older server (field absent) → not shown as shared (back-compat).
+    expect(isSharedHost(base)).toBe(false);
+  });
+
+  it("blocks launching on a view-only host but allows use/manage/owner", () => {
+    expect(canLaunchOnHost({ ...base, permission_level: "view" })).toBe(false);
+    expect(canLaunchOnHost({ ...base, permission_level: "use" })).toBe(true);
+    expect(canLaunchOnHost({ ...base, permission_level: "manage" })).toBe(true);
+    expect(canLaunchOnHost({ ...base, permission_level: "owner" })).toBe(true);
+    // Older server (field absent) → launchable, so the picker keeps
+    // working against servers without host sharing.
+    expect(canLaunchOnHost(base)).toBe(true);
   });
 });

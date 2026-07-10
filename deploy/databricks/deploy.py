@@ -553,6 +553,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--admins",
+        default="",
+        help=(
+            "Comma-separated identities to grant admin on login, e.g. "
+            "'alice@example.com'. Empty keeps the runtime admin-list file / "
+            "DB flag as the only admin sources."
+        ),
+    )
+    parser.add_argument(
         "--compute-size",
         default="LARGE",
         choices=["SMALL", "MEDIUM", "LARGE"],
@@ -746,6 +755,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"admins={args.admins}",
     ]
 
 

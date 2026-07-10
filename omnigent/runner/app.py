@@ -2512,7 +2512,7 @@ async def _auto_create_hermes_terminal(
     :returns: Created terminal resource view.
     """
     from omnigent.hermes_native import resolve_hermes_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so old and new tasks can't both mirror (double-posting), and
@@ -2631,7 +2631,21 @@ async def _auto_create_hermes_terminal(
         session_key="main",
         resource_role=HERMES_NATIVE_TERMINAL_ROLE,
         spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            # Explicit sandbox=none: an OSEnvSpec with sandbox=None resolves to
+            # the platform default (linux_bwrap on Linux) in resolve_sandbox(),
+            # which needs the `bwrap` binary — absent on hosts like a CoDA
+            # Databricks App container, so the Hermes TUI terminal 500s with
+            # "linux_bwrap sandbox requires the 'bwrap' binary on PATH" and the
+            # whole session fails to start. The hermes-native wrapper agent spec
+            # (see omnigent.hermes_native._materialize_hermes_agent_spec) already
+            # declares sandbox: none; thread the same here so the runner-owned
+            # terminal matches it. Mirrors the caller_process + sandbox=none the
+            # headless `hermes` harness uses.
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
             command=hermes_command,
             args=hermes_args,
             env=_hermes_terminal_env,

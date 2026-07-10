@@ -755,8 +755,13 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        # The Apps spec validator rejects an env entry whose `value:` is the
+        # empty string ("Must specify environment variable source"). When no
+        # admins are set, pass a single space so the entry is a valid non-empty
+        # value; the app parses OMNIGENT_ADMINS on `,` and strips each token,
+        # so a whitespace-only value yields an empty admin roster all the same.
         "--var",
-        f"admins={args.admins}",
+        f"admins={args.admins or ' '}",
     ]
 
 

@@ -2668,6 +2668,28 @@ async def _auto_create_hermes_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session whose host it doesn't own (a shared/externally-owned host such as
+    # a CoDA Databricks App), the refresh-capable SP bearer clears the ingress
+    # but has no user grant on the human's conversation, so the forwarder's and
+    # approval mirror's POST /v1/sessions/{id}/events would be 404-masked and the
+    # Hermes transcript / dangerous-command prompts would never reach Chat.
+    # Attach the tunnel binding token so the server's runner self-access check
+    # matches the token-derived runner id against the session's runner_id and
+    # grants LEVEL_EDIT. The flag gates the header so it isn't sent on ordinary
+    # own-host runs. Mirrors the pi-/claude-native paths.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    _hermes_forward_headers: dict[str, str] = {}
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _hermes_binding_token = _runner_tunnel_binding_token_from_env()
+        if _hermes_binding_token:
+            _hermes_forward_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _hermes_binding_token
+
     from omnigent.hermes_native_bridge import read_hermes_home
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
     from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
@@ -2696,7 +2718,7 @@ async def _auto_create_hermes_terminal(
         await asyncio.gather(
             supervise_hermes_forwarder(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="hermes-native-ui",
@@ -2707,7 +2729,7 @@ async def _auto_create_hermes_terminal(
             ),
             supervise_hermes_approval_mirror(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 auth=_runner_auth,

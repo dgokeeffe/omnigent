@@ -35,6 +35,11 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create the host_permissions table. No backfill — hosts stay private."""
+    # Idempotent: some databases already have this table (created out-of-band
+    # from the same model), so skip creation when present. The definition below
+    # is the source of truth for a fresh DB.
+    if sa.inspect(op.get_bind()).has_table("host_permissions"):
+        return
     # No DB foreign keys (Rule R032): the application owns referential
     # cleanup — HostStore.delete_host removes a host's grants.
     op.create_table(

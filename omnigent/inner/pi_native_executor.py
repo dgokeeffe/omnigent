@@ -125,6 +125,11 @@ class PiNativeExecutor(Executor):
             factory = _make_auth_token_factory()
             token = factory() if factory is not None else None
             if token:
+                # Only the bearer is rotated here; refresh_config_auth_headers
+                # MERGES over the existing authHeaders, so the guest-on-shared-
+                # host X-Omnigent-Runner-Tunnel-Token written at launch survives
+                # (this worker's env has the token scrubbed, so we can't re-supply
+                # it — the merge is what keeps the chat-mirror self-access grant).
                 refresh_config_auth_headers(self._bridge_dir, {"Authorization": f"Bearer {token}"})
         except Exception:  # noqa: BLE001 — best-effort refresh; never block a turn
             pass

@@ -595,22 +595,40 @@ def _mint_managed_owner_token(
     return payload["token"], float(payload["expires_at"])
 
 
+# Captured at first read (runner startup, before any scrub). The binding
+# token is popped from os.environ at every child-spawn / sandbox boundary
+# (strip_runner_auth_secrets / sandbox launcher), so a later reader —
+# e.g. _auto_create_pi_terminal building the pi extension config after a
+# terminal launch scrubbed the env — would otherwise see None. Caching it
+# in the runner's own process memory keeps it available to all in-process
+# callbacks without re-exposing it to any child environment (the scrub
+# boundary is child process env, not in-process memory).
+_CAPTURED_BINDING_TOKEN: str | None = None
+
+
 def _runner_tunnel_binding_token_from_env() -> str | None:
-    """Return the optional tunnel binding token from the environment.
+    """Return the optional tunnel binding token.
+
+    Reads the env var on first call (runner startup, before the env is
+    scrubbed) and caches it, so later callers still get it after the
+    sandbox / child-spawn scrubbers pop it from ``os.environ``.
 
     :returns: Secret token used to bind the WebSocket tunnel to its
         runner id, or ``None`` when the runner was started without
         per-tunnel binding.
     :raises RuntimeError: If the token env var is set but empty.
     """
+    global _CAPTURED_BINDING_TOKEN
     from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
     token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR)
     if token is None:
-        return None
+        # Env was scrubbed after startup; fall back to the captured value.
+        return _CAPTURED_BINDING_TOKEN
     if not token.strip():
         raise RuntimeError(f"{RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR} must not be empty")
-    return token.strip()
+    _CAPTURED_BINDING_TOKEN = token.strip()
+    return _CAPTURED_BINDING_TOKEN
 
 
 def _runner_parent_pid_from_env() -> int | None:

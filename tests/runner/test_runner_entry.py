@@ -45,6 +45,20 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 importlib.import_module("mcp.client.streamable_http")
 
 
+@pytest.fixture(autouse=True)
+def _reset_captured_binding_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear the process-global binding-token cache before each test.
+
+    ``_runner_tunnel_binding_token_from_env`` caches the token on first read so
+    it survives the post-startup env scrub. That cache is module-global, so a
+    test that sets a token would otherwise leak it into a later test asserting
+    "no token". Reset it per test for isolation.
+    """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
+
+
 class _TrackingTerminalRegistry:
     """TerminalRegistry stand-in that records shutdown calls."""
 
@@ -902,6 +916,9 @@ def test_runner_tunnel_binding_token_from_env_returns_none_without_token(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
 
     assert _runner_tunnel_binding_token_from_env() is None
@@ -915,6 +932,9 @@ def test_runner_tunnel_binding_token_from_env_rejects_empty_token(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "  ")
 
     with pytest.raises(RuntimeError, match="must not be empty"):
@@ -929,8 +949,32 @@ def test_runner_tunnel_binding_token_from_env_strips_value(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", " bind-token ")
 
+    assert _runner_tunnel_binding_token_from_env() == "bind-token"
+
+
+def test_runner_tunnel_binding_token_survives_env_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token, captured on first read, survives a later os.environ scrub.
+
+    The sandbox launcher / child-spawn scrubbers pop the binding token from
+    ``os.environ`` after startup. A later in-process reader (e.g. the pi
+    terminal auto-create building the extension config) must still get it from
+    the captured value, or the extension's POST /events self-access 404-masks.
+    """
+    import omnigent.runner._entry as _entry
+
+    monkeypatch.setattr(_entry, "_CAPTURED_BINDING_TOKEN", None)
+    # First read at startup, before any scrub — populates the cache.
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "bind-token")
+    assert _runner_tunnel_binding_token_from_env() == "bind-token"
+    # Env scrubbed (token popped) — the reader must fall back to the capture.
+    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
     assert _runner_tunnel_binding_token_from_env() == "bind-token"
 
 

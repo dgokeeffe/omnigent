@@ -1927,6 +1927,22 @@ async def _auto_create_pi_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
+    # Guest-on-shared-host: attach the tunnel binding token so the extension's
+    # POST /events (chat mirror) is authorized against THIS session by matching
+    # the token-derived runner id against the session's runner_id. Without it the
+    # SP bearer clears the ingress but has no user grant on the human's conv, so
+    # the server 404-masks the mirror. Gated on the same flag the transcript
+    # forwarder uses (see the guest-on-shared-host block below), so it isn't sent
+    # on ordinary own-host runs.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    _pi_binding_token = _runner_tunnel_binding_token_from_env()
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR) and _pi_binding_token:
+        auth_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _pi_binding_token
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's

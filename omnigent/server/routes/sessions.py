@@ -139,6 +139,7 @@ from omnigent.runtime.policies.builder import build_policy_engine, load_session_
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence
+from omnigent.server.audit import audit_event
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -14649,6 +14650,7 @@ def create_sessions_router(
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
+        all: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -14656,6 +14658,16 @@ def create_sessions_router(
         Sessions are conversations with a non-``None`` ``agent_id``
         — i.e. those created via ``POST /v1/sessions``.
         Conversations without an agent binding are excluded.
+
+        With ``?all=true`` (admin only) the per-user ACL filter is
+        dropped and sessions across **every** owner are returned — the
+        admin fleet view, mirroring ``GET /v1/hosts?all=true``. Each item
+        already carries ``host_id``, ``runner_id``, and ``owner`` so an
+        admin can see which host/owner every session belongs to. Fails
+        closed: a non-admin passing ``all=true`` gets 403 rather than a
+        silently owner-filtered response they might mistake for the fleet.
+        The read is audited (``session.fleet.list``) since it discloses
+        every owner's sessions.
 
         :param limit: Maximum number of sessions to return
             (1-1000, default 20).
@@ -14692,8 +14704,13 @@ def create_sessions_router(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+        :param all: When ``True``, return sessions across every owner
+            (requires admin) — the admin fleet view. ``False`` (default)
+            scopes to the caller's own/shared sessions.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
+        :raises HTTPException: 403 when ``all=true`` and the caller is
+            not an admin.
         """
         # Empty-string normalization — the UI sends
         # ``?search_query=`` when the search box is cleared and
@@ -14708,12 +14725,26 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # Admin fleet view: drop the ACL filter so every owner's sessions
+        # are returned. Fail closed — a non-admin asking for all=true gets
+        # 403, never a silently owner-scoped list. Audit the disclosure.
+        fleet_view = False
+        if all:
+            is_admin = (
+                await asyncio.to_thread(permission_store.is_admin, user_id)
+                if permission_store is not None and user_id is not None
+                else False
+            )
+            if not is_admin:
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            fleet_view = True
+            audit_event("session.fleet.list", actor=user_id, target="*")
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        owned_by = None if fleet_view else (user_id if project else None)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -14721,7 +14752,7 @@ def create_sessions_router(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            accessible_by=None if fleet_view else user_id,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API

@@ -23,6 +23,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostHelloFrame,
@@ -224,6 +225,147 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
+
+
+async def test_handle_launch_refuses_when_at_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With OMNIGENT_HOST_MAX_RUNNERS set, a launch past the cap is refused
+    with the structured host_at_capacity code and no runner is spawned.
+
+    If this regresses, an unbounded fan-out of launch frames spawns a full
+    agent process each, which can OOM a fixed-resource host and kill every
+    session on it — the exact backpressure this cap exists to provide.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_MAX_RUNNERS", "1")
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # One live runner already occupies the single slot.
+    alive_proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    host._runners["runner_existing"] = _RunnerHandle(
+        proc=alive_proc, log_path=tmp_path / "runner-existing.log"
+    )
+    # Harness check would pass — isolate the capacity refusal.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: True,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_capacity",
+        binding_token="token_over",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+
+        assert isinstance(result, HostLaunchRunnerResultFrame)
+        assert result.status == "failed"
+        assert result.error_code == HOST_AT_CAPACITY_ERROR_CODE
+        assert "capacity" in (result.error or "").lower()
+        assert result.runner_id is None
+        # No NEW runner spawned; only the pre-existing one remains.
+        assert set(host._runners) == {"runner_existing"}
+    finally:
+        alive_proc.terminate()
+        alive_proc.wait()
+        _cleanup_host(host)
+
+
+async def test_handle_launch_unlimited_when_cap_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With OMNIGENT_HOST_MAX_RUNNERS unset, the capacity gate is a no-op:
+    a launch proceeds to the harness check (original behavior preserved).
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_MAX_RUNNERS", raising=False)
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    # Pre-load several live runners; without a cap none of them block a launch.
+    procs = []
+    for name in ("r_a", "r_b", "r_c"):
+        p = subprocess.Popen(
+            ["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        host._runners[name] = _RunnerHandle(proc=p, log_path=tmp_path / f"{name}.log")
+        procs.append(p)
+    # Fail the harness check so we prove the launch got PAST the capacity gate
+    # (a capacity refusal would carry a different error_code) without spawning.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_unlimited",
+        binding_token="token_ok",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+        # Reached the harness check — not stopped by capacity.
+        assert result.status == "failed"
+        assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait()
+        _cleanup_host(host)
+
+
+async def test_handle_launch_capacity_counts_only_live_runners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The cap counts only LIVE runners: a dead handle occupying the dict must
+    not consume a slot (``_alive_runner_ids`` prunes it first), so a launch
+    under a cap of 1 with only a dead runner present proceeds.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_MAX_RUNNERS", "1")
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    dead_proc = subprocess.Popen(
+        ["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    dead_proc.wait()
+    host._runners["runner_dead"] = _RunnerHandle(
+        proc=dead_proc, log_path=tmp_path / "runner-dead.log"
+    )
+    # Harness check fails so the launch stops cleanly right after the capacity
+    # gate without spawning a real runner — proving the gate did NOT refuse.
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: False,
+    )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_dead_slot",
+        binding_token="token_x",
+        workspace=str(workspace),
+        harness="codex",
+    )
+    try:
+        result = await host._handle_launch(frame)
+        # Not a capacity refusal (dead runner was pruned, slot free).
+        assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+        # And the dead handle was cleaned up as a side effect of the count.
+        assert "runner_dead" not in host._runners
+    finally:
+        _cleanup_host(host)
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(

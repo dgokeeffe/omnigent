@@ -26,6 +26,7 @@ from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -136,6 +137,33 @@ _RUNNER_WATCH_INTERVAL_S = 0.5
 # ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
 # syscall, so 2s keeps zombie lifetime short at negligible cost.
 _ORPHAN_REAP_INTERVAL_S = 2.0
+
+
+def _max_concurrent_runners() -> int | None:
+    """Max concurrent runners this host will spawn, or ``None`` for unlimited.
+
+    Read from ``OMNIGENT_HOST_MAX_RUNNERS`` at call time (not import) so a
+    redeploy can change it without a code change. On a fixed-resource host
+    (e.g. a Databricks App container: 4 vCPU / 12 GB) each runner is a full
+    agent process using 0.5-1.5 GB, so an unbounded fan-out of
+    ``host.launch_runner`` frames can OOM the box and take down every session
+    on it (cf. the zombie-OOM incident, #1782). A positive value caps the
+    fan-out; ``0`` / unset / non-numeric means unlimited (unchanged behavior).
+
+    :returns: The positive cap, or ``None`` when unlimited.
+    """
+    raw = os.environ.get("OMNIGENT_HOST_MAX_RUNNERS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning(
+            "OMNIGENT_HOST_MAX_RUNNERS=%r is not an integer — ignoring (unlimited)",
+            raw,
+        )
+        return None
+    return value if value > 0 else None
 
 
 def _install_child_subreaper() -> bool:
@@ -1049,6 +1077,34 @@ class HostProcess:
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
         """
+        # Backpressure: refuse to spawn past this host's configured runner cap.
+        # On a fixed-resource host each runner is a full agent process, so an
+        # unbounded fan-out of launch frames can OOM the box and kill every
+        # session on it. ``_alive_runner_ids`` prunes dead entries first, so the
+        # count reflects only runners actually still consuming resources.
+        # ``None`` (unset/0) preserves the original unlimited behavior.
+        max_runners = _max_concurrent_runners()
+        if max_runners is not None:
+            live = len(self._alive_runner_ids())
+            if live >= max_runners:
+                _logger.warning(
+                    "Refusing launch_runner: host %r at capacity "
+                    "(%d/%d live runners, OMNIGENT_HOST_MAX_RUNNERS)",
+                    self._identity.name,
+                    live,
+                    max_runners,
+                )
+                return HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=(
+                        f"host {self._identity.name!r} is at capacity "
+                        f"({live}/{max_runners} runners) — close a session or "
+                        f"raise OMNIGENT_HOST_MAX_RUNNERS"
+                    ),
+                    error_code=HOST_AT_CAPACITY_ERROR_CODE,
+                )
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an

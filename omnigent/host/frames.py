@@ -33,6 +33,14 @@ HarnessAvailability = bool | str
 # ``ErrorCode.HARNESS_NOT_CONFIGURED``), and tests.
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 
+# Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
+# when the host refuses a launch because it is already at its configured
+# maximum number of concurrent runners (``OMNIGENT_HOST_MAX_RUNNERS``). Lets
+# the server distinguish a capacity backpressure signal (retryable / queue
+# elsewhere) from a hard failure. Shared by the daemon (producer), server, and
+# tests.
+HOST_AT_CAPACITY_ERROR_CODE = "host_at_capacity"
+
 
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""

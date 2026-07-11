@@ -2528,7 +2528,7 @@ async def _auto_create_hermes_terminal(
     :returns: Created terminal resource view.
     """
     from omnigent.hermes_native import resolve_hermes_executable
-    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 
     # Tear down any forwarder left from a prior terminal for this session before
     # re-creating, so old and new tasks can't both mirror (double-posting), and
@@ -2647,7 +2647,21 @@ async def _auto_create_hermes_terminal(
         session_key="main",
         resource_role=HERMES_NATIVE_TERMINAL_ROLE,
         spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            # Explicit sandbox=none: an OSEnvSpec with sandbox=None resolves to
+            # the platform default (linux_bwrap on Linux) in resolve_sandbox(),
+            # which needs the `bwrap` binary — absent on hosts like a CoDA
+            # Databricks App container, so the Hermes TUI terminal 500s with
+            # "linux_bwrap sandbox requires the 'bwrap' binary on PATH" and the
+            # whole session fails to start. The hermes-native wrapper agent spec
+            # (see omnigent.hermes_native._materialize_hermes_agent_spec) already
+            # declares sandbox: none; thread the same here so the runner-owned
+            # terminal matches it. Mirrors the caller_process + sandbox=none the
+            # headless `hermes` harness uses.
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
             command=hermes_command,
             args=hermes_args,
             env=_hermes_terminal_env,
@@ -2684,6 +2698,28 @@ async def _auto_create_hermes_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session whose host it doesn't own (a shared/externally-owned host such as
+    # a CoDA Databricks App), the refresh-capable SP bearer clears the ingress
+    # but has no user grant on the human's conversation, so the forwarder's and
+    # approval mirror's POST /v1/sessions/{id}/events would be 404-masked and the
+    # Hermes transcript / dangerous-command prompts would never reach Chat.
+    # Attach the tunnel binding token so the server's runner self-access check
+    # matches the token-derived runner id against the session's runner_id and
+    # grants LEVEL_EDIT. The flag gates the header so it isn't sent on ordinary
+    # own-host runs. Mirrors the pi-/claude-native paths.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    _hermes_forward_headers: dict[str, str] = {}
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _hermes_binding_token = _runner_tunnel_binding_token_from_env()
+        if _hermes_binding_token:
+            _hermes_forward_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _hermes_binding_token
+
     from omnigent.hermes_native_bridge import read_hermes_home
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
     from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
@@ -2712,7 +2748,7 @@ async def _auto_create_hermes_terminal(
         await asyncio.gather(
             supervise_hermes_forwarder(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="hermes-native-ui",
@@ -2723,7 +2759,7 @@ async def _auto_create_hermes_terminal(
             ),
             supervise_hermes_approval_mirror(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 auth=_runner_auth,

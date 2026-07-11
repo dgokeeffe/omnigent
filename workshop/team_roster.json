@@ -1,0 +1,148 @@
+{
+  "server_app": "omnigent",
+  "server_url": "https://omnigent-7405614666872455.15.azure.databricksapps.com",
+  "facilitators": [
+    {
+      "user_id": "david.okeeffe1@coles.com.au",
+      "level": "manage"
+    }
+  ],
+  "teams": [
+    {
+      "team": "T1",
+      "host": "coda-01",
+      "grants": [
+        {
+          "user_id": "asanga.wickramasinghe@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "hariharasudhan.j@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "shree.acharya@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T2",
+      "host": "coda-02",
+      "grants": [
+        {
+          "user_id": "chris.hatton@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "john.pereyra@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "srinivasulu.reddiboina@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T3",
+      "host": "coda-03",
+      "grants": [
+        {
+          "user_id": "david.hemming@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "mahesh.chahar@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "swethakachana.kachana@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T4",
+      "host": "coda-04",
+      "grants": [
+        {
+          "user_id": "david.johnston3@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "ning.kang@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "todd.schwarzbrott@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T5",
+      "host": "coda-05",
+      "grants": [
+        {
+          "user_id": "david.sartori@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "peter.eldred@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "tom.commons@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T6",
+      "host": "coda-06",
+      "grants": [
+        {
+          "user_id": "dom.maeorg@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "pinal.desai@coles.com.au",
+          "level": "use"
+        },
+        {
+          "user_id": "uday.nagar@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T7",
+      "host": "coda-07",
+      "grants": [
+        {
+          "user_id": "fareed.akhlaq@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "prabhanjan.sindgikar@coles.com.au",
+          "level": "use"
+        }
+      ]
+    },
+    {
+      "team": "T8",
+      "host": "coda-08",
+      "grants": [
+        {
+          "user_id": "feroz.basha1@coles.com.au",
+          "level": "manage"
+        },
+        {
+          "user_id": "rakesh.gunna@coles.com.au",
+          "level": "use"
+        }
+      ]
+    }
+  ]
+}

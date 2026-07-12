@@ -146,6 +146,9 @@ const HostsPage = lazy(() => import("@/pages/HostsPage").then((m) => ({ default:
 const SessionsPage = lazy(() =>
   import("@/pages/SessionsPage").then((m) => ({ default: m.SessionsPage })),
 );
+const SharingPage = lazy(() =>
+  import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
 
 /**
  * Settings content panel. The section nav lives in the sidebar card
@@ -172,7 +175,8 @@ export function SettingsPage() {
     section === "members" ||
     section === "policies" ||
     section === "hosts" ||
-    section === "sessions"
+    section === "sessions" ||
+    section === "sharing"
   ) {
     return (
       <Suspense fallback={null}>
@@ -182,8 +186,10 @@ export function SettingsPage() {
           <PoliciesPage />
         ) : section === "hosts" ? (
           <HostsPage />
-        ) : (
+        ) : section === "sessions" ? (
           <SessionsPage />
+        ) : (
+          <SharingPage />
         )}
       </Suspense>
     );

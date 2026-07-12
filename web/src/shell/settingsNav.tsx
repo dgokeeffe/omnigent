@@ -16,6 +16,7 @@ import {
   PaletteIcon,
   PanelRightOpenIcon,
   ServerIcon,
+  Share2Icon,
   ShieldCheckIcon,
   TerminalIcon,
   UserCogIcon,
@@ -38,6 +39,7 @@ export type SettingsSectionId =
   | "policies"
   | "hosts"
   | "sessions"
+  | "sharing"
   | "archived"
   | "cli";
 
@@ -50,6 +52,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "policies",
   "hosts",
   "sessions",
+  "sharing",
   "archived",
   "cli",
 ];
@@ -116,6 +119,7 @@ export function settingsNavGroups(
         { id: "policies", label: "Policies", icon: ShieldCheckIcon },
         { id: "hosts", label: "Hosts", icon: ServerIcon },
         { id: "sessions", label: "Sessions", icon: MessagesSquareIcon },
+        { id: "sharing", label: "Sharing", icon: Share2Icon },
       ],
     });
   }

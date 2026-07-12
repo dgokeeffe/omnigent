@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import shutil
 import signal
 import subprocess
@@ -62,9 +63,10 @@ _IN_PROGRESS_EVENT = "response.in_progress"
 _FAILED_EVENT = "response.failed"
 _INTERRUPTED_EVENT = "session.interrupted"
 _POLICY_DENIED_EVENT = "response.policy_denied"
+_ELICITATION_EVENT = "response.elicitation_request"
 
 _CEL_POLICY_HANDLER = "omnigent.policies.builtins.cel.cel_policy"
-_NATIVE_DENY_REASON = "bench-native-tool-deny"
+_NATIVE_POLICY_REASON = "bench-native-tool-policy"
 _TOOL_TURN_TIMEOUT_S = 60.0
 # policy_denied may arrive after output_item.done.
 _DENY_OBSERVE_S = 15.0
@@ -223,8 +225,7 @@ class NativeTuiDriver:
         return await asyncio.to_thread(self._drive_tool_turn, deny=deny)
 
     async def run_policy_turn(self, *, action: str) -> TurnResult:
-        """Return unmeasured until native ALLOW/ASK observation is implemented."""
-        return TurnResult()
+        return await asyncio.to_thread(self._drive_policy_turn, action=action)
 
     async def run_interrupt_turn(self) -> TurnResult:
         return await asyncio.to_thread(self._drive_interrupt_turn)
@@ -504,10 +505,12 @@ class NativeTuiDriver:
                     "cannot exercise tool-call DENY"
                 )
                 return result
-            attached = self._attach_tool_deny_policy()
-            if attached is not None:
-                result.error = attached  # e.g. CEL handler unavailable -> SKIP
+            policy_id, attach_error = self._attach_tool_policy("deny")
+            if attach_error is not None:
+                result.error = attach_error
                 return result
+        else:
+            policy_id = None
 
         events: list[str] = []
         ready = threading.Event()
@@ -542,60 +545,165 @@ class NativeTuiDriver:
         token = "deny" if deny else "allow"
         prompt = self._vendor.tool_prompt.replace("omnigent-bench-ok", f"omnigent-bench-{token}")
 
-        baseline = self._tool_item_count()
         reader = threading.Thread(target=_read)
-        reader.start()
-        ready.wait(timeout=10.0)
-        self._post_message(prompt)
-        self._poll_new_tool_calls(baseline, result)
-        if deny and not result.tool_call_denied:
-            deadline = time.monotonic() + _DENY_OBSERVE_S
-            while reader.is_alive() and time.monotonic() < deadline:
-                reader.join(timeout=0.5)
-        stop.set()
-        reader.join(timeout=10.0)
+        try:
+            baseline = self._tool_item_count()
+            reader.start()
+            ready.wait(timeout=10.0)
+            self._post_message(prompt)
+            self._poll_new_tool_calls(baseline, result)
+            if deny and not result.tool_call_denied:
+                deadline = time.monotonic() + _DENY_OBSERVE_S
+                while reader.is_alive() and time.monotonic() < deadline:
+                    reader.join(timeout=0.5)
+        finally:
+            stop.set()
+            if reader.is_alive():
+                reader.join(timeout=10.0)
+            self._delete_tool_policy(policy_id)
 
         result.completed = _OUTPUT_DONE_EVENT in events or bool(result.tool_calls)
         return result
 
-    def _attach_tool_deny_policy(self) -> str | None:
-        """Attach a session policy that DENYs any tool call at the tool_call phase.
+    def _drive_policy_turn(self, *, action: str) -> TurnResult:
+        """Provoke a native tool under an explicit ALLOW or ASK policy.
 
-        Uses the registered CEL handler via ``POST /v1/sessions/{id}/policies``.
-        Denies on the *phase* alone rather than a specific tool name: the wire
-        ``event.data.name`` is the vendor's raw hook ``tool_name``, which varies
-        per vendor and is not always the item name the forwarder mirrors (codex
-        mirrors ``shell`` but its hook may report a different tool_name). Gating
-        on ``event.type == "tool_call"`` blocks whatever tool the model calls,
-        which is exactly what "is a tool-call DENY enforced?" asks. The session
-        is bench-owned, so denying every tool call in it is harmless.
-
-        Returns ``None`` on success (200/201/409); a skip-reason string when the
-        handler is unavailable (e.g. ``cel_expr_python`` not installed, so the
-        server rejects it as unregistered) — an environment gap, not a
-        capability gap.
+        ALLOW proves that a tool proceeds while an explicit policy is attached;
+        the native hook emits no positive signal that distinguishes an evaluated
+        ALLOW from its default no-op behavior.
         """
+        if action not in {"allow", "ask"}:
+            raise ValueError(f"unsupported native policy action: {action!r}")
+        assert self._client is not None and self._vendor is not None
+        result = TurnResult()
+        if not self._vendor.tool_name:
+            result.error = f"no tool-provocation mapping for {self._vendor.harness!r}; skipped"
+            return result
+        if self._policy_hook_disabled_reason:
+            result.error = (
+                f"native policy enforcement inactive ({self._policy_hook_disabled_reason}); "
+                f"cannot exercise tool-call {action.upper()}"
+            )
+            return result
+
+        policy_id, attach_error = self._attach_tool_policy(action)
+        if attach_error is not None:
+            result.error = attach_error
+            return result
+
+        ready = threading.Event()
+        stop = threading.Event()
+        elicitation_id: list[str] = []
+
+        def _read() -> None:
+            assert self._client is not None
+            event_type: str | None = None
+            try:
+                with self._client.stream(
+                    "GET",
+                    f"/v1/sessions/{self._session_id}/stream",
+                    timeout=_TOOL_TURN_TIMEOUT_S,
+                ) as resp:
+                    ready.set()
+                    for line in resp.iter_lines():
+                        if line.startswith("event:"):
+                            event_type = line[len("event:") :].strip()
+                            if action == "allow" and event_type in _READER_TERMINAL:
+                                return
+                        if line.startswith("data:"):
+                            try:
+                                frame = json.loads(line[len("data:") :].strip())
+                            except (TypeError, ValueError):
+                                continue
+                            if frame.get("type") == _ELICITATION_EVENT or (
+                                event_type == _ELICITATION_EVENT
+                            ):
+                                value = frame.get("elicitation_id")
+                                if isinstance(value, str):
+                                    elicitation_id.append(value)
+                                result.elicitation_requested = True
+                                return
+                        if stop.is_set():
+                            return
+            except httpx.HTTPError as exc:
+                result.error = repr(exc)
+
+        reader = threading.Thread(target=_read)
+        try:
+            baseline = self._tool_item_count()
+            reader.start()
+            ready.wait(timeout=10.0)
+            prompt = self._vendor.tool_prompt.replace(
+                "omnigent-bench-ok", f"omnigent-bench-{action}"
+            )
+            self._post_message(prompt)
+            deadline = time.monotonic() + _TOOL_TURN_TIMEOUT_S
+            while time.monotonic() < deadline:
+                if result.elicitation_requested:
+                    if elicitation_id:
+                        self._resolve_elicitation(elicitation_id[0])
+                    break
+                self._poll_new_tool_calls(
+                    baseline, result, timeout=min(1.0, deadline - time.monotonic())
+                )
+                if result.tool_calls:
+                    break
+            else:
+                result.timed_out = True
+        finally:
+            stop.set()
+            reader.join(timeout=10.0)
+            self._delete_tool_policy(policy_id)
+
+        result.completed = bool(result.tool_calls)
+        result.tool_call_allowed = action == "allow" and bool(result.tool_calls)
+        return result
+
+    def _attach_tool_policy(self, action: str) -> tuple[str | None, str | None]:
+        """Attach a temporary CEL policy for every native tool call."""
         assert self._client is not None
-        # Ternary so the expression returns a map (a bare comparison returns a
-        # bool, which the CEL policy treats as abstain -> ALLOW).
+        verdict = action.upper()
         expression = (
             'event.type == "tool_call" '
-            f'? {{"result": "DENY", "reason": "{_NATIVE_DENY_REASON}"}} '
+            f'? {{"result": "{verdict}", "reason": "{_NATIVE_POLICY_REASON}"}} '
             ': {"result": "ALLOW"}'
         )
         resp = self._client.post(
             f"/v1/sessions/{self._session_id}/policies",
             json={
-                "name": "bench_tool_deny",
+                "name": f"bench_tool_{action}_{uuid.uuid4().hex[:8]}",
                 "type": "python",
                 "handler": _CEL_POLICY_HANDLER,
-                "factory_params": {"expression": expression, "reason": _NATIVE_DENY_REASON},
+                "factory_params": {"expression": expression, "reason": _NATIVE_POLICY_REASON},
             },
             timeout=30.0,
         )
-        if resp.status_code in (200, 201, 409):  # 409: already attached (reused session)
-            return None
-        return f"could not attach tool-call deny policy (status {resp.status_code}); skipped"
+        if resp.status_code not in (200, 201):
+            return None, (
+                f"could not attach tool-call {action} policy (status {resp.status_code}); skipped"
+            )
+        policy_id = resp.json().get("id")
+        return (policy_id if isinstance(policy_id, str) else None), None
+
+    def _delete_tool_policy(self, policy_id: str | None) -> None:
+        if policy_id is None:
+            return
+        assert self._client is not None
+        with contextlib.suppress(httpx.HTTPError):
+            self._client.delete(
+                f"/v1/sessions/{self._session_id}/policies/{policy_id}", timeout=30.0
+            )
+
+    def _resolve_elicitation(self, elicitation_id: str) -> None:
+        assert self._client is not None
+        with contextlib.suppress(httpx.HTTPError):
+            self._client.post(
+                f"/v1/sessions/{self._session_id}/events",
+                json={
+                    "type": "approval",
+                    "data": {"elicitation_id": elicitation_id, "action": "accept"},
+                },
+            )
 
     def _tool_item_count(self) -> int:
         """Current number of function_call items in the session (pre-turn baseline)."""

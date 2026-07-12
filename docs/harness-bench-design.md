@@ -205,7 +205,7 @@ Validated for presence and shape only: `Owner`, `Transport`, `Implementation`,
 | Streaming (P0) | count output-text deltas; repeated single-delta output is `PARTIAL` |
 | Tool calling (P0) | provoke the transport's tool mechanism and require a surfaced call |
 | Policy DENY (P0) | apply a tool-call deny and require a blocked-call signal |
-| Policy ALLOW (P1) | apply an explicit allow and require a non-blocked tool output |
+| Policy ALLOW (P1) | attach an explicit allow and require a non-blocked tool output; native hooks expose no positive ALLOW event |
 | Policy ASK (P1) | apply ask and require an elicitation/approval request |
 | Model override (P0) | validate the requested harness/model pair and complete a turn |
 | Cost tracking (P1) | read priced cost or token usage from the turn/session |
@@ -286,7 +286,6 @@ The bench on `main` includes:
 
 ### Not yet wired
 
-- Policy ALLOW and ASK on `native-tui`.
 - Registry-driven server seeding for community native UI agents.
 - Steering, live queue, resume/fork, reasoning, images, and compaction probes.
 - Automatic provisioning of vendor login/provider configuration for native
@@ -353,13 +352,13 @@ stream, the bench flags a real drift on the next run, rather than a false
 | Basic turn, Streaming, Model override, Interrupt | Wrap-level observation | End-to-end server/runner observation | End-to-end server/runner/vendor observation |
 | Tool calling | Request-level wrap tool | Server-dispatched builtin | Vendor tool mirrored into session items |
 | Policy DENY | Not observable | Fixed policy blocks the builtin | Session CEL policy triggers the native policy hook |
-| Policy ALLOW / ASK | Not observable | Fixed policy; ASK observes and resolves an elicitation | Not implemented |
+| Policy ALLOW / ASK | Not observable | Fixed policy; ASK observes and resolves an elicitation | Temporary session CEL policy; ASK observes and resolves an elicitation |
 | Cost tracking | Completed-response usage when forwarded | Session snapshot usage/cost | Session snapshot when the vendor forwards usage |
 
 `full-server` remains the SDK default because it covers the deployed server
 path and all three policy actions. `--fast` trades that policy coverage for
-lower startup cost. `native-tui` now has real Tool calling and Policy DENY
-coverage; its remaining policy gap is ALLOW/ASK.
+lower startup cost. `native-tui` now has real Tool calling and all three policy
+action probes through the native hook path.
 
 ## Plugin seamlessness: where it is and isn't
 
@@ -415,8 +414,6 @@ agree with it.
 - **Registry-driven native-agent seeding** — replace the hardcoded server
   seeding list with registry iteration so community native harnesses work end
   to end after plugin installation.
-- **Policy ALLOW / ASK on `native-tui`** — attach and observe native allow/ask
-  policies with the same rigor as the shipped native DENY probe.
 - **Per-harness native provisioning** — some vendors require login or provider
   configuration that the bench deliberately cannot create. Improve diagnostics
   where possible while retaining clean skips.

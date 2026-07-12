@@ -1,8 +1,9 @@
 """Policy-ALLOW probe — does an explicit ALLOW policy let a tool call through?
 
-Drives a real ``action=allow`` tool_call policy (not mere absence of a deny) and
-checks the call proceeded. Full-server observes a non-blocked output; transports
-with no server-side policy surface return unmeasured and the probe SKIPs.
+Drives a real ``action=allow`` tool_call policy and checks the call proceeded
+while that policy was attached. The native hook has no positive ALLOW event, so
+this measures non-blocking under an explicit policy rather than proving the hook
+evaluated it. Transports with no policy surface return unmeasured and SKIP.
 """
 
 from __future__ import annotations

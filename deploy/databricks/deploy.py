@@ -25,6 +25,7 @@ including first-time infrastructure setup.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -385,6 +386,44 @@ def build_uv_pyproject(
     )
 
 
+def _sanitize_lock_proxy_urls(lock: Path) -> None:
+    """Rewrite internal pypi-proxy URLs in ``uv.lock`` to public PyPI.
+
+    The Databricks Apps build environment cannot reach
+    ``pypi-proxy.cloud.databricks.com``, so any URL pointing at it 404s
+    at install time. But a machine whose global uv config pins the proxy
+    as the default index bakes proxy hostnames into every lock entry
+    regardless of ``--index-url``. The proxy is a caching mirror of PyPI
+    with an identical ``/packages/<hash>/`` layout, so swapping only the
+    hostname preserves every version and sha256 pin; uv re-verifies the
+    hashes on install.
+    """
+    text = lock.read_text()
+    rewritten = (
+        text.replace(
+            "https://pypi-proxy.cloud.databricks.com/packages/",
+            "https://files.pythonhosted.org/packages/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple/",
+            "https://pypi.org/simple/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple",
+            "https://pypi.org/simple",
+        )
+    )
+    if rewritten == text:
+        return
+    lock.write_text(rewritten)
+    if "pypi-proxy.cloud.databricks.com" in rewritten:
+        raise RuntimeError(
+            f"{lock} still references pypi-proxy after rewrite; "
+            "the Apps build env cannot reach it"
+        )
+    _log(f"rewrote pypi-proxy URLs → public PyPI in {lock.name}")
+
+
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
@@ -406,6 +445,10 @@ def run_uv_lock(src: Path) -> None:
         env=env,
         check=True,
     )
+    # A global uv config pinning the proxy as default can still bake proxy
+    # hostnames into the lock even when we pass --index-url. The Apps build
+    # env can't reach the proxy, so sanitize the resolved lock to public PyPI.
+    _sanitize_lock_proxy_urls(src / "uv.lock")
 
 
 def write_uv_dependency_files(
@@ -595,6 +638,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--profile-token-auth",
+        action="store_true",
+        help=(
+            "Read the --profile's cached OAuth token and use bearer auth "
+            "(DATABRICKS_HOST + DATABRICKS_TOKEN) for the SDK and CLI instead "
+            "of profile auth. Use when the SDK's forced token refresh fails "
+            "in a spawned subprocess (macOS keychain write denied, "
+            "'cache update: exit status 161'). The token comes from the same "
+            "--profile, so it cannot route to a different workspace."
+        ),
+    )
+    parser.add_argument(
         "--version",
         default=None,
         help=(
@@ -646,11 +701,59 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _clear_env_vars() -> None:
+def _clear_env_vars(keep: Iterable[str] = ()) -> None:
+    keep = set(keep)
     for name in _ENV_VARS_TO_CLEAR:
+        if name in keep:
+            continue
         if name in os.environ:
             _log(f"unsetting {name} to avoid leaking into the SDK")
             del os.environ[name]
+
+
+def _setup_profile_token_auth(profile: str) -> None:
+    """Switch to bearer auth using the profile's cached OAuth token.
+
+    The SDK's ``databricks-cli`` credential strategy force-refreshes the
+    token on every init, which writes to the macOS keychain — denied for
+    a spawned subprocess ("cache update: exit status 161"). Reading the
+    *cached* token (no ``--force-refresh``) succeeds, and exporting it as
+    ``DATABRICKS_TOKEN`` makes both the SDK and the CLI use bearer auth,
+    skipping the refresh entirely. The token is scoped to ``profile``, so
+    it cannot authenticate against a different workspace.
+    """
+    token_json = subprocess.run(
+        ["databricks", "auth", "token", "--profile", profile],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    token = json.loads(token_json)["access_token"]
+    host = subprocess.run(
+        ["databricks", "auth", "env", "--profile", profile],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    host_url = json.loads(host).get("env", {}).get("DATABRICKS_HOST", "")
+    if not host_url:
+        raise SystemExit(f"could not resolve DATABRICKS_HOST for profile {profile!r}")
+    os.environ["DATABRICKS_HOST"] = host_url
+    os.environ["DATABRICKS_TOKEN"] = token
+    _log(f"--profile-token-auth: using cached bearer token for {profile} ({host_url})")
+
+
+def _workspace_client(args: argparse.Namespace) -> WorkspaceClient:
+    """Construct the SDK client, honoring --profile-token-auth.
+
+    With token auth, DATABRICKS_HOST + DATABRICKS_TOKEN are already in the
+    env, so a bare client uses bearer auth and skips the profile refresh.
+    """
+    from databricks.sdk import WorkspaceClient as _WorkspaceClient
+
+    if getattr(args, "profile_token_auth", False):
+        return _WorkspaceClient()
+    return _WorkspaceClient(profile=args.profile) if args.profile else _WorkspaceClient()
 
 
 def _ensure_bound(args: argparse.Namespace) -> None:
@@ -669,10 +772,9 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     success.
     """
     # Late-import so --help works without the SDK.
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import NotFound
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
     try:
         wc.apps.get(name=args.app_name)
     except NotFound:
@@ -766,6 +868,11 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
 
 
 def _profile_arg(args: argparse.Namespace) -> list[str]:
+    # With --profile-token-auth the CLI authenticates via DATABRICKS_HOST +
+    # DATABRICKS_TOKEN in the env; passing --profile too would re-trigger the
+    # keychain refresh we're avoiding.
+    if getattr(args, "profile_token_auth", False):
+        return []
     return ["--profile", args.profile] if args.profile else []
 
 
@@ -816,7 +923,14 @@ def _ensure_app_sp_uc_traversal(
 
 def main() -> int:
     args = _parse_args()
-    _clear_env_vars()
+    if args.profile_token_auth:
+        if not args.profile:
+            raise SystemExit("--profile-token-auth requires --profile")
+        _setup_profile_token_auth(args.profile)
+        # Keep the token we just set; clear the rest.
+        _clear_env_vars(keep={"DATABRICKS_TOKEN"})
+    else:
+        _clear_env_vars()
     _assert_clean_tree(skip=args.allow_dirty)
 
     base_version = _read_base_version()
@@ -859,10 +973,7 @@ def main() -> int:
             "because uv lock validates path sources locally."
         )
 
-    # Late-import the SDK so `--help` works without it installed.
-    from databricks.sdk import WorkspaceClient
-
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
 
     # 1) Prep the bundle's source_code_path (src/) — sweep stale
     # wheels locally, then copy the new small wheels in.

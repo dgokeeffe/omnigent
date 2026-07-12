@@ -418,8 +418,7 @@ def _sanitize_lock_proxy_urls(lock: Path) -> None:
     lock.write_text(rewritten)
     if "pypi-proxy.cloud.databricks.com" in rewritten:
         raise RuntimeError(
-            f"{lock} still references pypi-proxy after rewrite; "
-            "the Apps build env cannot reach it"
+            f"{lock} still references pypi-proxy after rewrite; the Apps build env cannot reach it"
         )
     _log(f"rewrote pypi-proxy URLs → public PyPI in {lock.name}")
 
@@ -620,6 +619,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: run 'python app.py' instead of "
+            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
+            "drop the platform telemetry_export_destinations. Use for "
+            "workspaces with no OTel collector / UC OTel tables — otherwise "
+            "span exports fail DEADLINE_EXCEEDED to localhost:4317."
+        ),
+    )
+    parser.add_argument(
         "--target",
         default="prod",
         help=(
@@ -698,7 +708,15 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --no-otel selects the tracer-off DAB target (same workspace + state as
+    # `prod`, OTel variables overridden off). Only auto-switch the default
+    # target so an explicit --target still wins; if a caller pairs --no-otel
+    # with a custom --target, that target must define the OTel-off overrides
+    # itself.
+    if args.no_otel and args.target == "prod":
+        args.target = "prod-no-otel"
+    return args
 
 
 def _clear_env_vars(keep: Iterable[str] = ()) -> None:

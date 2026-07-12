@@ -448,7 +448,7 @@ def create_hosts_router(
 
             def _count_sessions() -> dict[str, int]:
                 return {
-                    h.host_id: len(conversation_store.list_conversations_by_host_id(h.host_id))
+                    h.host_id: conversation_store.count_conversations_by_host_id(h.host_id)
                     for h in hosts
                 }
 
@@ -1249,6 +1249,7 @@ def create_hosts_router(
             raise HTTPException(status_code=400, detail=exc.message) from exc
 
         return {"object": "list", "data": worktrees}
+
     # ── Host sharing (permissions) ────────────────────────────────
     # Owner / admin / a `manage` grantee may view and mutate grants. An
     # app-SP-owned CoDA host can't use the UI, so its first grant is

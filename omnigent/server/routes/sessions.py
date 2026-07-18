@@ -182,6 +182,9 @@ from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user as _authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -207,6 +210,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
@@ -935,6 +939,35 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
+
+# A runner capability may use the shared event endpoint only for events that
+# originate from the runner itself. Human controls and item inputs (notably a
+# user-role ``message``) continue through normal user permission checks.
+_RUNNER_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        _MCP_ELICITATION_TYPE,
+        "compaction",
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MCP_STARTUP_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_MODEL_OPTIONS_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    }
+)
 
 # Validates every dict that crosses the AP→client SSE boundary on
 # the session stream. Built once at module load.
@@ -6623,6 +6656,7 @@ async def _validate_session_workspace(
             host_store=host_store_inst,
             host_permission_store=host_permission_store_inst,
             permission_store=permission_store_inst,
+            admin_list=getattr(request.app.state, "admin_list", None),
         )
         host_name = host.name
 
@@ -15047,6 +15081,7 @@ def create_sessions_router(
                     conversation_store=conversation_store,
                     permission_store=permission_store,
                     host_permission_store=host_permission_store_inst,
+                    admin_list=getattr(request.app.state, "admin_list", None),
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)
@@ -15323,19 +15358,17 @@ def create_sessions_router(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
-        # Single permission pass: authorize + resolve the display level +
-        # fetch the conversation once, then reuse the conversation in the
-        # snapshot (the snapshot's read is skipped). Replaces the former
-        # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id,
+        # Runner capability or human permission in one pass: a runner with
+        # a matching binding token reads its own session snapshot; a human
+        # resolves the display level + conversation in the same round trip.
+        access = await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.READ_SESSION,
             LEVEL_READ,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -16907,18 +16940,16 @@ def create_sessions_router(
             400 if the body fails JSON parse or is missing
             ``tool_name``.
         """
-        user_id = _get_user_id(request, auth_provider)
-        # Use the level-aware helper so the runner's tunnel binding token can
-        # authorize a guest approval prompt on a shared externally-owned host
-        # (header auth mode has no mintable owner identity). The resolved level
-        # is unused here; this route only needs READ.
-        await _require_access_and_level(
-            user_id,
+        # Runner capability or human permission: a runner evaluates policy
+        # hooks on its own session via the binding token; a human needs READ.
+        await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.EVALUATE_POLICY,
             LEVEL_READ,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         try:
             payload = await request.json()
@@ -17242,15 +17273,16 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id,
+        access = await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.EVALUATE_POLICY,
             LEVEL_READ,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
+        user_id = access.user_id
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
             payload = await request.json()
@@ -20079,16 +20111,17 @@ def create_sessions_router(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id,
+        auth = await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.APPEND_EVENT,
             LEVEL_EDIT,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
-        conv = access.conversation
+        user_id = auth.user_id
+        conv = auth.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
@@ -20103,6 +20136,11 @@ def create_sessions_router(
                 f"Unknown event type: {body.type!r}. "
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        if auth.is_runner and body.type not in _RUNNER_EVENT_TYPES:
+            raise OmnigentError(
+                f"Runner capability cannot submit event type {body.type!r}",
+                code=ErrorCode.FORBIDDEN,
             )
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
@@ -21842,14 +21880,14 @@ def create_sessions_router(
         :returns: The bound agent's :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id,
+        access = await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.READ_SESSION_SPEC,
             LEVEL_READ,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:
@@ -21898,14 +21936,14 @@ def create_sessions_router(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id,
+        access = await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.READ_SESSION_SPEC,
             LEVEL_READ,
+            auth_provider,
             permission_store,
             conversation_store,
-            runner_binding_token=request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
         )
         conv = access.conversation
         if conv is None:

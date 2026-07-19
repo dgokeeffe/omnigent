@@ -155,6 +155,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.audit import audit_event
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -183,6 +184,9 @@ from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user as _authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -208,6 +212,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
@@ -936,6 +941,35 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
+
+# A runner capability may use the shared event endpoint only for events that
+# originate from the runner itself. Human controls and item inputs (notably a
+# user-role ``message``) continue through normal user permission checks.
+_RUNNER_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        _MCP_ELICITATION_TYPE,
+        "compaction",
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MCP_STARTUP_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_MODEL_OPTIONS_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    }
+)
 
 # Validates every dict that crosses the AP→client SSE boundary on
 # the session stream. Built once at module load.
@@ -6545,9 +6579,9 @@ async def _validate_session_workspace(
     See ``designs/SESSION_WORKSPACE_SELECTION.md`` for the full
     semantic spec.
 
-    The caller's host ownership is checked BEFORE the ``host.stat``
-    round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
+    The caller's host access is checked BEFORE the ``host.stat``
+    round-trip the validation performs, so a caller without ``use``
+    never reaches the host (raises 403/404 via ``resolve_host_access``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.
@@ -6603,21 +6637,28 @@ async def _validate_session_workspace(
             code=ErrorCode.INTERNAL_ERROR,
         )
 
-    # Authorize host ownership FIRST — before loading the agent spec or
-    # the host.stat round-trip below. A non-owner must be rejected
-    # (403/404 via the shared resolve_host_owner) before we touch the
-    # host or even read the agent bundle (cross-user host probe). The
-    # returned host also gives the display name for error messages.
-    from omnigent.server.routes._host_launch import resolve_host_owner
+    # Authorize host access FIRST — before loading the agent spec or
+    # the host.stat round-trip below. A caller without `use` must be
+    # rejected (403/404 via the shared resolve_host_access) before we
+    # touch the host or even read the agent bundle (cross-user host
+    # probe). Browsing the host filesystem requires `use` — the same
+    # privilege as launching on it. The returned host also gives the
+    # display name for error messages.
+    from omnigent.server.routes._host_launch import resolve_host_access
 
     host_name: str | None = None
     host_store_inst = getattr(request.app.state, "host_store", None)
-    if host_store_inst is not None:
+    host_permission_store_inst = getattr(request.app.state, "host_permission_store", None)
+    permission_store_inst = getattr(request.app.state, "permission_store", None)
+    if host_store_inst is not None and host_permission_store_inst is not None:
         host = await asyncio.to_thread(
-            resolve_host_owner,
+            resolve_host_access,
             user_id=user_id,
             host_id=host_id,
             host_store=host_store_inst,
+            host_permission_store=host_permission_store_inst,
+            permission_store=permission_store_inst,
+            admin_list=getattr(request.app.state, "admin_list", None),
         )
         host_name = host.name
 
@@ -6685,6 +6726,7 @@ async def _launch_runner_on_host(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    permission_store: PermissionStore | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6702,6 +6744,12 @@ async def _launch_runner_on_host(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param permission_store: Permission store, used to resolve the session
+        owner so the frame can tell the runner to authenticate its
+        callbacks as the session owner when that owner differs from the
+        host owner (the shared / externally-owned-host case). ``None``
+        skips the resolution → the flag stays ``False`` (today's
+        host-owner-credential behavior).
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -6731,6 +6779,18 @@ async def _launch_runner_on_host(
         )
         return _HostLaunchAttempt(runner_id=new_runner_id)
     request_id = secrets.token_hex(8)
+    # When the session owner differs from the host owner (a shared /
+    # externally-owned host, e.g. a service-principal-owned Databricks App
+    # host serving another user's session), tell the runner to authenticate
+    # its server callbacks as the SESSION owner via the binding-token mint —
+    # the host-owner credential can't read a guest session's spec, so its
+    # spec callbacks 404 and the native terminal fails to start. Equal owners
+    # (the common own-host case) leave this False → today's behavior.
+    session_owner = _get_session_owner_id(conv.id, permission_store)
+    host_owner = host_conn.owner
+    prefer_binding_token_mint = (
+        session_owner is not None and host_owner is not None and session_owner != host_owner
+    )
     launch_future: asyncio.Future[dict[str, str | None]] = (
         asyncio.get_running_loop().create_future()
     )
@@ -6745,6 +6805,7 @@ async def _launch_runner_on_host(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            prefer_binding_token_mint=prefer_binding_token_mint,
         )
     )
     try:
@@ -15009,7 +15070,12 @@ def create_sessions_router(
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
-            if host_registry is not None and host_store_inst is not None:
+            host_permission_store_inst = getattr(request.app.state, "host_permission_store", None)
+            if (
+                host_registry is not None
+                and host_store_inst is not None
+                and host_permission_store_inst is not None
+            ):
                 from omnigent.host.frames import (
                     HostLaunchRunnerFrame,
                     encode_host_frame,
@@ -15026,6 +15092,8 @@ def create_sessions_router(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
+                    host_permission_store=host_permission_store_inst,
+                    admin_list=getattr(request.app.state, "admin_list", None),
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)
@@ -15056,6 +15124,15 @@ def create_sessions_router(
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
+                # Guest on a shared / externally-owned host (session owner !=
+                # host owner): tell the runner to authenticate its server
+                # callbacks with its binding token (matched to the session's
+                # runner_id) instead of the host-owner credential, which can't
+                # read a guest session's spec (404). Equal owners (own-host)
+                # leave this False → unchanged.
+                prefer_binding_token_mint = (
+                    user_id is not None and conn.owner is not None and user_id != conn.owner
+                )
                 launch_frame = encode_host_frame(
                     HostLaunchRunnerFrame(
                         request_id=request_id,
@@ -15067,6 +15144,7 @@ def create_sessions_router(
                         # spawning. None (agent not resolvable) skips the
                         # host-side check.
                         harness=resp.harness,
+                        prefer_binding_token_mint=prefer_binding_token_mint,
                     )
                 )
                 host_registry.send_text(conn, launch_frame)
@@ -15292,14 +15370,17 @@ def create_sessions_router(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
-        # Single permission pass: authorize + resolve the display level +
-        # fetch the conversation once, then reuse the conversation in the
-        # snapshot (the snapshot's read is skipped). Replaces the former
-        # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Runner capability or human permission in one pass: a runner with
+        # a matching binding token reads its own session snapshot; a human
+        # resolves the display level + conversation in the same round trip.
+        access = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -15375,6 +15456,7 @@ def create_sessions_router(
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
+        all: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -15382,6 +15464,16 @@ def create_sessions_router(
         Sessions are conversations with a non-``None`` ``agent_id``
         — i.e. those created via ``POST /v1/sessions``.
         Conversations without an agent binding are excluded.
+
+        With ``?all=true`` (admin only) the per-user ACL filter is
+        dropped and sessions across **every** owner are returned — the
+        admin fleet view, mirroring ``GET /v1/hosts?all=true``. Each item
+        already carries ``host_id``, ``runner_id``, and ``owner`` so an
+        admin can see which host/owner every session belongs to. Fails
+        closed: a non-admin passing ``all=true`` gets 403 rather than a
+        silently owner-filtered response they might mistake for the fleet.
+        The read is audited (``session.fleet.list``) since it discloses
+        every owner's sessions.
 
         :param limit: Maximum number of sessions to return
             (1-1000, default 20).
@@ -15418,8 +15510,13 @@ def create_sessions_router(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+        :param all: When ``True``, return sessions across every owner
+            (requires admin) — the admin fleet view. ``False`` (default)
+            scopes to the caller's own/shared sessions.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
+        :raises HTTPException: 403 when ``all=true`` and the caller is
+            not an admin.
         """
         # Empty-string normalization — the UI sends
         # ``?search_query=`` when the search box is cleared and
@@ -15434,12 +15531,26 @@ def create_sessions_router(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # Admin fleet view: drop the ACL filter so every owner's sessions
+        # are returned. Fail closed — a non-admin asking for all=true gets
+        # 403, never a silently owner-scoped list. Audit the disclosure.
+        fleet_view = False
+        if all:
+            is_admin = (
+                await asyncio.to_thread(permission_store.is_admin, user_id)
+                if permission_store is not None and user_id is not None
+                else False
+            )
+            if not is_admin:
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            fleet_view = True
+            audit_event("session.fleet.list", actor=user_id, target="*")
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        owned_by = None if fleet_view else (user_id if project else None)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -15447,7 +15558,7 @@ def create_sessions_router(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            accessible_by=None if fleet_view else user_id,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API
@@ -16841,9 +16952,16 @@ def create_sessions_router(
             400 if the body fails JSON parse or is missing
             ``tool_name``.
         """
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Runner capability or human permission: a runner evaluates policy
+        # hooks on its own session via the binding token; a human needs READ.
+        await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.EVALUATE_POLICY,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
         try:
             payload = await request.json()
@@ -17167,10 +17285,18 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        request_user_id = _get_user_id(request, auth_provider)
+        access = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.EVALUATE_POLICY,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
+            request_user_id,
         )
+        user_id = access.user_id
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
             payload = await request.json()
@@ -19999,11 +20125,17 @@ def create_sessions_router(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        auth = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.APPEND_EVENT,
+            LEVEL_EDIT,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
-        conv = access.conversation
+        user_id = auth.user_id
+        conv = auth.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
@@ -20018,6 +20150,11 @@ def create_sessions_router(
                 f"Unknown event type: {body.type!r}. "
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        if auth.is_runner and body.type not in _RUNNER_EVENT_TYPES:
+            raise OmnigentError(
+                f"Runner capability cannot submit event type {body.type!r}",
+                code=ErrorCode.FORBIDDEN,
             )
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
@@ -20829,6 +20966,7 @@ def create_sessions_router(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        permission_store=getattr(request.app.state, "permission_store", None),
                     )
                     if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
                         # The host refused: the agent's harness isn't
@@ -21756,9 +21894,14 @@ def create_sessions_router(
         :returns: The bound agent's :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        access = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION_SPEC,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
         conv = access.conversation
         if conv is None:
@@ -21807,9 +21950,14 @@ def create_sessions_router(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        access = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION_SPEC,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
         conv = access.conversation
         if conv is None:

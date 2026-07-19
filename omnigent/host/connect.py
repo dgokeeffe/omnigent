@@ -338,6 +338,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # execute it on demand so Apps-proxy auth can refresh without receiving
         # a static token or client secret.
         "OMNIGENT_DATABRICKS_TOKEN_COMMAND",
+        # Loopback address consumed by CoDA's token helper command. This is
+        # configuration, not a credential; the broker itself remains bound to
+        # 127.0.0.1 and mints short-lived app-SP bearers on demand.
+        "CODA_SP_TOKEN_BROKER_URL",
         # Runtime config/data-dir selection. These are filesystem PATHS, not
         # secrets, so they're safe to propagate to the host owner's own
         # daemon/runner subprocesses. They MUST propagate so the whole local

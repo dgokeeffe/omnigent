@@ -1712,6 +1712,23 @@ async def test_build_runner_env_propagates_databricks_token_command() -> None:
     assert env["OMNIGENT_DATABRICKS_TOKEN_COMMAND"] == "/opt/bin/fresh-token"
 
 
+async def test_build_runner_env_propagates_loopback_token_broker_url() -> None:
+    """The non-secret loopback broker address reaches the token command."""
+    env = _build_runner_env(
+        {
+            "PATH": "/usr/bin:/bin",
+            "CODA_SP_TOKEN_BROKER_URL": "http://127.0.0.1:4010/token",
+        },
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert env["CODA_SP_TOKEN_BROKER_URL"] == "http://127.0.0.1:4010/token"
+
+
 def test_build_runner_env_propagates_data_dir_paths_not_db_uri() -> None:
     """
     The runtime data/config-dir PATH vars propagate to runners so the whole

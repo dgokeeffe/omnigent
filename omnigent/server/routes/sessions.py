@@ -17273,6 +17273,7 @@ def create_sessions_router(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
+        request_user_id = _get_user_id(request, auth_provider)
         access = await _authorize_runner_or_user(
             request,
             session_id,
@@ -17281,6 +17282,7 @@ def create_sessions_router(
             auth_provider,
             permission_store,
             conversation_store,
+            request_user_id,
         )
         user_id = access.user_id
         is_read_only = access.level is not None and access.level < LEVEL_EDIT

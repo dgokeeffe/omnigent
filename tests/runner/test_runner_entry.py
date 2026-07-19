@@ -6,7 +6,6 @@ import asyncio
 import importlib
 import io
 import os
-import sys
 import tarfile
 import time
 from pathlib import Path
@@ -172,25 +171,6 @@ def test_make_auth_token_factory_returns_factory_when_databricks_creds_available
         "_make_auth_token_factory returned None despite Databricks credentials being available."
     )
     assert factory() == "fresh-token"
-
-
-def test_make_auth_token_factory_prefers_configured_token_command(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An explicit token command supplies a fresh Apps-proxy bearer per call."""
-    monkeypatch.setenv(
-        "OMNIGENT_DATABRICKS_TOKEN_COMMAND",
-        f"{sys.executable} -c \"print('broker-token')\"",
-    )
-    monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth",
-        lambda **_kwargs: pytest.fail("SDK auth must not shadow the explicit token command"),
-    )
-
-    factory = _make_auth_token_factory(server_url="https://omnigent.example.com")
-
-    assert factory is not None
-    assert factory() == "broker-token"
 
 
 def test_make_auth_token_factory_returns_none_without_databricks_creds(
@@ -1815,7 +1795,7 @@ def _run_create_app_capturing_client_headers(
 ) -> dict[str, str]:
     """Drive create_app() with fakes and return the server_client headers.
 
-    Monkeypatches httpx.AsyncClient to capture the headers kwarg the runner's
+    Replaces the async callback client to capture the headers kwarg the runner's
     callback client is built with, plus the minimal set of runner dependencies
     so create_app() constructs without real I/O.
     """

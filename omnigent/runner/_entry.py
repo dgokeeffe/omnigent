@@ -12,7 +12,9 @@ import asyncio
 import contextlib
 import logging
 import os
+import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +40,7 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
+_DATABRICKS_TOKEN_COMMAND_ENV_VAR = "OMNIGENT_DATABRICKS_TOKEN_COMMAND"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 # Re-mint a managed runner's owner JWT this many seconds before it
@@ -291,9 +294,10 @@ def _make_auth_token_factory(
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
+      1. Explicit token command from ``OMNIGENT_DATABRICKS_TOKEN_COMMAND``.
+      2. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      2. Databricks OAuth token (refreshed via the SDK) — host-keyed
+      3. Databricks OAuth token (refreshed via the SDK) — host-keyed
          when a Databricks Apps pointer record is stored for
          ``server_url`` (``omnigent login <apps-url>``), ambient
          otherwise.
@@ -325,6 +329,21 @@ def _make_auth_token_factory(
     )
 
     resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+    token_command = os.environ.get(_DATABRICKS_TOKEN_COMMAND_ENV_VAR, "").strip()
+
+    if token_command:
+        def _command_token() -> str | None:
+            result = subprocess.run(
+                shlex.split(token_command),
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            token = result.stdout.strip()
+            return token if result.returncode == 0 and token else None
+
+        return _command_token
 
     # Reused Databricks SDK auth, resolved once on first use and cached
     # here for the life of the factory. Reusing one Config is the whole

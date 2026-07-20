@@ -634,6 +634,17 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
+    parser.add_argument(
+        "--publish-wheels-to-volume",
+        action="store_true",
+        help=(
+            "Also upload the built wheels to the artifact volume under "
+            "<volume>/wheels/<version>/ so an external runtime (e.g. a "
+            "coding-agents-on-Databricks-Apps process) can install "
+            "Omnigent from the volume. Does not affect how the app "
+            "itself installs wheels (always the workspace source snapshot)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -753,6 +764,14 @@ def _profile_arg(args: argparse.Namespace) -> list[str]:
     return ["--profile", args.profile] if args.profile else []
 
 
+def _split_volume(volume_name: str) -> tuple[str, str, str]:
+    """Split a ``catalog.schema.volume`` name, or exit with a clear error."""
+    parts = volume_name.split(".")
+    if len(parts) != 3:
+        raise SystemExit(f"--volume-name {volume_name!r} must be catalog.schema.volume")
+    return parts[0], parts[1], parts[2]
+
+
 def _ensure_app_sp_uc_traversal(
     args: argparse.Namespace,
     app_sp: str | None,
@@ -767,10 +786,7 @@ def _ensure_app_sp_uc_traversal(
         _log("app SP not resolved yet; skipping UC traversal grants")
         return
 
-    parts = args.volume_name.split(".")
-    if len(parts) != 3:
-        raise SystemExit(f"--volume-name {args.volume_name!r} must be catalog.schema.volume")
-    catalog, schema_only, _ = parts
+    catalog, schema_only, _ = _split_volume(args.volume_name)
     schema_fqn = f"{catalog}.{schema_only}"
 
     import json as _json
@@ -796,6 +812,30 @@ def _ensure_app_sp_uc_traversal(
             capture_output=True,
             text=True,
         )
+
+
+def _publish_wheels_to_volume(
+    wc,  # WorkspaceClient — untyped; imported lazily in main()
+    args: argparse.Namespace,
+    wheels: list[Path],
+    deploy_version: str,
+) -> None:
+    """Upload the built wheels to the artifact volume for external consumers.
+
+    The app itself always installs wheels from the workspace source
+    snapshot (``uv lock`` rejects volume path sources at build time).
+    This is a *separate*, opt-in publish so a runtime that can reach the
+    volume — e.g. a coding-agents-on-Databricks-Apps process — can
+    ``uv pip install`` Omnigent from ``/Volumes/…/wheels/<version>/`` at
+    runtime. Version-namespaced so multiple deploys coexist. Idempotent.
+    """
+    catalog, schema, volume = _split_volume(args.volume_name)
+    base = f"/Volumes/{catalog}/{schema}/{volume}/wheels/{deploy_version}"
+    for wheel in wheels:
+        target = f"{base}/{wheel.name}"
+        _log(f"publish {wheel.name} → {target}")
+        with wheel.open("rb") as fh:
+            wc.files.upload(file_path=target, contents=fh, overwrite=True)
 
 
 def main() -> int:
@@ -857,6 +897,14 @@ def main() -> int:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
+
+    # 1a) Optionally publish the built wheels to the artifact volume for
+    # external consumers (see --publish-wheels-to-volume). Independent of
+    # the app's own install path (the workspace source snapshot above).
+    if args.publish_wheels_to_volume:
+        _publish_wheels_to_volume(
+            wc, args, [*classified.small, *classified.oversize], deploy_version
+        )
 
     # 2) Generate pyproject.toml + uv.lock. Remove requirements.txt
     # first because Databricks Apps gives it precedence over uv.

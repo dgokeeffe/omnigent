@@ -44,6 +44,8 @@ resources:
             value_from: artifact_volume
           - name: OTEL_TRACES_SAMPLER
             value: 'always_on'
+          - name: OMNIGENT_ADMINS
+            value: 'david.okeeffe@databricks.com,simonpeter.johnston@databricks.com'
       resources:
         - name: postgres
           postgres:
@@ -77,6 +79,45 @@ targets:
           # in default storage ("Cannot export App telemetry to tables in
           # default storage"), so this requires a workspace with a custom
           # storage location — drop this block if yours has none.
+          telemetry_export_destinations:
+            - unity_catalog:
+                logs_table: ${var.otel_table_schema}.otel_logs
+                metrics_table: ${var.otel_table_schema}.otel_metrics
+                traces_table: ${var.otel_table_schema}.otel_spans
+  lakemeter:
+    mode: production
+    workspace:
+      host: https://fe-vm-lakemeter.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    resources:
+      apps:
+        omnigent:
+          telemetry_export_destinations:
+            - unity_catalog:
+                logs_table: ${var.otel_table_schema}.otel_logs
+                metrics_table: ${var.otel_table_schema}.otel_metrics
+                traces_table: ${var.otel_table_schema}.otel_spans
+  aws-daveok:
+    mode: production
+    workspace:
+      host: https://fe-sandbox-dok-aws-sandbox.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    resources:
+      apps:
+        omnigent:
+          telemetry_export_destinations:
+            - unity_catalog:
+                logs_table: ${var.otel_table_schema}.otel_logs
+                metrics_table: ${var.otel_table_schema}.otel_metrics
+                traces_table: ${var.otel_table_schema}.otel_spans
+  aws-syd:
+    mode: production
+    workspace:
+      host: https://dbc-d8b32eb0-866b.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    resources:
+      apps:
+        omnigent:
           telemetry_export_destinations:
             - unity_catalog:
                 logs_table: ${var.otel_table_schema}.otel_logs

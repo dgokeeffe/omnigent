@@ -16105,11 +16105,18 @@ def create_sessions_router(
         body: AutomaticSessionRenameRequest,
     ) -> AutomaticSessionRenameResponse:
         """Replace the deterministic first-message title when still current."""
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id,
+        # Runner capability OR human permission. sys_session_rename is a
+        # framework auto-title on the runner's OWN session; the bound
+        # runner authenticates via its binding token — the only credential
+        # it can present when the session owner differs from the host owner
+        # (in-app / shared host). This is a same-session metadata write and
+        # still no-ops unless the current title is the deterministic seed.
+        await _authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.RENAME_SESSION,
             LEVEL_EDIT,
+            auth_provider,
             permission_store,
             conversation_store,
         )

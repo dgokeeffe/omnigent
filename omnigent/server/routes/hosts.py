@@ -459,7 +459,7 @@ def create_hosts_router(
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
-            owned = host.owner == viewer
+            owned = host.user_id == viewer
             level = await asyncio.to_thread(
                 get_host_permission_level,
                 user_id,
@@ -480,7 +480,7 @@ def create_hosts_router(
             entry: dict[str, Any] = {
                 "host_id": host.host_id,
                 "name": host.name,
-                "owner": host.owner,
+                "owner": host.user_id,
                 "status": "online" if host_is_live(host, now=now) else "offline",
                 # Non-None marks a server-managed sandbox host (e.g.
                 # "modal"). Clients use it to hide sandbox-backed
@@ -552,13 +552,13 @@ def create_hosts_router(
         return {
             "host_id": host.host_id,
             "name": host.name,
-            "owner": host.owner,
+            "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
-            "owned_by_current_user": host.owner == (user_id if user_id is not None else "local"),
+            "owned_by_current_user": host.user_id == (user_id if user_id is not None else "local"),
             "permission_level": _permission_level_name(level),
             "runners": [],
         }
@@ -879,7 +879,7 @@ def create_hosts_router(
             raise HTTPException(status_code=404, detail="host not found")
         if (
             user_id is not None
-            and host.owner != user_id
+            and host.user_id != user_id
             and not await asyncio.to_thread(_is_admin_caller, user_id)
         ):
             raise HTTPException(status_code=403, detail="not your host")
@@ -912,7 +912,7 @@ def create_hosts_router(
             actor=user_id,
             target=host_id,
             host_name=host.name,
-            host_owner=host.owner,
+            host_owner=host.user_id,
         )
         return {"status": "shutting_down"}
 
@@ -1366,7 +1366,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         # host is non-None (the manage check 404s otherwise), but the
         # owner can't be a grantee — ownership already grants everything.
-        if host is not None and host.owner == user_id:
+        if host is not None and host.user_id == user_id:
             raise HTTPException(
                 status_code=400,
                 detail="host owner already has full access; cannot grant",

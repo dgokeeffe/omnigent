@@ -23,7 +23,7 @@ from omnigent.server.routes._host_launch import (
 class _FakeHost:
     host_id: str = "host_1"
     name: str = "test-host"
-    owner: str = "alice"
+    user_id: str = "alice"
 
 
 @dataclass
@@ -85,7 +85,7 @@ class TestResolveHostAccess:
         assert exc_info.value.status_code == 404
 
     def test_wrong_owner_no_grant_403(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         with pytest.raises(HTTPException) as exc_info:
             resolve_host_access(
@@ -98,7 +98,7 @@ class TestResolveHostAccess:
         assert exc_info.value.status_code == 403
 
     def test_correct_owner(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_access(
             user_id="alice",
@@ -110,7 +110,7 @@ class TestResolveHostAccess:
         assert result.host_id == "host_1"
 
     def test_use_grantee_allowed(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         grants = _FakeHostPermissionStore(grants={("alice", "host_1"): HOST_LEVEL_USE})
         result = resolve_host_access(
@@ -125,7 +125,7 @@ class TestResolveHostAccess:
     def test_view_grantee_403_at_use_level(self) -> None:
         # `view` shows the host in listings but must not authorize the
         # default `use`-level access (browse/launch).
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         grants = _FakeHostPermissionStore(grants={("alice", "host_1"): HOST_LEVEL_VIEW})
         with pytest.raises(HTTPException) as exc_info:
@@ -139,7 +139,7 @@ class TestResolveHostAccess:
         assert exc_info.value.status_code == 403
 
     def test_no_auth_skips_access_check(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="bob")
+        host = _FakeHost(host_id="host_1", user_id="bob")
         store = _FakeHostStore(hosts={"host_1": host})
         result = resolve_host_access(
             user_id=None,
@@ -156,7 +156,7 @@ class TestResolveHostAccess:
 
 class TestResolveHostLaunch:
     def test_host_offline_409(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry()  # empty = no connections
         conv_store = _FakeConversationStore()
@@ -174,7 +174,7 @@ class TestResolveHostLaunch:
         assert exc_info.value.status_code == 409
 
     def test_missing_session_404(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         store = _FakeHostStore(hosts={"host_1": host})
         registry = _FakeHostRegistry(conns={"host_1": conn})
@@ -193,7 +193,7 @@ class TestResolveHostLaunch:
         assert exc_info.value.status_code == 404
 
     def test_success_no_auth(self) -> None:
-        host = _FakeHost(host_id="host_1", owner="alice")
+        host = _FakeHost(host_id="host_1", user_id="alice")
         conn = object()
         conv = Conversation(
             id="s1",

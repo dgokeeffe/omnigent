@@ -5,7 +5,7 @@ integer: 1=view, 2=use, 3=manage. Unlike the session permission store
 there is no ``"__public__"`` sentinel — host sharing is explicit
 per-user opt-in (see the feature spec, SR-007).
 
-The host owner (``hosts.owner``) and admins are NOT stored here; their
+The host owner (``hosts.user_id``) and admins are NOT stored here; their
 access is resolved in :func:`omnigent.server.host_permissions.check_host_access`.
 """
 

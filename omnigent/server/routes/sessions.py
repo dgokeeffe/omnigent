@@ -22222,10 +22222,26 @@ def create_sessions_router(
                 detail="MCP proxy requires a runner_router; none configured on this server",
             )
 
-        user_id = _require_user(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        # Runner capability OR human permission. The bound runner
+        # dispatches its own session's MCP tool calls through this proxy
+        # authenticated by its tunnel binding token — the only credential
+        # it can present when the session owner differs from the host
+        # owner (in-app / shared host), where its inherited credential is
+        # not the session owner and cannot pass the human EDIT check.
+        # Full TOOL_CALL / TOOL_RESULT policy still runs in
+        # _handle_mcp_tools_call, so this does not widen runner authority.
+        # A human client (or own-host runner whose Bearer is the owner)
+        # authorizes via the EDIT fallback.
+        _mcp_auth = await _authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.PROXY_MCP,
+            LEVEL_EDIT,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
+        user_id = _mcp_auth.user_id
 
         # Parse JSON-RPC body. Return a parse-error response (not HTTP
         # 400) on failure — JSON-RPC errors travel in the body.

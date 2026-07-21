@@ -21,6 +21,13 @@ variables:
       UC schema (catalog.schema) holding the OTel destination tables.
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
+  app_command:
+    description: >
+      App container entrypoint. Defaults to running under
+      opentelemetry-instrument; targets on managed/default-storage catalogs
+      (no telemetry export) override this to plain ["python", "app.py"].
+    type: complex
+    default: ["opentelemetry-instrument", "python", "app.py"]
 
 resources:
   apps:
@@ -36,7 +43,7 @@ resources:
       # set it out-of-band via apps.create_update in deploy.py before
       # the bundle deploy runs.
       config:
-        command: ["opentelemetry-instrument", "python", "app.py"]
+        command: ${var.app_command}
         env:
           - name: AP_LAKEBASE_ENDPOINT
             value_from: postgres
@@ -69,6 +76,8 @@ targets:
       host: https://example.databricks.com   # ← your workspace URL
       # Isolate state per app so one bundle can deploy multiple apps.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    variables:
+      app_command: ["opentelemetry-instrument", "python", "app.py"]
     resources:
       apps:
         omnigent:
@@ -89,19 +98,18 @@ targets:
     workspace:
       host: https://fe-vm-lakemeter.cloud.databricks.com
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
-    resources:
-      apps:
-        omnigent:
-          telemetry_export_destinations:
-            - unity_catalog:
-                logs_table: ${var.otel_table_schema}.otel_logs
-                metrics_table: ${var.otel_table_schema}.otel_metrics
-                traces_table: ${var.otel_table_schema}.otel_spans
+    variables:
+      # gridsense is a managed catalog; the App telemetry-export API rejects
+      # tables in managed/default storage, so run without OTel export (no
+      # telemetry_export_destinations below) and drop opentelemetry-instrument.
+      app_command: ["python", "app.py"]
   aws-daveok:
     mode: production
     workspace:
       host: https://fe-sandbox-dok-aws-sandbox.cloud.databricks.com
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    variables:
+      app_command: ["opentelemetry-instrument", "python", "app.py"]
     resources:
       apps:
         omnigent:
@@ -115,6 +123,8 @@ targets:
     workspace:
       host: https://dbc-d8b32eb0-866b.cloud.databricks.com
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}
+    variables:
+      app_command: ["opentelemetry-instrument", "python", "app.py"]
     resources:
       apps:
         omnigent:

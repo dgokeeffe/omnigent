@@ -9,6 +9,11 @@
 #
 #   make deploy   PROFILE=aws-syd      # full build + deploy + run + health
 #   make redeploy PROFILE=aws-syd      # reuse existing wheels (skip build)
+#
+# Retarget the catalog/volume for a run (without editing the profile):
+#   make deploy PROFILE=aws-syd CATALOG=my_cat            # my_cat.omnigent.artifacts
+#   make deploy PROFILE=aws-syd CATALOG=my_cat SCHEMA=my_schema
+#   make deploy PROFILE=aws-syd VOLUME_NAME=c.s.vol OTEL_TABLE_SCHEMA=c.s
 #   make health   PROFILE=aws-syd      # just hit /health
 #   make config   PROFILE=aws-daveok   # print resolved vars for a profile
 #   make list-profiles
@@ -26,6 +31,18 @@ ifeq ($(wildcard $(_PROFILE_MK)),)
 $(error unknown PROFILE '$(PROFILE)' — no $(_PROFILE_MK). Run 'make list-profiles')
 endif
 include $(_PROFILE_MK)
+
+# --- optional catalog/volume override ---------------------------------------
+# Setting CATALOG retargets omnigent's artifact volume + OTel tables for this
+# run without touching the profile. SCHEMA/VOLUME default to the usual layout.
+# Explicit VOLUME_NAME / OTEL_TABLE_SCHEMA on the command line still win (they
+# override any makefile assignment), so split namespaces stay possible.
+SCHEMA ?= omnigent
+VOLUME ?= artifacts
+ifneq ($(strip $(CATALOG)),)
+  VOLUME_NAME       := $(CATALOG).$(SCHEMA).$(VOLUME)
+  OTEL_TABLE_SCHEMA := $(CATALOG).$(SCHEMA)
+endif
 
 # --- fixed environment facts (see skill) ------------------------------------
 # pypi.org is blocked locally; build + lock through the Databricks proxy.
@@ -74,6 +91,8 @@ config: ## Print the resolved variables for PROFILE
 	@echo "APP_NAME          = $(APP_NAME)"
 	@echo "LAKEBASE_BRANCH   = $(LAKEBASE_BRANCH)"
 	@echo "LAKEBASE_DATABASE = $(LAKEBASE_DATABASE)"
+	@echo "CATALOG           = $(CATALOG)"
+	@echo "SCHEMA            = $(SCHEMA)"
 	@echo "VOLUME_NAME       = $(VOLUME_NAME)"
 	@echo "OTEL_TABLE_SCHEMA = $(OTEL_TABLE_SCHEMA)"
 	@echo "APP_URL           = $(APP_URL)"

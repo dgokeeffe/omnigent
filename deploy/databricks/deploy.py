@@ -776,11 +776,14 @@ def _ensure_app_sp_uc_traversal(
     args: argparse.Namespace,
     app_sp: str | None,
 ) -> None:
-    """Grant USE_CATALOG + USE_SCHEMA to the app SP on the volume's parents.
+    """Grant the app SP the UC privileges it needs on the artifact volume.
 
-    Apps' ``uc_securable`` only grants the leaf (WRITE_VOLUME); the
-    SP can boot but 403s on first volume read if the parent catalog
-    doesn't grant USE to ``account users``. Idempotent.
+    Apps' ``uc_securable`` only grants the leaf WRITE_VOLUME, and only when
+    the volume already exists at bundle-deploy time. The SP still needs
+    USE_CATALOG/USE_SCHEMA to traverse, and READ_VOLUME to load agent specs
+    (it 403s on first volume read otherwise). Grant WRITE_VOLUME here too so
+    a volume created out-of-band (after the last deploy) is fully usable.
+    Idempotent.
     """
     if not app_sp:
         _log("app SP not resolved yet; skipping UC traversal grants")
@@ -791,12 +794,13 @@ def _ensure_app_sp_uc_traversal(
 
     import json as _json
 
-    for kind, fqn, priv in (
-        ("catalog", catalog, "USE_CATALOG"),
-        ("schema", schema_fqn, "USE_SCHEMA"),
+    for kind, fqn, privs in (
+        ("catalog", catalog, ["USE_CATALOG"]),
+        ("schema", schema_fqn, ["USE_SCHEMA"]),
+        ("volume", args.volume_name, ["READ_VOLUME", "WRITE_VOLUME"]),
     ):
-        _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
-        payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
+        _log(f"granting {', '.join(privs)} on {kind} {fqn} → app SP {app_sp}")
+        payload = _json.dumps({"changes": [{"principal": app_sp, "add": privs}]})
         subprocess.run(
             [
                 "databricks",

@@ -611,6 +611,39 @@ async def test_coda_two_sessions_adopt_one_host(
     assert env.host_store.get_host(first.host_id) is None
 
 
+async def test_cancelled_coda_owner_launch_waiter_deletes_session() -> None:
+    from omnigent.server.routes.sessions.routes_core import _await_coda_owner_launch
+
+    release = asyncio.Event()
+
+    async def sibling_launch() -> None:
+        await release.wait()
+
+    deleted: list[str] = []
+
+    class _ConversationStore:
+        async def delete_conversation(self, session_id: str) -> None:
+            deleted.append(session_id)
+
+    launch_task = asyncio.create_task(sibling_launch())
+    waiter = asyncio.create_task(
+        _await_coda_owner_launch(
+            launch_task,
+            session_id="cancelled-session",
+            conversation_store=_ConversationStore(),  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert deleted == ["cancelled-session"]
+    assert not launch_task.done()
+    release.set()
+    await launch_task
+
+
 async def test_concurrent_first_coda_sessions_single_flight_one_host(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,

@@ -190,6 +190,20 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
 
+async def _await_coda_owner_launch(
+    launch_task: asyncio.Task[None],
+    *,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Await a sibling launch and remove this waiter if its request is cancelled."""
+    try:
+        await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        await conversation_store.delete_conversation(session_id)
+        raise
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -518,7 +532,11 @@ def register_core_routes(
                     if adopted is not None or launch_scheduled:
                         break
                     if wait_for_owner_launch is not None:
-                        await asyncio.shield(wait_for_owner_launch)
+                        await _await_coda_owner_launch(
+                            wait_for_owner_launch,
+                            session_id=resp.id,
+                            conversation_store=conversation_store,
+                        )
 
             if adopted is None and not launch_scheduled:
                 managed_launches.begin(resp.id)

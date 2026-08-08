@@ -96,6 +96,16 @@ def test_provision_acquires_fenced_lease() -> None:
     assert body["lease_id"] == sandbox_id.rsplit("#", 1)[1]
 
 
+def test_provision_refuses_to_claim_existing_lease_generation() -> None:
+    control = FakeControl()
+    control.responses["/api/omnigent-host/lease"] = {"lease_id": "lease-existing"}
+
+    with pytest.raises(click.ClickException, match="already provisioning"):
+        launcher(control).provision("managed-abcd")
+
+    assert all(path != "/api/omnigent-host/disconnect" for _, path, _ in control.calls)
+
+
 def test_start_host_posts_identity_and_returns_reported_workspace() -> None:
     control = FakeControl()
     provider = launcher(control)

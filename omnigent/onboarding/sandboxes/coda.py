@@ -159,6 +159,11 @@ class CodaProvider(SandboxHostLauncher):
         acquired_id = result.get("lease_id", lease_id)
         if not isinstance(acquired_id, str) or not acquired_id:
             raise click.ClickException("CoDA lease response omitted lease_id")
+        if acquired_id != lease_id:
+            # Existing-host adoption uses allocate_workspace. A provisioning
+            # attempt must never claim an older generation, because its failure
+            # cleanup could otherwise disconnect and scrub the sibling host.
+            raise click.ClickException("CoDA lease is already provisioning for this owner")
         return f"coda:{self._app_name}#{acquired_id}"
 
     def start_host(

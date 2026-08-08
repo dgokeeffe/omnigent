@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -608,6 +609,123 @@ async def test_coda_two_sessions_adopt_one_host(
     assert env.host_store.get_host(first.host_id) is not None
     assert (await env.client.delete(f"/v1/sessions/{second.id}")).status_code == 200
     assert env.host_store.get_host(first.host_id) is None
+
+
+async def test_concurrent_first_coda_sessions_single_flight_one_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+    from omnigent.runner.identity import token_bound_runner_id
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    provision_started = threading.Event()
+    release_provision = threading.Event()
+    provision_calls: list[str] = []
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    class GateCoda(CodaProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                app_name="coda-main",
+                app_url="https://coda.example.com",
+                request_fn=lambda _method, _path, _body: {},
+                app_getter=lambda _: None,
+            )
+
+        def prepare(self) -> None:
+            return None
+
+        def provision(self, name: str) -> str:
+            provision_calls.append(name)
+            provision_started.set()
+            if not release_provision.wait(timeout=10):
+                raise AssertionError("provision gate timed out")
+            return "coda:coda-main#lease-a"
+
+        def start_host(self, _sandbox_id: str, **kwargs: object) -> str:
+            future = asyncio.run_coroutine_threadsafe(
+                _fake_sandbox_host(
+                    env.app,
+                    str(kwargs["host_id"]),
+                    str(kwargs["host_name"]),
+                    str(kwargs["token"]),
+                ),
+                loop,
+            )
+            host_futures.append(asyncio.wrap_future(future, loop=loop))
+            return "/app/python/source_code/coda-sessions/first"
+
+        def allocate_workspace(self, _sandbox_id: str, session_id: str) -> str:
+            return f"/app/python/source_code/coda-sessions/{session_id}"
+
+    fake = GateCoda()
+    env.app.state.sandbox_config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=13 * 3600,
+        provider="coda",
+        max_sessions_per_lease=10,
+    )
+    agent = await create_test_agent(env.client, name="coda-single-flight-agent")
+    first_resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert first_resp.status_code == 201
+    assert await asyncio.to_thread(provision_started.wait, 5)
+
+    second_post = asyncio.create_task(
+        env.client.post("/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"})
+    )
+    await asyncio.sleep(0.2)
+    assert len(provision_calls) == 1
+    assert not second_post.done()
+
+    release_provision.set()
+    first = await _wait_for_managed_binding(env, first_resp.json()["id"])
+    tunnel = await host_futures[0]
+
+    async def answer_adopted_runner() -> None:
+        for _ in range(50):
+            output = await tunnel.receive_output(timeout=10.0)
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostLaunchRunnerFrame):
+                await tunnel.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostLaunchRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="launched",
+                                runner_id=token_bound_runner_id(frame.binding_token),
+                            )
+                        ),
+                    }
+                )
+                return
+        raise AssertionError("adopted host did not receive runner launch")
+
+    responder = asyncio.create_task(answer_adopted_runner())
+    second_resp = await second_post
+    await responder
+    assert second_resp.status_code == 201
+    second = env.conv_store.get_conversation(second_resp.json()["id"])
+    assert second is not None
+    assert len(provision_calls) == 1
+    assert len(host_futures) == 1
+    assert first.host_id == second.host_id
+    assert first.runner_id != second.runner_id
+    assert first.workspace != second.workspace
 
 
 async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(

@@ -190,6 +190,20 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
 
+async def _await_coda_owner_launch(
+    launch_task: asyncio.Task[None],
+    *,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Await a sibling launch and remove this waiter if its request is cancelled."""
+    try:
+        await asyncio.shield(launch_task)
+    except asyncio.CancelledError:
+        await conversation_store.delete_conversation(session_id)
+        raise
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -401,73 +415,130 @@ def register_core_routes(
                 )
             owner = user_id if user_id is not None else RESERVED_USER_LOCAL
             adopted = None
+            launch_scheduled = False
             if sandbox_config.provider == "coda":
                 from omnigent.onboarding.sandboxes.coda import CodaProvider
                 from omnigent.stores.host_store import host_is_live
 
-                # Capacity check + workspace allocation + DB bind are one
-                # critical section. Without it, concurrent creates can both
-                # observe the last free slot on a shared lease.
+                # Capacity, allocation, binding, and the no-host launch decision
+                # are one owner-scoped single-flight. A second create arriving
+                # before the first host registers waits for that launch, then
+                # adopts it instead of provisioning the same lease twice.
                 adoption_lock = getattr(request.app.state, "coda_adoption_lock", None)
                 if adoption_lock is None:
                     adoption_lock = asyncio.Lock()
                     request.app.state.coda_adoption_lock = adoption_lock
-                async with adoption_lock:
-                    hosts = await asyncio.to_thread(host_store_for_managed.list_hosts, owner)
-                    candidates = [
-                        host
-                        for host in hosts
-                        if host.sandbox_provider == "coda"
-                        and host.sandbox_id is not None
-                        and host_is_live(host)
-                    ]
-                    if candidates:
-                        sessions = await asyncio.to_thread(
-                            conversation_store.list_conversations,
-                            limit=1000,
-                            kind=None,
-                        )
-                        cap = sandbox_config.max_sessions_per_lease or 10
-                        adopted = next(
-                            (
-                                host
-                                for host in candidates
-                                if sum(
-                                    session.host_id == host.host_id for session in sessions.data
+                owner_launches = getattr(request.app.state, "coda_owner_launches", None)
+                if owner_launches is None:
+                    owner_launches = {}
+                    request.app.state.coda_owner_launches = owner_launches
+
+                while True:
+                    wait_for_owner_launch = None
+                    async with adoption_lock:
+                        hosts = await asyncio.to_thread(host_store_for_managed.list_hosts, owner)
+                        candidates = [
+                            host
+                            for host in hosts
+                            if host.sandbox_provider == "coda"
+                            and host.sandbox_id is not None
+                            and host_is_live(host)
+                        ]
+                        if candidates:
+                            sessions = await asyncio.to_thread(
+                                conversation_store.list_conversations,
+                                limit=1000,
+                                kind=None,
+                            )
+                            cap = sandbox_config.max_sessions_per_lease or 10
+                            adopted = next(
+                                (
+                                    host
+                                    for host in candidates
+                                    if sum(
+                                        session.host_id == host.host_id
+                                        for session in sessions.data
+                                    )
+                                    < cap
+                                ),
+                                None,
+                            )
+                        if adopted is not None:
+                            launcher = sandbox_config.launcher_factory()
+                            if not isinstance(launcher, CodaProvider):
+                                raise OmnigentError(
+                                    "coda sandbox config did not produce a CodaProvider",
+                                    code=ErrorCode.INTERNAL_ERROR,
                                 )
-                                < cap
-                            ),
-                            None,
+                            try:
+                                workspace = await asyncio.to_thread(
+                                    launcher.allocate_workspace,
+                                    adopted.sandbox_id,
+                                    resp.id,
+                                )
+                                await asyncio.to_thread(
+                                    conversation_store.set_host_id,
+                                    resp.id,
+                                    adopted.host_id,
+                                    workspace,
+                                )
+                            except Exception:
+                                # Session creation is atomic from the caller's
+                                # perspective: a failed CoDA allocation must not
+                                # leave an unbound durable conversation behind.
+                                await conversation_store.delete_conversation(resp.id)
+                                raise
+                            resp.host_id = adopted.host_id
+                            resp.workspace = workspace
+                            launch_host_id = adopted.host_id
+                        else:
+                            wait_for_owner_launch = owner_launches.get(owner)
+                            if wait_for_owner_launch is None:
+                                managed_launches.begin(resp.id)
+                                _publish_sandbox_status(resp.id, "provisioning")
+                                launch_task = asyncio.create_task(
+                                    _run_managed_launch(
+                                        session_id=resp.id,
+                                        owner=owner,
+                                        sandbox_config=sandbox_config,
+                                        repo=repo,
+                                        tracker=managed_launches,
+                                        conversation_store=conversation_store,
+                                        host_store=host_store_for_managed,
+                                        host_registry=getattr(
+                                            request.app.state, "host_registry", None
+                                        ),
+                                        tunnel_registry=getattr(
+                                            request.app.state, "tunnel_registry", None
+                                        ),
+                                        agent_store=agent_store,
+                                        agent_id=conv.agent_id if conv is not None else None,
+                                    )
+                                )
+                                owner_launches[owner] = launch_task
+
+                                def _clear_owner_launch(
+                                    task: asyncio.Task[None],
+                                    *,
+                                    launch_owner: str = owner,
+                                ) -> None:
+                                    if owner_launches.get(launch_owner) is task:
+                                        owner_launches.pop(launch_owner, None)
+
+                                _managed_launch_tasks.add(launch_task)
+                                launch_task.add_done_callback(_managed_launch_tasks.discard)
+                                launch_task.add_done_callback(_clear_owner_launch)
+                                launch_scheduled = True
+                    if adopted is not None or launch_scheduled:
+                        break
+                    if wait_for_owner_launch is not None:
+                        await _await_coda_owner_launch(
+                            wait_for_owner_launch,
+                            session_id=resp.id,
+                            conversation_store=conversation_store,
                         )
-                    if adopted is not None:
-                        launcher = sandbox_config.launcher_factory()
-                        if not isinstance(launcher, CodaProvider):
-                            raise OmnigentError(
-                                "coda sandbox config did not produce a CodaProvider",
-                                code=ErrorCode.INTERNAL_ERROR,
-                            )
-                        try:
-                            workspace = await asyncio.to_thread(
-                                launcher.allocate_workspace,
-                                adopted.sandbox_id,
-                                resp.id,
-                            )
-                            await asyncio.to_thread(
-                                conversation_store.set_host_id,
-                                resp.id,
-                                adopted.host_id,
-                                workspace,
-                            )
-                        except Exception:
-                            # Session creation is atomic from the caller's
-                            # perspective: a failed CoDA allocation must not
-                            # leave an unbound durable conversation behind.
-                            await conversation_store.delete_conversation(resp.id)
-                            raise
-                        resp.host_id = adopted.host_id
-                        resp.workspace = workspace
-                        launch_host_id = adopted.host_id
-            if adopted is None:
+
+            if adopted is None and not launch_scheduled:
                 managed_launches.begin(resp.id)
                 # Seed the launch-progress indicator before the background
                 # task starts, so the first GET snapshot already carries it.

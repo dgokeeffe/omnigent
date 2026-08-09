@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import AsyncIterator, Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -266,12 +267,17 @@ def _runner_request_headers(
 
     token = factory() if factory is not None else None
     ingress_bearer = getattr(factory, "ingress_bearer", None)
-    headers = databricks_request_headers(server_url, bearer_token=ingress_bearer or token)
-    if ingress_bearer and token:
+    if ingress_bearer:
+        if not token:
+            raise RuntimeError(
+                "managed runner owner token unavailable while Apps ingress bearer is set"
+            )
         from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
 
+        headers = databricks_request_headers(server_url, bearer_token=ingress_bearer)
         headers[RUNNER_OWNER_TOKEN_HEADER] = token
-    return headers
+        return headers
+    return databricks_request_headers(server_url, bearer_token=token)
 
 
 class _RunnerDatabricksAuth(httpx.Auth):
@@ -341,15 +347,20 @@ class _RunnerDatabricksAuth(httpx.Auth):
         if self._factory is not None:
             token = self._factory()
             if not token:
+                ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+                if ingress_bearer:
+                    raise httpx.RequestError(
+                        "Apps ingress bearer is available but owner token refresh failed",
+                        request=request,
+                    )
                 if getattr(self._factory, "declined", False):
-                    # The server definitively refuses to mint for this runner
-                    # (managed mint factory hit HTTP 400/404 after install —
-                    # e.g. its construction probe lost a boot race to a
-                    # no-auth server). Bare requests are correct there; do
-                    # NOT fail closed or the runner bricks every callback.
+                    # The server definitively refuses managed minting (e.g.
+                    # an older no-auth server); bare requests are correct.
                     yield request
                     return
-                raise httpx.RequestError("Databricks token refresh returned no token")
+                raise httpx.RequestError(
+                    "Databricks token refresh returned no token", request=request
+                )
             ingress_bearer = getattr(self._factory, "ingress_bearer", None)
             if ingress_bearer:
                 from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
@@ -361,19 +372,53 @@ class _RunnerDatabricksAuth(httpx.Auth):
         response = yield request
         if self._factory is None:
             return
-        if _is_login_redirect_or_unauthorized(response):
-            _invalidate_auth_token_factory(self._factory)
-            token = self._factory()
-            if token:
-                ingress_bearer = getattr(self._factory, "ingress_bearer", None)
-                if ingress_bearer:
-                    from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+        if _is_apps_login_redirect(response):
+            invalidate_ingress = getattr(self._factory, "invalidate_ingress", None)
+            if callable(invalidate_ingress):
+                invalidate_ingress()
+            else:
+                _invalidate_auth_token_factory(self._factory)
+        elif response.status_code in (401, 403):
+            # A response from the application is not proof that the Apps
+            # front door rejected its ingress bearer. Keep that credential
+            # and refresh only the owner token (or the ordinary factory).
+            invalidate_owner = getattr(self._factory, "invalidate_owner", None)
+            if callable(invalidate_owner):
+                invalidate_owner()
+            else:
+                _invalidate_auth_token_factory(self._factory)
+        else:
+            return
 
-                    request.headers["Authorization"] = f"Bearer {ingress_bearer}"
-                    request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
-                else:
-                    request.headers["Authorization"] = f"Bearer {token}"
-                yield request
+        try:
+            token = self._factory()
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError, OSError) as exc:
+            raise httpx.RequestError(
+                "Databricks authentication refresh failed", request=request
+            ) from exc
+        if not token:
+            raise httpx.RequestError(
+                "Databricks authentication refresh returned no owner token",
+                request=request,
+            )
+        ingress_bearer = getattr(self._factory, "ingress_bearer", None)
+        from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
+
+        if ingress_bearer:
+            request.headers["Authorization"] = f"Bearer {ingress_bearer}"
+            request.headers[RUNNER_OWNER_TOKEN_HEADER] = token
+        else:
+            request.headers["Authorization"] = f"Bearer {token}"
+            request.headers.pop(RUNNER_OWNER_TOKEN_HEADER, None)
+        yield request
+
+
+def _is_apps_login_redirect(response: httpx.Response) -> bool:
+    """Return whether a response is an Apps OAuth ingress rejection."""
+    if not response.is_redirect:
+        return False
+    location = response.headers.get("location", "")
+    return "/oidc/" in location or "/.auth/" in location
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
@@ -456,11 +501,17 @@ class _InitialAuthTokenFactory:
             # initial bearer was injected once and cannot self-renew. Skip
             # managed mint entirely and go straight to SDK/OIDC.
             if getattr(self._fallback_factory, "proxy_auth_failed", False):
-                self._fallback_factory = _make_auth_token_factory(
-                    self._server_url,
-                    _allow_initial_token=False,
-                    _allow_delegated_mint=False,
-                )
+                # The launch bearer may have expired before the runner
+                # started. Resolve a replacement Apps-ingress credential
+                # before falling back to ordinary user auth; the latter is
+                # an owner credential and must not be relabelled as ingress.
+                self._fallback_factory = self._managed_factory_from_fresh_ingress()
+                if self._fallback_factory is None:
+                    self._fallback_factory = self._ordinary_fallback_factory()
+            elif self._fallback_factory is None:
+                self._fallback_factory = self._managed_factory_from_fresh_ingress()
+                if self._fallback_factory is None:
+                    self._fallback_factory = self._ordinary_fallback_factory()
             if self._fallback_factory is None:
                 _logger.error(
                     "host bootstrap bearer expired and no SDK/OIDC credential is available "
@@ -470,20 +521,84 @@ class _InitialAuthTokenFactory:
             return self._fallback_factory()
 
     @property
+    def ingress_bearer(self) -> str | None:
+        """Expose the fallback's Apps-ingress bearer, when it has one."""
+        with self._lock:
+            return getattr(self._fallback_factory, "ingress_bearer", None)
+
+    @property
     def declined(self) -> bool:
         """True when the inner fallback factory has definitively declined."""
         with self._lock:
             f = self._fallback_factory
             return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
-    def invalidate(self) -> bool:
-        """Discard the host bearer so the next call resolves local auth."""
+    def _invalidate_initial_or_fallback(self, operation: str) -> bool:
+        """Invalidate the active bootstrap or fallback credential state."""
         with self._lock:
-            if self._initial_token is None:
-                return False
-            self._initial_token = None
-            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
-            return True
+            if self._initial_token is not None:
+                self._initial_token = None
+                _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+                return True
+            fallback = self._fallback_factory
+        invalidate = getattr(fallback, operation, None)
+        return bool(invalidate()) if callable(invalidate) else False
+
+    def invalidate_owner(self) -> bool:
+        """Invalidate the active owner credential, or leave bootstrap mode."""
+        return self._invalidate_initial_or_fallback("invalidate_owner")
+
+    def invalidate_ingress(self) -> bool:
+        """Invalidate the active Apps-ingress credential and its owner token."""
+        return self._invalidate_initial_or_fallback("invalidate_ingress")
+
+    def invalidate(self) -> bool:
+        """Backward-compatible alias for invalidating ingress state."""
+        return self.invalidate_ingress()
+
+    def _ordinary_fallback_factory(self) -> Callable[[], str | None] | None:
+        """Resolve non-managed auth unless profile ingress must fail closed."""
+        from omnigent.runner.identity import (
+            RUNNER_DELEGATED_AUTH_ENV_VAR,
+            RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        )
+
+        delegated = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+        binding = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+        profile = os.environ.get("DATABRICKS_CONFIG_PROFILE", "").strip()
+        if delegated and binding and profile and _is_databricks_owned_server_url(self._server_url):
+            _logger.error(
+                "managed runner could not resolve a fresh Apps ingress bearer for profile %r",
+                profile,
+            )
+            return None
+        return _make_auth_token_factory(
+            self._server_url,
+            _allow_initial_token=False,
+            _allow_delegated_mint=False,
+        )
+
+    def _managed_factory_from_fresh_ingress(
+        self,
+    ) -> Callable[[], str | None] | None:
+        """Build managed auth from a freshly resolved Apps bearer."""
+        from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+
+        binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+        if not binding_token:
+            return None
+        try:
+            ingress_factory = _make_ingress_auth_token_factory(self._server_url)
+            ingress_bearer = ingress_factory() if ingress_factory is not None else None
+            if not ingress_bearer:
+                return None
+            return _make_managed_mint_factory(
+                self._server_url,
+                binding_token,
+                proxy_bearer=ingress_bearer,
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError, OSError, ImportError):
+            return None
 
 
 def _make_auth_token_factory(
@@ -691,6 +806,60 @@ def _make_auth_token_factory(
     return None
 
 
+def _is_databricks_owned_server_url(server_url: str) -> bool:
+    """Return whether *server_url* is hosted on a Databricks-owned domain."""
+    hostname = (urllib.parse.urlsplit(server_url).hostname or "").lower().rstrip(".")
+    return hostname in {"databricks.com", "databricksapps.com"} or hostname.endswith(
+        (".databricks.com", ".databricksapps.com")
+    )
+
+
+def _make_ingress_auth_token_factory(
+    server_url: str,
+) -> Callable[[], str | None] | None:
+    """Resolve only the Databricks OAuth credential for an Apps ingress.
+
+    The Apps front door accepts a token minted for the workspace that hosts
+    the app. Stored Omnigent OIDC/session tokens are owner credentials and
+    must never be relabelled as ingress credentials.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _resolve_databricks_auth,
+    )
+
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        resolve_kwargs: dict[str, str] = {"host": workspace_host}
+    else:
+        # CoDA materializes an explicit profile in the runner environment but
+        # does not create an Omnigent login pointer. Only trust that profile
+        # for a Databricks-owned origin; never send its credential to an
+        # arbitrary server merely because the profile is present.
+        if not _is_databricks_owned_server_url(server_url):
+            return None
+        profile = os.environ.get("DATABRICKS_CONFIG_PROFILE", "").strip()
+        if not profile:
+            return None
+        resolve_kwargs = {"profile": profile}
+    try:
+        sdk_auth, _host = _resolve_databricks_auth(**resolve_kwargs)
+    except (DatabricksAuthError, ImportError, ValueError, RuntimeError, OSError):
+        return None
+
+    def _factory() -> str | None:
+        try:
+            return sdk_auth.current_token()
+        except (DatabricksAuthError, httpx.HTTPError, RuntimeError, ValueError, OSError):
+            return None
+
+    # Keep the narrow type explicit: the SDK auth is the only source used.
+    _ = cast(_DatabricksBearerAuth, sdk_auth)
+    return _factory
+
+
 def _make_managed_mint_factory(
     server_url: str,
     binding_token: str,
@@ -721,8 +890,7 @@ def _make_managed_mint_factory(
         refreshes).
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
-        400 no-auth/header mode, 404 older server without the endpoint, or a
-        Databricks Apps OAuth redirect before the request reaches the app) —
+        400 no-auth/header mode or 404 older server without the endpoint) —
         the runner then uses the legacy credential path. A *transient* probe
         failure still installs the factory, which re-mints on the next
         callback (so a blip at boot does not leave the runner unauthenticated
@@ -738,8 +906,7 @@ def _make_managed_mint_factory(
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
-    # provider / header mode), 404 (an older server without the endpoint), or
-    # an Apps OAuth redirect that happens before the request reaches Omnigent.
+    # provider / header mode) or 404 (an older server without the endpoint).
     # Every other outcome installs the factory: a success seeds the cache; a
     # transient failure (network blip, 5xx, timeout) installs it anyway so the
     # next callback re-mints, rather than leaving the runner unauthenticated
@@ -758,8 +925,7 @@ class _ManagedMintTokenFactory:
 
     Each call returns the cached JWT until it nears expiry, then re-mints
     via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
-    refusal (HTTP 400 no-auth/header mode, 404 older server, or an Apps OAuth
-    redirect), the
+    refusal (HTTP 400 no-auth/header mode or 404 older server), the
     :attr:`declined` latch is set and every subsequent call returns
     ``None`` without touching the network —
     :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
@@ -792,8 +958,9 @@ class _ManagedMintTokenFactory:
         self.declined = False
         # Set when mint fails with 401/403 on the proxy bearer (not a server
         # refusal). Unlike ``declined``, this means the caller should try
-        # another credential path (SDK/OIDC) rather than sending bare requests.
+        # the pinned Apps-workspace resolver rather than sending bare requests.
         self.proxy_auth_failed = False
+        self._ingress_fallback: Callable[[], str | None] | None = None
 
     def __call__(self) -> str | None:
         """Return a fresh owner JWT, or ``None``.
@@ -810,6 +977,11 @@ class _ManagedMintTokenFactory:
             and now < self._cached_expires_at - _MANAGED_MINT_REFRESH_SKEW_S
         ):
             return self._cached_token
+        refreshed_ingress = False
+        if self.proxy_auth_failed:
+            if not self._refresh_ingress_bearer():
+                return self._still_valid_cached_token(now)
+            refreshed_ingress = True
         try:
             token, expires_at = _mint_managed_owner_token(
                 self._mint_url,
@@ -819,25 +991,58 @@ class _ManagedMintTokenFactory:
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
-            if response.status_code in (400, 404) or (
-                response.is_redirect and _is_login_redirect_or_unauthorized(response)
-            ):
-                # Only treat as a definitive refusal if we have never
-                # successfully minted. A 400/404 mid-session (e.g. during an
-                # IP ACL flip) is transient — the server already proved it
-                # mints for this runner.
+            if response.status_code in (400, 404):
+                # Only treat a server that definitively lacks managed-token
+                # support as declined. A mid-session refusal is transient —
+                # the server already proved it mints for this runner.
                 if self._cached_token is None:
                     self.declined = True
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid. If we have never
-                # successfully minted, there is no self-sustaining refresh
-                # loop to fall back to — signal proxy_auth_failed so the
-                # caller can try SDK/OIDC instead of looping on a dead bearer.
-                if self._cached_token is None:
-                    self.proxy_auth_failed = True
-                    return None
+                # A mint request without an ingress bearer is authenticated
+                # by the binding token itself. Do not classify its owner/app
+                # rejection as an Apps ingress failure or permanently disable
+                # the binding-token path.
+                if self._proxy_bearer is None:
+                    self.invalidate_owner()
+                    return self._still_valid_cached_token(now)
+                # A proxy rejection invalidates only ingress state. The
+                # replacement resolver is Apps-workspace pinned and is
+                # rebuilt after every rejection.
+                self.invalidate_ingress()
+                if not refreshed_ingress and self._refresh_ingress_bearer():
+                    try:
+                        token, expires_at = _mint_managed_owner_token(
+                            self._mint_url,
+                            self._server_url,
+                            self._binding_token,
+                            proxy_bearer=self._proxy_bearer,
+                        )
+                    except (httpx.HTTPError, RuntimeError, ValueError, KeyError, OSError):
+                        self.invalidate_ingress()
+                        return self._still_valid_cached_token(now)
+                    self._cached_token = token
+                    self._cached_expires_at = expires_at
+                    return token
+                return self._still_valid_cached_token(now)
+            if _is_apps_login_redirect(response):
+                self.invalidate_ingress()
+                if not refreshed_ingress and self._refresh_ingress_bearer():
+                    try:
+                        token, expires_at = _mint_managed_owner_token(
+                            self._mint_url,
+                            self._server_url,
+                            self._binding_token,
+                            proxy_bearer=self._proxy_bearer,
+                        )
+                    except (httpx.HTTPError, RuntimeError, ValueError, KeyError, OSError):
+                        self.invalidate_ingress()
+                        return self._still_valid_cached_token(now)
+                    self._cached_token = token
+                    self._cached_expires_at = expires_at
+                    return token
+                return self._still_valid_cached_token(now)
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
@@ -847,6 +1052,45 @@ class _ManagedMintTokenFactory:
         self._cached_token = token
         self._cached_expires_at = expires_at
         return token
+
+    def invalidate_owner(self) -> bool:
+        """Discard only the cached owner token after an app response."""
+        had_token = self._cached_token is not None
+        self._cached_token = None
+        self._cached_expires_at = 0.0
+        return had_token
+
+    def invalidate_ingress(self) -> bool:
+        """Discard owner and Apps-ingress state after an OAuth rejection."""
+        had_ingress = self._proxy_bearer is not None
+        had_owner = self.invalidate_owner()
+        self._proxy_bearer = None
+        # A binding-token-only runner has no proxy state to latch. It must
+        # continue minting through its binding token after app responses.
+        self.proxy_auth_failed = had_ingress
+        self._ingress_fallback = None
+        return had_owner or had_ingress
+
+    def invalidate(self) -> bool:
+        """Backward-compatible alias for invalidating Apps ingress state."""
+        return self.invalidate_ingress()
+
+    def _refresh_ingress_bearer(self) -> bool:
+        """Resolve a fresh Apps-workspace-pinned ingress credential."""
+        # Never reuse a resolver that may have returned the rejected bearer.
+        self._ingress_fallback = None
+        try:
+            self._ingress_fallback = _make_ingress_auth_token_factory(self._server_url)
+            if self._ingress_fallback is None:
+                return False
+            bearer = self._ingress_fallback()
+        except (httpx.HTTPError, RuntimeError, ValueError, KeyError, OSError, ImportError):
+            return False
+        if not bearer:
+            return False
+        self._proxy_bearer = bearer
+        self.proxy_auth_failed = False
+        return True
 
     @property
     def ingress_bearer(self) -> str | None:

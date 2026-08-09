@@ -25,6 +25,7 @@ from omnigent.runner._entry import (
     _install_crash_logging,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
+    _make_ingress_auth_token_factory,
     _make_managed_mint_factory,
     _ManagedMintTokenFactory,
     _mint_managed_owner_token,
@@ -406,9 +407,12 @@ def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
 
     factory = _make_auth_token_factory()
 
+    # With no ingress credential, a rejected managed mint remains on the
+    # binding-token path; callers receive an explicit refresh failure rather
+    # than silently switching to a general owner credential.
     assert factory is not None
-    assert factory() == "workspace-token"
-    assert mint_calls == [1]
+    assert factory() is None
+    assert mint_calls == [1, 1]
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -823,6 +827,99 @@ def test_managed_mint_factory_keeps_ingress_bearer_separate(
     assert factory.ingress_bearer == "seed-bearer"
 
 
+def test_managed_factories_keep_harness_credentials_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two managed harness factories retain independent credential state.
+
+    This unit test proves factory isolation only; live harness lifecycle and
+    continuation behavior require the deployment E2E.
+    """
+    import omnigent.runner._entry as entry
+
+    now = [1000.0]
+    mint_calls: list[tuple[str, str | None]] = []
+    mint_counts: dict[str, int] = {}
+    fallback_factories: list[Any] = []
+
+    def _mint(
+        _url: str,
+        _server_url: str,
+        binding_token: str,
+        *,
+        proxy_bearer: str | None = None,
+    ) -> tuple[str, float]:
+        mint_calls.append((binding_token, proxy_bearer))
+        mint_counts[binding_token] = mint_counts.get(binding_token, 0) + 1
+        if proxy_bearer and proxy_bearer.startswith("seed-") and mint_counts[binding_token] > 1:
+            request = httpx.Request("POST", "https://apps.example/v1/token")
+            response = httpx.Response(
+                302,
+                headers={"Location": "https://apps.example/oidc/oauth2/authorize"},
+                request=request,
+            )
+            raise httpx.HTTPStatusError("expired Apps bearer", request=request, response=response)
+        generation = (mint_counts[binding_token] + 1) // 2
+        return (f"owner-{binding_token}-{generation}", now[0] + 3600)
+
+    def _fallback(_server_url: str, **_kwargs: Any) -> Any:
+        return fallback_factories.pop(0)
+
+    class _Fallback:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        def __call__(self) -> str:
+            return self.token
+
+    monkeypatch.setattr(entry.time, "time", lambda: now[0])
+    monkeypatch.setattr(entry, "_mint_managed_owner_token", _mint)
+    monkeypatch.setattr(entry, "_make_ingress_auth_token_factory", _fallback)
+
+    sessions = [
+        ("claude-sdk", "claude", "seed-claude", "/coda/workspaces/claude"),
+        ("pi-native", "pi", "seed-pi", "/coda/workspaces/pi"),
+    ]
+    factories = [
+        _ManagedMintTokenFactory(
+            f"https://apps.example/v1/runners/{binding}/token",
+            "https://apps.example",
+            binding,
+            proxy_bearer=seed,
+        )
+        for _harness, binding, seed, _workspace in sessions
+    ]
+    assert {harness for harness, _binding, _seed, _workspace in sessions} == {
+        "claude-sdk",
+        "pi-native",
+    }
+    assert {binding for _harness, binding, _seed, _workspace in sessions} == {
+        "claude",
+        "pi",
+    }
+    assert {workspace for _harness, _binding, _seed, workspace in sessions} == {
+        "/coda/workspaces/claude",
+        "/coda/workspaces/pi",
+    }
+    assert [factory() for factory in factories] == ["owner-claude-1", "owner-pi-1"]
+
+    # The original bearer is now expired for both sessions. Each fallback is
+    # intentionally different, making a cross-session credential mix-up
+    # observable rather than relying on object identity alone.
+    fallback_factories.extend([_Fallback("sdk-claude"), _Fallback("sdk-pi")])
+    now[0] = 5000.0
+    assert [factory() for factory in factories] == ["owner-claude-2", "owner-pi-2"]
+    assert [factory.ingress_bearer for factory in factories] == ["sdk-claude", "sdk-pi"]
+    assert mint_calls == [
+        ("claude", "seed-claude"),
+        ("pi", "seed-pi"),
+        ("claude", "seed-claude"),
+        ("claude", "sdk-claude"),
+        ("pi", "seed-pi"),
+        ("pi", "sdk-pi"),
+    ]
+
+
 def test_runner_databricks_auth_sends_apps_and_owner_headers() -> None:
     """Managed requests separate ingress OAuth from application identity."""
     from omnigent.runner.identity import RUNNER_OWNER_TOKEN_HEADER
@@ -856,6 +953,332 @@ def test_runner_request_headers_sends_apps_and_owner_headers() -> None:
 
     assert headers["Authorization"] == "Bearer apps-sp-token"
     assert headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
+
+
+def test_initial_factory_delegates_managed_fallback_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lazy managed fallback metadata reaches callers building dual headers."""
+
+    class _ManagedFallback:
+        ingress_bearer = "fresh-ingress"
+        declined = False
+
+        def __call__(self) -> str:
+            return "owner-jwt"
+
+        def invalidate_owner(self) -> bool:
+            return True
+
+        def invalidate_ingress(self) -> bool:
+            return True
+
+    fallback = _ManagedFallback()
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory", lambda *_args, **_kwargs: fallback
+    )
+    factory = _InitialAuthTokenFactory("expired-host-bearer", "https://app.databricksapps.com")
+    factory.invalidate()
+
+    headers = _runner_request_headers(factory, "https://app.databricksapps.com")
+    assert headers["Authorization"] == "Bearer fresh-ingress"
+    assert headers[RUNNER_OWNER_TOKEN_HEADER] == "owner-jwt"
+    assert factory.ingress_bearer == "fresh-ingress"
+    assert factory.declined is False
+    assert factory.invalidate_owner() is True
+    assert factory.invalidate_ingress() is True
+
+
+def test_runner_request_headers_rejects_ingress_without_owner() -> None:
+    """Pi/native callers must not emit a half-authenticated header set."""
+
+    class _Factory:
+        ingress_bearer = "expired-apps-token"
+
+        def __call__(self) -> None:
+            return None
+
+    with pytest.raises(RuntimeError, match="owner token"):
+        _runner_request_headers(_Factory(), "https://app.databricksapps.com")
+
+
+def test_ingress_resolver_uses_only_pinned_workspace_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An Omnigent OIDC owner token is never selected for Apps ingress."""
+    calls: list[str] = []
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "workspace-oauth"
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://workspace.cloud.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: calls.append("oidc"))
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *, host: (_SdkAuth(), host),
+    )
+
+    factory = _make_ingress_auth_token_factory("https://app.databricksapps.com")
+
+    assert factory is not None
+    assert factory() == "workspace-oauth"
+    assert calls == []
+
+
+def test_ingress_resolver_uses_explicit_coda_profile_without_pointer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CoDA's profile supplies ingress auth when no Omnigent pointer exists."""
+    resolve_calls: list[str | None] = []
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "profile-workspace-oauth"
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "omnigents-host")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+
+    def _resolve(*, profile: str | None = None, host: str | None = None):
+        resolve_calls.append(profile)
+        assert host is None
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+
+    factory = _make_ingress_auth_token_factory("https://app.databricksapps.com")
+
+    assert factory is not None
+    assert factory() == "profile-workspace-oauth"
+    assert resolve_calls == ["omnigents-host"]
+
+
+def test_ingress_resolver_refuses_profile_for_non_databricks_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient profile cannot be used to send credentials to other origins."""
+    resolve_calls: list[int] = []
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "omnigents-host")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda **_kwargs: resolve_calls.append(1),
+    )
+
+    assert _make_ingress_auth_token_factory("https://accounts.example.com") is None
+    assert resolve_calls == []
+
+
+def test_managed_launch_refreshes_expired_host_bearer_from_coda_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale launch bearer is replaced by profile ingress plus owner JWT."""
+    mint_bearers: list[str | None] = []
+
+    class _SdkAuth:
+        def current_token(self) -> str:
+            return "fresh-ingress"
+
+    def _resolve(*, profile: str | None = None, host: str | None = None):
+        assert profile == "omnigents-host"
+        assert host is None
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    def _mint(_url: str, _server: str, _binding: str, *, proxy_bearer: str | None = None):
+        mint_bearers.append(proxy_bearer)
+        if proxy_bearer == "expired-host-bearer":
+            request = httpx.Request("POST", _url)
+            response = httpx.Response(
+                302, headers={"Location": "/oidc/oauth2/v2.0/authorize"}, request=request
+            )
+            raise httpx.HTTPStatusError("expired Apps bearer", request=request, response=response)
+        assert proxy_bearer == "fresh-ingress"
+        return "fresh-owner-jwt", time.time() + 1800
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "expired-host-bearer")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "omnigents-host")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert not isinstance(factory, _InitialAuthTokenFactory)
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("POST", "https://app.databricksapps.com/v1/events")
+    sent = next(auth.auth_flow(request))
+    assert sent.headers["Authorization"] == "Bearer fresh-ingress"
+    assert sent.headers[RUNNER_OWNER_TOKEN_HEADER] == "fresh-owner-jwt"
+    assert mint_bearers == ["expired-host-bearer", "fresh-ingress"]
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_managed_binding_factory_retries_owner_after_app_response(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    """Application 401/403 keeps a binding-token-only factory alive."""
+    mint_calls: list[str | None] = []
+
+    def _mint(_url: str, _server: str, binding: str, *, proxy_bearer: str | None = None):
+        assert binding == "binding-token"
+        mint_calls.append(proxy_bearer)
+        return f"owner-{len(mint_calls)}", time.time() + 1800
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    factory = _ManagedMintTokenFactory(
+        "https://server/v1/runners/r/token", "https://server", "binding-token"
+    )
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "https://server/v1/events")
+    captured = _drive_auth_flow(auth, request, httpx.Response(status_code, request=request))
+
+    assert captured == ["Bearer owner-1", "Bearer owner-2"]
+    assert mint_calls == [None, None]
+    assert factory.proxy_auth_failed is False
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_managed_apps_factory_keeps_ingress_on_application_rejection(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    """Owner/application 401/403 must not invalidate a valid Apps bearer."""
+    mint_bearers: list[str | None] = []
+
+    def _mint(_url: str, _server: str, _binding: str, *, proxy_bearer: str | None = None):
+        mint_bearers.append(proxy_bearer)
+        return f"owner-{len(mint_bearers)}", time.time() + 1800
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    factory = _ManagedMintTokenFactory(
+        "https://server/v1/runners/r/token",
+        "https://server",
+        "binding-token",
+        proxy_bearer="apps-ingress",
+    )
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("POST", "https://server/v1/events")
+
+    assert _drive_auth_flow(auth, request, httpx.Response(status_code, request=request)) == [
+        "Bearer apps-ingress",
+        "Bearer apps-ingress",
+    ]
+    assert mint_bearers == ["apps-ingress", "apps-ingress"]
+    assert factory.ingress_bearer == "apps-ingress"
+    assert factory.proxy_auth_failed is False
+
+
+def test_managed_binding_factory_retries_owner_after_apps_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Apps redirect cannot latch a binding-token-only factory."""
+    calls = 0
+
+    def _mint(_url: str, _server: str, _binding: str, *, proxy_bearer: str | None = None):
+        nonlocal calls
+        calls += 1
+        assert proxy_bearer is None
+        return f"owner-{calls}", time.time() + 1800
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    factory = _ManagedMintTokenFactory(
+        "https://server/v1/runners/r/token", "https://server", "binding-token"
+    )
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "https://server/v1/events")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/authorize"}, request=request)
+
+    assert _drive_auth_flow(auth, request, redirect) == ["Bearer owner-1", "Bearer owner-2"]
+    assert factory.proxy_auth_failed is False
+
+
+@pytest.mark.parametrize(
+    "fallback_error", [None, RuntimeError("resolver down"), httpx.RequestError("offline")]
+)
+def test_apps_rejection_refresh_failure_is_typed_error(
+    monkeypatch: pytest.MonkeyPatch, fallback_error: object
+) -> None:
+    """A missing or failing ingress resolver never hands 302 back silently."""
+
+    def _mint(_url: str, _server: str, _binding: str, *, proxy_bearer: str | None = None):
+        if proxy_bearer == "seed":
+            return "owner-1", time.time() + 1800
+        raise AssertionError("fallback should not mint when it cannot resolve")
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    if isinstance(fallback_error, BaseException):
+
+        def _resolve(_url: str) -> object:
+            raise fallback_error
+    else:
+
+        def _resolve(_url: str) -> None:
+            return None
+
+    monkeypatch.setattr("omnigent.runner._entry._make_ingress_auth_token_factory", _resolve)
+
+    factory = _ManagedMintTokenFactory(
+        "https://server/v1/runners/r/token",
+        "https://server",
+        "binding-token",
+        proxy_bearer="seed",
+    )
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "https://server/v1/events")
+    gen = auth.auth_flow(request)
+    next(gen)
+    with pytest.raises(httpx.RequestError, match="authentication refresh"):
+        gen.send(httpx.Response(302, headers={"Location": "/oidc/authorize"}, request=request))
+
+
+def test_two_consecutive_apps_rejections_rebuild_ingress_and_fail_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale replacement bearer causes a typed error, not a silent 302."""
+    fallback_tokens = iter(["fresh-ingress", "stale-ingress"])
+    mint_bearers: list[str | None] = []
+
+    def _resolve(_url: str):
+        token = next(fallback_tokens)
+        return lambda: token
+
+    def _mint(_url: str, _server: str, _binding: str, *, proxy_bearer: str | None = None):
+        mint_bearers.append(proxy_bearer)
+        if proxy_bearer == "stale-ingress":
+            request = httpx.Request("POST", "https://server/v1/token")
+            response = httpx.Response(
+                302, headers={"Location": "/oidc/authorize"}, request=request
+            )
+            raise httpx.HTTPStatusError("expired", request=request, response=response)
+        return f"owner-{len(mint_bearers)}", time.time() + 1800
+
+    monkeypatch.setattr("omnigent.runner._entry._make_ingress_auth_token_factory", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    factory = _ManagedMintTokenFactory(
+        "https://server/v1/runners/r/token", "https://server", "binding-token", proxy_bearer="seed"
+    )
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("POST", "https://server/v1/events")
+
+    # First rejection refreshes the ingress and succeeds.
+    assert _drive_auth_flow(
+        auth,
+        request,
+        httpx.Response(302, headers={"Location": "/oidc/authorize"}, request=request),
+    ) == ["Bearer seed", "Bearer fresh-ingress"]
+    # The next rejection rebuilds the resolver, then reports a typed failure.
+    request2 = httpx.Request("POST", "https://server/v1/events")
+    gen = auth.auth_flow(request2)
+    next(gen)
+    with pytest.raises(httpx.RequestError, match="authentication refresh"):
+        gen.send(httpx.Response(302, headers={"Location": "/oidc/authorize"}, request=request2))
+    assert mint_bearers == ["seed", "fresh-ingress", "stale-ingress"]
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:

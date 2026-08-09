@@ -31,7 +31,11 @@ from typing import Any, Protocol
 from cachetools import TTLCache
 
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import (
+    HostCapacitySnapshot,
+    HostHelloFrame,
+    capacity_snapshot_payload,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -269,6 +273,9 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    #: Last advisory capacity report from this host (hello or
+    #: ``host.capacity_update``). ``None`` = unknown, not zero.
+    capacity: HostCapacitySnapshot | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -384,6 +391,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            capacity=hello.capacity,
         )
         with self._lock:
             key = (ws_id, host_id)
@@ -500,6 +508,27 @@ class HostRegistry:
         if conn is None:
             return None
         return conn.hello.installation_id
+
+    def capacity_snapshot(
+        self,
+        host_id: str,
+        workspace_id: int | None = None,
+    ) -> dict[str, object] | None:
+        """Return the host's last advisory capacity snapshot, if any.
+
+        ``None`` means *unknown* on this replica (an older host that never
+        reports capacity, or no report since this connection began) — never
+        "no capacity". Callers must not gate a launch on this value; the
+        host's own admission check is authoritative.
+
+        :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Workspace scope, or ``None`` for the current one.
+        :returns: The serialized snapshot, or ``None`` when unknown.
+        """
+        conn = self.get(host_id, workspace_id)
+        if conn is None:
+            return None
+        return capacity_snapshot_payload(conn.capacity)
 
     def record_gateway_inference(
         self,

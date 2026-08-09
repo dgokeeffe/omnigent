@@ -140,7 +140,13 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  hostCapacityLabel,
+  isHostAtCapacity,
+  useHostModelOptions,
+  useHosts,
+  type Host,
+} from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -398,6 +404,12 @@ function HostOption({
   subtitle?: string;
 }) {
   const isOnline = host.status === "online";
+  // Advisory runner capacity, e.g. "3/10 runners", or "capacity unknown" when
+  // the host has not reported a fresh snapshot — never "0 free slots". This is
+  // the host's ACTIVE RUNNER cap, not a CoDA browser-terminal cap and not a
+  // managed lease's durable-session cap.
+  const capacityLabel = isOnline ? hostCapacityLabel(host.capacity) : null;
+  const atCapacity = isOnline && isHostAtCapacity(host.capacity);
   return (
     <span className="flex min-w-0 items-center gap-2">
       {host.name.toLowerCase().includes("cloud") ? (
@@ -416,9 +428,26 @@ function HostOption({
             />
             {host.status}
           </span>
+          {capacityLabel && (
+            <span
+              className={`shrink-0 text-[10px] tabular-nums ${
+                atCapacity ? "font-semibold text-amber-600" : "text-muted-foreground"
+              }`}
+              data-testid={`host-capacity-${host.host_id}`}
+            >
+              {capacityLabel}
+            </span>
+          )}
         </span>
         {subtitle && (
           <span className="text-[10px] leading-tight text-muted-foreground">{subtitle}</span>
+        )}
+        {!subtitle && atCapacity && (
+          <span className="text-[10px] leading-tight text-amber-600">
+            {host.capacity?.reason === "memory_pressure"
+              ? "paused — memory above safe watermark"
+              : "at capacity — finish or stop a session"}
+          </span>
         )}
       </span>
     </span>
@@ -4324,6 +4353,10 @@ export function NewChatLandingScreen() {
                     <DropdownMenuItem
                       key={host.host_id}
                       onSelect={() => selectHost(host.host_id)}
+                      // Disabled ONLY on a fresh "not accepting" snapshot; an
+                      // unknown or stale one leaves the host selectable and
+                      // lets the authoritative launch decide.
+                      disabled={isHostAtCapacity(host.capacity)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
                       className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"

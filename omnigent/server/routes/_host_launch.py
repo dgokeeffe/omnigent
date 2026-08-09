@@ -18,17 +18,99 @@ Centralizing the checks here keeps the two call sites from drifting
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+
+#: How recent a capacity snapshot must be to justify refusing a launch
+#: before it reaches the host. Hosts publish on every transition plus a
+#: periodic refresh, so anything older than this is treated as unknown and
+#: the launch proceeds to the host's authoritative gate.
+CAPACITY_SNAPSHOT_MAX_AGE_S = 60.0
+
+#: Tolerated clock skew between a host and this replica. A snapshot stamped
+#: further in the future than this is not evidence about the present, so it is
+#: treated as unknown rather than as a fresh refusal.
+CAPACITY_SNAPSHOT_MAX_SKEW_S = 5.0
+
+
+def capacity_snapshot_is_fresh(
+    snapshot: dict[str, object] | None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Whether an advisory capacity snapshot is recent enough to act on.
+
+    :param snapshot: Serialized snapshot from ``HostRegistry`` or ``None``.
+    :param now: Injectable epoch seconds for tests.
+    :returns: ``True`` only when the snapshot exists and carries an
+        ``observed_at`` that is at most
+        :data:`CAPACITY_SNAPSHOT_MAX_AGE_S` old and no more than
+        :data:`CAPACITY_SNAPSHOT_MAX_SKEW_S` in the future. A missing or
+        unparseable timestamp is treated as unknown.
+    """
+    if not snapshot:
+        return False
+    observed_at = snapshot.get("observed_at")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
+        return False
+    age = (now if now is not None else time.time()) - observed_at
+    return -CAPACITY_SNAPSHOT_MAX_SKEW_S <= age <= CAPACITY_SNAPSHOT_MAX_AGE_S
+
+
+def refuse_if_at_capacity(
+    *,
+    host_registry: HostRegistry,
+    host_id: str,
+) -> None:
+    """Refuse early when a fresh snapshot says the host stopped accepting.
+
+    A cheap server-side preflight so a doomed launch does not first create
+    a git worktree and mint a binding token. It is deliberately advisory:
+    an unknown or stale snapshot lets the launch through, and the host's
+    own admission check remains the authority (it also covers the race
+    where capacity frees up or fills between snapshot and launch).
+
+    :param host_registry: In-memory live host connections (this replica).
+    :param host_id: Target host id, e.g. ``"host_a1b2c3d4..."``.
+    :raises OmnigentError: ``HOST_AT_CAPACITY`` (429) when a fresh
+        snapshot reports the host is not accepting new runners.
+    """
+    snapshot = host_registry.capacity_snapshot(host_id)
+    if not capacity_snapshot_is_fresh(snapshot):
+        return
+    assert snapshot is not None  # narrowed by capacity_snapshot_is_fresh
+    if snapshot.get("accepting") is not False:
+        return
+    if snapshot.get("reason") == "memory_pressure":
+        raise OmnigentError(
+            "This host paused new runners because its memory is above the "
+            "safe launch watermark. Wait for a session to finish, close one, "
+            "or use another host.",
+            code=ErrorCode.HOST_AT_CAPACITY,
+        )
+    limit = snapshot.get("limit")
+    active = snapshot.get("active")
+    detail = (
+        f" ({active} of {limit} runners in use)"
+        if isinstance(limit, int) and isinstance(active, int)
+        else ""
+    )
+    raise OmnigentError(
+        f"This host is at capacity{detail}. Wait for a session to finish, "
+        "stop one, or use another host.",
+        code=ErrorCode.HOST_AT_CAPACITY,
+    )
 
 
 @dataclass

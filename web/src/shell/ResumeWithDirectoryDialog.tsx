@@ -26,11 +26,11 @@ import {
   normalizeWorkspacePath,
   sessionsSharingDirectory,
 } from "./NewChatDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { hostCapacityLabel, isHostAtCapacity, useHosts, type Host } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
-import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { ApiError, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 
 /**
  * Compact host label for the Select item — mirrors NewChatDialog's
@@ -38,6 +38,11 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  */
 function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
+  // Advisory active-runner capacity (not a browser-terminal or lease cap).
+  // Reads "capacity unknown" when unknown/stale so the row never implies zero
+  // free slots.
+  const capacityLabel = isOnline ? hostCapacityLabel(host.capacity) : null;
+  const atCapacity = isOnline && isHostAtCapacity(host.capacity);
   return (
     <span className="flex items-center gap-2">
       {host.name.toLowerCase().includes("cloud") ? (
@@ -56,6 +61,16 @@ function HostLabel({ host }: { host: Host }) {
         />
         {host.status}
       </span>
+      {capacityLabel && (
+        <span
+          className={`text-[10px] tabular-nums ${
+            atCapacity ? "font-semibold text-amber-600" : "text-muted-foreground"
+          }`}
+          data-testid={`resume-dir-host-capacity-${host.host_id}`}
+        >
+          {capacityLabel}
+        </span>
+      )}
     </span>
   );
 }
@@ -240,7 +255,15 @@ export function ResumeWithDirectoryDialog({
       handleOpenChange(false);
       onBound?.();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Couldn't start the session. Try again.");
+      // An authoritative at-capacity refusal can beat the advisory snapshot
+      // that let this host stay selectable, so always give the wait /
+      // close-a-session / other-host next step rather than a bare failure.
+      if (e instanceof ApiError && e.code === "host_at_capacity") {
+        setError(`${e.message} The list refreshes as sessions finish.`);
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      } else {
+        setError(e instanceof Error ? e.message : "Couldn't start the session. Try again.");
+      }
     } finally {
       setSubmitting(false);
     }
@@ -303,6 +326,9 @@ export function ResumeWithDirectoryDialog({
                     <SelectItem
                       key={host.host_id}
                       value={host.host_id}
+                      // Only a fresh "not accepting" snapshot disables a host;
+                      // unknown/stale capacity stays selectable.
+                      disabled={isHostAtCapacity(host.capacity)}
                       data-testid={`resume-dir-host-option-${host.host_id}`}
                     >
                       <HostLabel host={host} />

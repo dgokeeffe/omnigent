@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HostCapacitySnapshot, HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
@@ -491,3 +491,92 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+# ── advisory capacity snapshots ──────────────────────────────
+
+
+def _capacity(**overrides: object) -> HostCapacitySnapshot:
+    fields: dict[str, object] = {
+        "active": 4,
+        "pending": 1,
+        "limit": 10,
+        "available": 5,
+        "accepting": True,
+        "reason": None,
+        "pressure": False,
+        "memory_used": 2048,
+        "memory_limit": 8192,
+        "memory_percent": 25.0,
+        "memory_high_threshold": 80.0,
+        "memory_resume_threshold": 70.0,
+        "reserve_mb": 768,
+        "observed_at": 999.5,
+    }
+    fields.update(overrides)
+    return HostCapacitySnapshot(**fields)  # type: ignore[arg-type]
+
+
+def test_hello_capacity_is_stored_and_serialized() -> None:
+    """A host that reports capacity on connect is queryable immediately."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.capacity = _capacity()
+    registry.register("host_cap", FakeWebSocket(), hello, owner="alice")
+    assert registry.capacity_snapshot("host_cap") == {
+        "active": 4,
+        "pending": 1,
+        "limit": 10,
+        "available": 5,
+        "accepting": True,
+        "reason": None,
+        "pressure": False,
+        "memory_used": 2048,
+        "memory_limit": 8192,
+        "memory_percent": 25.0,
+        "memory_high_threshold": 80.0,
+        "memory_resume_threshold": 70.0,
+        "reserve_mb": 768,
+        "observed_at": 999.5,
+    }
+
+
+def test_capacity_snapshot_is_none_for_older_host() -> None:
+    """A host that never reports capacity reads as unknown, never as full."""
+    registry = HostRegistry()
+    registry.register("host_old", FakeWebSocket(), _make_hello(), owner="alice")
+    assert registry.capacity_snapshot("host_old") is None
+
+
+def test_capacity_snapshot_is_none_for_unknown_host() -> None:
+    """An offline/unknown host has no snapshot on this replica."""
+    assert HostRegistry().capacity_snapshot("host_missing") is None
+
+
+def test_capacity_update_replaces_the_stored_snapshot() -> None:
+    """The tunnel's update path is what keeps the advisory value converging."""
+    registry = HostRegistry()
+    hello = _make_hello()
+    hello.capacity = _capacity()
+    conn = registry.register("host_cap", FakeWebSocket(), hello, owner="alice")
+    conn.capacity = _capacity(
+        active=10, pending=0, available=0, accepting=False, reason="host_at_capacity"
+    )
+    snapshot = registry.capacity_snapshot("host_cap")
+    assert snapshot is not None
+    assert snapshot["accepting"] is False
+    assert snapshot["available"] == 0
+    assert snapshot["reason"] == "host_at_capacity"
+
+
+def test_reconnect_resets_capacity_from_the_new_hello() -> None:
+    """A replaced connection must not keep the previous generation's numbers."""
+    registry = HostRegistry()
+    first = _make_hello()
+    first.capacity = _capacity(active=9, available=1)
+    registry.register("host_cap", FakeWebSocket(), first, owner="alice")
+    second = _make_hello()
+    second.capacity = _capacity(active=0, available=10)
+    registry.register("host_cap", FakeWebSocket(), second, owner="alice")
+    snapshot = registry.capacity_snapshot("host_cap")
+    assert snapshot is not None and snapshot["active"] == 0

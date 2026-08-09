@@ -26,6 +26,9 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.host.frames import (
+    HOST_AT_CAPACITY_ERROR_CODE as _HOST_AT_CAPACITY_ERROR_CODE,
+)
+from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -1269,6 +1272,20 @@ def register_events_routes(
                             created_by=created_by,
                         )
                         return {"queued": True, "item_id": item_id}
+                    if launch_attempt.error_code == _HOST_AT_CAPACITY_ERROR_CODE:
+                        # Transient, unlike the refusals below: the host
+                        # simply has no free runner slot right now. Reject
+                        # the POST with the typed 429 so the message is NOT
+                        # consumed and the user can resend it once a session
+                        # finishes, instead of burning the turn on a banner.
+                        raise OmnigentError(
+                            launch_attempt.error
+                            or (
+                                "This host is at capacity. Wait for a session "
+                                "to finish, stop one, or use another host."
+                            ),
+                            code=ErrorCode.HOST_AT_CAPACITY,
+                        )
                     if launch_attempt.error_code == _WORKSPACE_MISSING_ERROR_CODE:
                         # The host refused: the workspace directory no longer
                         # exists (e.g. the worktree was deleted). Consume the

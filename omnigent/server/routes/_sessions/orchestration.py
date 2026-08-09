@@ -50,6 +50,9 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.host.frames import (
+    HOST_AT_CAPACITY_ERROR_CODE as _HOST_AT_CAPACITY_ERROR_CODE,
+)
+from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
@@ -2748,9 +2751,13 @@ async def _bind_and_launch_managed_runner(
                 host_registry,
                 host_conn,
             )
-            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
-                # The sandbox image should bake in the harness, but if the
-                # host refuses, fail the launch loudly (mirroring the
+            if launch_attempt.error_code in (
+                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                _HOST_AT_CAPACITY_ERROR_CODE,
+            ):
+                # The sandbox image should bake in the harness and a fresh
+                # sandbox host should have a free slot, but if the host
+                # refuses either way, fail the launch loudly (mirroring the
                 # delete-during-provisioning path) rather than waiting out
                 # the connect timeout for a runner that will never appear.
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
@@ -3061,15 +3068,18 @@ async def ensure_runner_connected(
                 host_registry,
                 host_conn,
             )
-            # A harness-not-configured or workspace-missing refusal means the
-            # runner will never appear — don't set relaunched_runner_id or the
-            # caller will wait out the full connect timeout for nothing.
-            # Record the refusal message in runner_exit_reports so the
-            # runner_failed_to_start error surfaces the actionable cause
-            # rather than the generic "may have failed to start" fallback.
+            # A harness-not-configured, workspace-missing, or at-capacity
+            # refusal means the runner will never appear — don't set
+            # relaunched_runner_id or the caller will wait out the full
+            # connect timeout for nothing. Record the refusal message in
+            # runner_exit_reports so the runner_failed_to_start error
+            # surfaces the actionable cause (including "wait for a session
+            # to finish") rather than the generic "may have failed to
+            # start" fallback.
             _fatal_refusal = launch_attempt.error_code in (
                 _HARNESS_NOT_CONFIGURED_ERROR_CODE,
                 _WORKSPACE_MISSING_ERROR_CODE,
+                _HOST_AT_CAPACITY_ERROR_CODE,
             )
             if _fatal_refusal and launch_attempt.error is not None:
                 _rer = getattr(app_state, "runner_exit_reports", None)
@@ -3378,7 +3388,10 @@ async def _run_managed_wake(
                 host_registry,
                 host_conn,
             )
-            if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            if launch_attempt.error_code in (
+                _HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                _HOST_AT_CAPACITY_ERROR_CODE,
+            ):
                 reason = launch_attempt.error or "harness not configured on the sandbox host"
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)

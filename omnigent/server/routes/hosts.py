@@ -31,6 +31,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
@@ -51,7 +52,10 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import (
+    refuse_if_at_capacity,
+    resolve_host_launch,
+)
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -607,6 +611,12 @@ def create_hosts_router(
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
                     "gateway_inference": host_registry.gateway_inference(host.host_id),
+                    # Advisory runner-capacity snapshot from the host daemon,
+                    # with its own ``observed_at`` so a client can judge
+                    # freshness. ``None`` = unknown (older host, or no report
+                    # on this replica), never "full". A launch is still gated
+                    # by the host's own admission check.
+                    "capacity": host_registry.capacity_snapshot(host.host_id),
                 }
             )
         return {"hosts": result}
@@ -649,6 +659,9 @@ def create_hosts_router(
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
+            # Same semantics as list_hosts: advisory, with ``observed_at``
+            # freshness; ``None`` is unknown rather than zero capacity.
+            "capacity": host_registry.capacity_snapshot(host.host_id),
             "runners": [],
         }
 
@@ -785,6 +798,14 @@ def create_hosts_router(
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
+        # Cheap advisory preflight: refuse before creating a worktree or
+        # minting a binding token when a fresh snapshot already says the host
+        # stopped accepting. Deliberately AFTER input validation so a bad
+        # branch/workspace still reports 400 rather than being masked by a
+        # transient 429; the host's own gate still decides races.
+        refuse_if_at_capacity(host_registry=host_registry, host_id=host_id)
+
+        if body.git is not None:
             if body.git.existing_worktree:
                 # Binding to a pre-existing worktree: no worktree is created,
                 # but record its branch so the sidebar shows it and the opt-in
@@ -945,6 +966,19 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
+            if result.get("error_code") == HOST_AT_CAPACITY_ERROR_CODE:
+                # Authoritative refusal from the host's admission gate. The
+                # rollback above already cleared the binding and worktree, so
+                # a retry after a session finishes is safe. 429, not 502: the
+                # request is valid and the condition is transient.
+                raise OmnigentError(
+                    result.get("error")
+                    or (
+                        "This host is at capacity. Wait for a session to "
+                        "finish, stop one, or use another host."
+                    ),
+                    code=ErrorCode.HOST_AT_CAPACITY,
+                )
             if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action

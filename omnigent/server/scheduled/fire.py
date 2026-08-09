@@ -827,6 +827,9 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
             target.conn,
         )
         if attempt.error is not None:
+            # Includes an at-capacity refusal: the host's message names the
+            # cause and the fix, and the scheduler's own retry/backoff is the
+            # right recovery for a transient full host.
             raise RuntimeError(f"host launch failed: {attempt.error}")
 
         runner_client = await _wait_for_runner_client(

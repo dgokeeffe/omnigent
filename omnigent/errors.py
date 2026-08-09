@@ -45,6 +45,13 @@ class ErrorCode:
         rather than 400 (the request is valid against a configured
         host) or 503 (retrying cannot succeed without user action —
         running ``omnigent setup`` on the host machine).
+    :cvar HOST_AT_CAPACITY: The selected host refused the launch
+        because its active + in-flight runners already reach its
+        configured ceiling, or its memory is above the safe launch
+        watermark (the host refused with the ``host_at_capacity``
+        error code). HTTP 429 — the request is valid and a retry
+        succeeds once a session finishes, so it is neither a 409
+        (offline host) nor a 412 (needs setup on the host).
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -60,6 +67,7 @@ class ErrorCode:
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    HOST_AT_CAPACITY = "host_at_capacity"
 
 
 # Single source of truth for error code → HTTP status.
@@ -81,6 +89,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.HOST_AT_CAPACITY: 429,
 }
 
 

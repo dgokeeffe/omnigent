@@ -14,6 +14,7 @@ import functools
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -30,9 +31,17 @@ from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host.capacity import (
+    MEMORY_PRESSURE_REASON,
+    CapacitySnapshot,
+    HostAdmission,
+)
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AT_CAPACITY_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCapacitySnapshot,
+    HostCapacityUpdateFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -272,6 +281,43 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
         message += "\n--- runner log tail ---\n" + "\n".join(lines)
     return message
+
+
+class _LaunchDeferral:
+    """Whether one launch invocation handed its reservation to teardown.
+
+    Deliberately per-invocation rather than keyed by request id: a server that
+    replays a request id must not be able to release (or strand) a different
+    in-flight launch's reservation.
+    """
+
+    __slots__ = ("deferred",)
+
+    def __init__(self) -> None:
+        self.deferred = False
+
+
+def _capacity_refusal_message(snapshot: CapacitySnapshot) -> str:
+    """Compose the actionable refusal text for a rejected launch.
+
+    Distinguishes the count ceiling from the independent memory gate so
+    the user is told what will actually free capacity.
+
+    :param snapshot: The refusing snapshot from :meth:`HostAdmission.reserve`.
+    :returns: A single-line message safe to surface verbatim in an API error.
+    """
+    if snapshot.reason == MEMORY_PRESSURE_REASON:
+        return (
+            "This host paused new runners because its memory is above the safe "
+            "launch watermark. Wait for a running session to finish, close one, "
+            "or use another host."
+        )
+    limit = "the configured limit" if snapshot.limit is None else str(snapshot.limit)
+    return (
+        f"This host is at capacity ({snapshot.active} running, "
+        f"{snapshot.pending} starting, limit {limit}). Wait for a session to "
+        "finish, stop one, or use another host."
+    )
 
 
 def _url_is_loopback(url: str) -> bool:
@@ -742,6 +788,15 @@ class HostProcess:
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         self._runners: dict[str, _RunnerHandle] = {}
+        # Spawned children that could not yet be proven dead. Their original
+        # admission reservations stay held until a retry confirms teardown.
+        self._untracked_runners: dict[
+            int, tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, str | None]
+        ] = {}
+        # Pruning inside the admission lock keeps "count live runners" atomic
+        # with the accept/refuse decision.
+        self._admission = HostAdmission(self._live_runner_count)
+        self._capacity_send_lock = asyncio.Lock()
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -1193,6 +1248,42 @@ class HostProcess:
             "Check the server URL and your access."
         )
 
+    def _live_runner_count(self) -> int:
+        """Count runners that have not exited yet.
+
+        Reads the already-known ``returncode`` instead of calling ``poll()``:
+        a zygote-forked runner's ``poll()`` is a blocking control-socket
+        round-trip that must not run on the event loop, and *removing* the
+        handle here would race :meth:`_watch_runner` into treating a crash as
+        an intentional stop — silently dropping the ``host.runner_exited``
+        report the waiting session needs. The watcher owns removal; the
+        exited runner's slot frees on the next publish, which the watcher
+        triggers as soon as it observes the exit.
+        """
+        return sum(1 for handle in self._runners.values() if handle.proc.returncode is None)
+
+    def _capacity_frame(self) -> HostCapacityUpdateFrame:
+        snapshot = self._admission.snapshot()
+        return HostCapacityUpdateFrame(
+            capacity=HostCapacitySnapshot(**snapshot.as_dict())  # type: ignore[arg-type]
+        )
+
+    async def _publish_capacity(self, ws: Any | None = None) -> None:
+        """Publish a best-effort snapshot without blocking launch handling."""
+        target = ws or self._ws
+        if target is None:
+            return
+        async with self._capacity_send_lock:
+            try:
+                await target.send(encode_host_frame(self._capacity_frame()))
+            except Exception:  # noqa: BLE001 - reconnect loop owns transport errors
+                _logger.debug("Could not publish host capacity", exc_info=True)
+
+    async def _capacity_loop(self, ws: Any) -> None:
+        while True:
+            await asyncio.sleep(15.0)
+            await self._publish_capacity(ws)
+
     async def _handle_launch(
         self,
         frame: HostLaunchRunnerFrame,
@@ -1209,6 +1300,51 @@ class HostProcess:
             ``"failed"`` result with ``error_code`` set to
             ``"harness_not_configured"`` when the harness check
             refuses the launch.
+        """
+        # Reserve before any environment preparation or subprocess spawn, so
+        # the refused launch never costs a fork. The reservation counts
+        # in-flight launches alongside live runners, closing the concurrent
+        # launch race at the authoritative host boundary.
+        refused = self._admission.reserve(frame.request_id)
+        if refused is not None:
+            _logger.info(
+                "Refused runner launch %s: %s (active=%d pending=%d limit=%s)",
+                frame.request_id,
+                refused.reason,
+                refused.active,
+                refused.pending,
+                refused.limit,
+            )
+            await self._publish_capacity()
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=_capacity_refusal_message(refused),
+                error_code=HOST_AT_CAPACITY_ERROR_CODE,
+            )
+        # Per-invocation, NOT keyed by request id: a replayed request id must
+        # not be able to hand off (or steal) another in-flight launch's
+        # reservation ownership.
+        deferral = _LaunchDeferral()
+        try:
+            return await self._handle_launch_admitted(frame, deferral)
+        finally:
+            if not deferral.deferred:
+                self._admission.release(frame.request_id)
+                await self._publish_capacity()
+            # Otherwise the abandoned-spawn teardown owns this reservation:
+            # releasing it here would let another launch take the slot while
+            # the orphaned child is still alive.
+
+    async def _handle_launch_admitted(
+        self,
+        frame: HostLaunchRunnerFrame,
+        deferral: _LaunchDeferral,
+    ) -> HostLaunchRunnerResultFrame:
+        """Perform a launch after the admission reservation is held.
+
+        :param deferral: Marked when this invocation hands its reservation to
+            :meth:`_discard_abandoned_spawn`.
         """
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
@@ -1236,6 +1372,15 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+        # A replayed binding token would collide on the handle key and orphan
+        # the live process the dict currently points at. Refuse before the
+        # fork instead (the live runner is already serving that session).
+        if runner_id in self._runners:
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"runner {runner_id} is already running on this host",
+            )
         initial_auth_token = await asyncio.to_thread(
             self._current_auth_token,
             initialize=False,
@@ -1274,7 +1419,10 @@ class HostProcess:
         try:
             proc, log_path = await asyncio.shield(spawn)
         except asyncio.CancelledError:
-            spawn.add_done_callback(self._discard_abandoned_spawn)
+            deferral.deferred = True
+            spawn.add_done_callback(
+                functools.partial(self._discard_abandoned_spawn, request_id=frame.request_id)
+            )
             raise
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
@@ -1291,6 +1439,29 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="failed",
                 error=_runner_exit_error(proc.returncode, log_path),
+            )
+
+        if runner_id in self._runners:
+            # Lost a post-spawn race against a duplicate launch: tear down the
+            # speculative child rather than overwrite (and leak) the winner.
+            _logger.warning(
+                "Duplicate runner id %s after spawn; terminating the loser (pid=%s)",
+                runner_id,
+                proc.pid,
+            )
+            try:
+                stopped = await asyncio.to_thread(self._stop_untracked_runner_proc, proc)
+            except RuntimeError:
+                # The executor can shut down between spawn completion and
+                # duplicate cleanup. Fall back inline without freeing the slot.
+                stopped = self._stop_untracked_runner_proc(proc)
+            if not stopped:
+                deferral.deferred = True
+                self._retain_untracked_runner(proc, frame.request_id)
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"runner {runner_id} is already running on this host",
             )
 
         self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
@@ -1395,7 +1566,113 @@ class HostProcess:
         finally:
             log_fh.close()
 
-    def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
+    @staticmethod
+    def _runner_has_exited(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> bool:
+        """Return whether a process is definitely gone without trusting one handle path."""
+        try:
+            if proc.poll() is not None:
+                return True
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            pass
+        try:
+            os.kill(proc.pid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        return False
+
+    def _stop_untracked_runner_proc(
+        self, proc: subprocess.Popen[bytes] | ZygoteRunnerProc
+    ) -> bool:
+        """Best-effort teardown that returns true only after confirmed exit."""
+        try:
+            self._stop_runner_proc(proc)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            _logger.warning("Graceful orphan teardown failed (pid=%s): %s", proc.pid, exc)
+        if self._runner_has_exited(proc):
+            return True
+
+        # The Popen and zygote handles both signal by pid, but a damaged handle
+        # can fail before doing so. Send SIGKILL directly as a final fallback.
+        try:
+            proc.kill()
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            _logger.warning("Runner handle kill failed (pid=%s): %s", proc.pid, exc)
+        if not self._runner_has_exited(proc):
+            try:
+                os.kill(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except ProcessLookupError:
+                return True
+            except (PermissionError, OSError) as exc:
+                _logger.warning("Direct orphan kill failed (pid=%s): %s", proc.pid, exc)
+        with contextlib.suppress(
+            OSError, RuntimeError, subprocess.SubprocessError, asyncio.CancelledError
+        ):
+            proc.wait(timeout=5.0)
+        return self._runner_has_exited(proc)
+
+    def _retain_untracked_runner(
+        self,
+        proc: subprocess.Popen[bytes] | ZygoteRunnerProc,
+        request_id: str | None,
+    ) -> None:
+        """Keep a failed teardown visible to admission until a retry succeeds."""
+        key = id(proc)
+        if key in self._untracked_runners:
+            return
+        self._untracked_runners[key] = (proc, request_id)
+        _logger.error(
+            "Runner %s could not be confirmed stopped; retaining its capacity slot",
+            proc.pid,
+        )
+        try:
+            retry = asyncio.get_running_loop().create_task(self._retry_untracked_runner(key))
+        except RuntimeError:
+            return
+        self._watcher_tasks.add(retry)
+        retry.add_done_callback(self._watcher_tasks.discard)
+
+    async def _retry_untracked_runner(self, key: int) -> None:
+        """Retry an orphan teardown without ever admitting past the hard ceiling."""
+        while key in self._untracked_runners:
+            await asyncio.sleep(1.0)
+            retained = self._untracked_runners.get(key)
+            if retained is None:
+                return
+            proc, request_id = retained
+            try:
+                stopped = await asyncio.to_thread(self._stop_untracked_runner_proc, proc)
+            except RuntimeError:
+                # The default executor may already be shut down while the event
+                # loop is still draining callbacks. Retry inline rather than
+                # silently abandoning the retained slot forever.
+                stopped = self._stop_untracked_runner_proc(proc)
+            if not stopped:
+                continue
+            self._untracked_runners.pop(key, None)
+            self._release_deferred(request_id)
+            _logger.info("Confirmed orphaned runner %s stopped", proc.pid)
+
+    def _release_deferred(self, request_id: str | None) -> None:
+        """Release a reservation held across abandoned-spawn teardown.
+
+        ``HostAdmission`` counts reservations per request id, so releasing one
+        here retires exactly this teardown's reservation even when the server
+        replayed that id.
+        """
+        if request_id is None:
+            return
+        self._admission.release(request_id)
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(self._publish_capacity())
+
+    def _discard_abandoned_spawn(
+        self,
+        spawn: asyncio.Future[Any],
+        *,
+        request_id: str | None = None,
+    ) -> None:
         """Tear down a runner whose launch was cancelled before registration.
 
         ``_handle_launch`` shields the spawn, so a cancellation still lets the
@@ -1404,22 +1681,58 @@ class HostProcess:
         status forever). Kill it off the loop, since for a zygote-forked runner
         the terminate/wait round-trips are blocking control-socket exchanges.
 
+        The cancelled launch's admission reservation is held until that
+        teardown finishes, so the orphan's memory and process slot are not
+        handed to another launch while it is still alive.
+
         :param spawn: The completed spawn future.
+        :param request_id: Launch request whose reservation this teardown owns.
         """
-        if spawn.cancelled():
+        if spawn.cancelled() or spawn.exception() is not None:
+            # Nothing was created, so the slot is free immediately.
+            self._release_deferred(request_id)
             return
-        if spawn.exception() is not None:
-            return  # spawn failed; nothing was created
         proc, _log_path = spawn.result()
         _logger.warning(
             "Launch cancelled after runner spawn (pid=%s); terminating the orphan",
             proc.pid,
         )
-        with contextlib.suppress(RuntimeError):
-            # No running loop during interpreter shutdown — best effort.
-            asyncio.get_running_loop().run_in_executor(
-                None, functools.partial(self._stop_runner_proc, proc)
+
+        def _finish(future: Any = None) -> None:
+            """Release only after teardown confirms the child is gone."""
+            stopped = False
+            if future is not None and not future.cancelled():
+                try:
+                    stopped = bool(future.result())
+                except (
+                    OSError,
+                    RuntimeError,
+                    subprocess.SubprocessError,
+                    asyncio.CancelledError,
+                ) as exc:
+                    _logger.warning(
+                        "Failed to terminate orphaned runner (pid=%s): %s", proc.pid, exc
+                    )
+            if stopped:
+                self._release_deferred(request_id)
+            else:
+                self._retain_untracked_runner(proc, request_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            teardown = loop.run_in_executor(
+                None, functools.partial(self._stop_untracked_runner_proc, proc)
             )
+        except RuntimeError:
+            # No running loop / a shut-down executor: make one final inline
+            # attempt. If it cannot prove exit, retain the slot rather than
+            # admitting another runner against a possibly live orphan.
+            if self._stop_untracked_runner_proc(proc):
+                self._release_deferred(request_id)
+            else:
+                self._retain_untracked_runner(proc, request_id)
+            return
+        teardown.add_done_callback(_finish)
 
     async def _handle_stop(
         self,
@@ -1445,6 +1758,7 @@ class HostProcess:
         # freeze the daemon's control handler.
         await asyncio.to_thread(self._stop_runner_proc, handle.proc)
         _logger.info("Stopped runner %s", frame.runner_id)
+        await self._publish_capacity()
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
             flush=True,
@@ -1551,10 +1865,14 @@ class HostProcess:
             # has to message to reactivate, so stay silent. A non-zero exit
             # below is a genuine crash and still reports its cause.
             _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+            self._runners.pop(runner_id, None)
+            await self._publish_capacity()
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
         await self._report_runner_exit(runner_id, error)
+        self._runners.pop(runner_id, None)
+        await self._publish_capacity()
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
         """Send a ``host.runner_exited`` report, queueing on failure.
@@ -2498,6 +2816,9 @@ class HostProcess:
             except subprocess.TimeoutExpired:
                 handle.proc.kill()
         self._runners.clear()
+        for proc, _request_id in self._untracked_runners.values():
+            self._stop_untracked_runner_proc(proc)
+        self._untracked_runners.clear()
 
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
@@ -2717,6 +3038,7 @@ class HostProcess:
             gateway_inference=gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            capacity=self._capacity_frame().capacity,
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws
@@ -2745,6 +3067,7 @@ class HostProcess:
         readiness_task = asyncio.create_task(
             self._harness_readiness_loop(ws, configured_harnesses)
         )
+        capacity_task = asyncio.create_task(self._capacity_loop(ws))
         try:
             while True:
                 raw = await ws.recv()
@@ -2752,8 +3075,11 @@ class HostProcess:
                     await self._handle_raw_message(ws, raw)
         finally:
             readiness_task.cancel()
+            capacity_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await capacity_task
 
     async def _harness_readiness_loop(
         self,
@@ -2868,6 +3194,8 @@ class HostProcess:
         :returns: None.
         """
         if isinstance(frame, HostLaunchRunnerFrame):
+            # _handle_launch / _handle_stop publish their own post-transition
+            # snapshot, so no extra publish is needed here.
             await ws.send(encode_host_frame(await self._handle_launch(frame)))
         elif isinstance(frame, HostStopRunnerFrame):
             await ws.send(encode_host_frame(await self._handle_stop(frame)))

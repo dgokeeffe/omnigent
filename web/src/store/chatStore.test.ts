@@ -1870,6 +1870,45 @@ describe("chatStore — send (first-send ordering)", () => {
     });
   });
 
+  it("renders an at-capacity 429 as an actionable, resend-safe error block", async () => {
+    // The relaunch path returns 429 WITHOUT consuming the message, so the
+    // banner must say so — otherwise the user assumes the turn was lost and
+    // either gives up or double-sends once capacity frees.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "running",
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    const hostMessage =
+      "This host is at capacity (10 running, 0 starting, limit 10). " +
+      "Wait for a session to finish, stop one, or use another host.";
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "host_at_capacity", message: hostMessage } },
+          { ok: false, status: 429 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.status).toBe("idle");
+    const errorBlocks = state.blocks.filter((b) => b.type === "error");
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0].message).toContain(hostMessage);
+    expect(errorBlocks[0].message).toContain("send it again");
+    // No raw code in the banner title: this is a clean, retryable condition.
+    expect(errorBlocks[0]).toMatchObject({ code: "" });
+  });
+
   it("carries a non-runner send failure's own message into the error block", async () => {
     // A generic failure (not runner_unavailable) must still become visible,
     // using the server-provided message and code so it isn't swallowed.

@@ -28,6 +28,96 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Advisory runner-capacity snapshot published by the host daemon.
+   * `null`/absent means unknown (older host or server, or no report on this
+   * replica) — render it as unknown, never as "full". The host's own launch
+   * admission is authoritative, so a launch may still be refused with a 429
+   * even when this says the host is accepting.
+   */
+  capacity?: HostCapacity | null;
+}
+
+/** How stale an advisory capacity snapshot may be and still be trusted.
+ *  Hosts publish on every launch/stop/exit plus a 15 s refresh, so a minute
+ *  of silence means "unknown", not "unchanged". */
+export const CAPACITY_SNAPSHOT_MAX_AGE_MS = 60_000;
+
+/** Tolerated host/browser clock skew. A snapshot stamped further ahead than
+ *  this is not evidence about the present, so it reads as unknown rather than
+ *  keeping a stale refusal "fresh" for an extra minute. */
+export const CAPACITY_SNAPSHOT_MAX_SKEW_MS = 5_000;
+
+/** Shown instead of `N/limit` when an online host reports no fresh snapshot.
+ *  Unknown must read as unknown — never as zero free slots. */
+export const CAPACITY_UNKNOWN_LABEL = "capacity unknown";
+
+/** Advisory host runner capacity. Distinct from the CoDA browser-terminal cap
+ *  and from a managed lease's durable-session cap — this counts live runner
+ *  processes plus in-flight launches on one host daemon. */
+export interface HostCapacity {
+  /** Live runner processes. */
+  active: number;
+  /** Launches accepted but not yet registered as active. */
+  pending: number;
+  /** Configured hard ceiling, or null when the host runs uncapped. */
+  limit: number | null;
+  /** `limit - (active + pending)`, or null when uncapped (unknown, not 0). */
+  available: number | null;
+  /** Whether the host would admit another runner at `observed_at`. */
+  accepting: boolean;
+  /** Why it is refusing: `"host_at_capacity"` or `"memory_pressure"`. */
+  reason: string | null;
+  /** Whether the host's memory gate is latched. `null`/absent = unknown. */
+  pressure?: boolean | null;
+  memory_used?: number | null;
+  memory_limit?: number | null;
+  memory_percent?: number | null;
+  memory_high_threshold?: number | null;
+  memory_resume_threshold?: number | null;
+  reserve_mb?: number | null;
+  /** Epoch seconds when the host observed this. Absent = freshness unknown. */
+  observed_at?: number | null;
+}
+
+/** Whether a snapshot is recent enough to act on (see
+ *  {@link CAPACITY_SNAPSHOT_MAX_AGE_MS}). A missing `observed_at` is unknown. */
+export function isCapacityFresh(
+  capacity: HostCapacity | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!capacity || typeof capacity.observed_at !== "number") return false;
+  if (!Number.isFinite(capacity.observed_at)) return false;
+  const age = now - capacity.observed_at * 1000;
+  return age >= -CAPACITY_SNAPSHOT_MAX_SKEW_MS && age <= CAPACITY_SNAPSHOT_MAX_AGE_MS;
+}
+
+/** A host is blocked only when a FRESH snapshot says it is not accepting.
+ *  Unknown or stale capacity must never disable a host. */
+export function isHostAtCapacity(
+  capacity: HostCapacity | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  return isCapacityFresh(capacity, now) && capacity!.accepting === false;
+}
+
+/** Short user-facing capacity label, e.g. `"3/10 runners"`, or
+ *  {@link CAPACITY_UNKNOWN_LABEL} when capacity is unknown or stale — an
+ *  online host must never read as "0 free slots" just because it has not
+ *  reported yet. */
+export function hostCapacityLabel(
+  capacity: HostCapacity | null | undefined,
+  now: number = Date.now(),
+): string {
+  if (!isCapacityFresh(capacity, now)) return CAPACITY_UNKNOWN_LABEL;
+  const cap = capacity!;
+  const used = cap.active + cap.pending;
+  if (cap.limit === null || cap.limit === undefined) {
+    return `${used} running · no limit`;
+  }
+  const suffix =
+    cap.accepting === false && cap.reason === "memory_pressure" ? " · paused (memory)" : "";
+  return `${used}/${cap.limit} runners${suffix}`;
 }
 
 interface HostsResponse {

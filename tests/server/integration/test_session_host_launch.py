@@ -1971,3 +1971,131 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.host_id == _HOST_ID
+
+
+_CAPACITY_REFUSAL = (
+    "This host is at capacity (10 running, 0 starting, limit 10). "
+    "Wait for a session to finish, stop one, or use another host."
+)
+
+
+async def test_inline_create_at_capacity_stays_lenient(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """A ``host_at_capacity`` refusal at CREATE keeps the lenient contract.
+
+    Create is deliberately lenient on every launch failure: the session
+    opens (201) with its binding intact so the first message retries the
+    launch, and no premature transcript item is written. Failing the
+    create instead would leave the identical bound-but-runnerless row
+    *plus* an error, which is strictly worse.
+
+    Mutation check: make create raise on a capacity refusal and the 201
+    assertion below fails.
+    """
+    del db_uri
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_CAPACITY_REFUSAL,
+            launch_error_code="host_at_capacity",
+        )
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+
+    assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert body["host_id"] == _HOST_ID
+    assert body["runner_id"] is not None
+    items = await client.get(f"/v1/sessions/{body['id']}/items")
+    assert items.json()["data"] == []
+
+
+async def test_message_relaunch_at_capacity_returns_429_and_keeps_message(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch refused for capacity returns the typed 429 unconsumed.
+
+    Unlike ``harness_not_configured`` (which needs user action on the host
+    and so burns the turn on a banner), capacity is transient: the correct
+    behavior is to reject the POST with ``host_at_capacity`` / 429, persist
+    NOTHING, and let the user resend once a slot frees. The host binding is
+    kept so the resend relaunches on the same host.
+
+    Mutation check: drop the ``host_at_capacity`` branch in post_event's
+    relaunch and the response becomes a 503 ``runner_unavailable`` with the
+    user's message consumed — both assertions below fail.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    create_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await create_responder
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=_CAPACITY_REFUSAL,
+            launch_error_code="host_at_capacity",
+        )
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 429, (
+        f"expected 429, got {msg_resp.status_code}: {msg_resp.text}"
+    )
+    body = msg_resp.json()
+    assert body["error"]["code"] == "host_at_capacity"
+    assert body["error"]["message"] == _CAPACITY_REFUSAL
+
+    # Nothing was consumed or persisted: the user can simply resend.
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    assert items.json()["data"] == [], (
+        f"a capacity refusal must persist no items, got {items.json()['data']!r}"
+    )
+
+    # The binding is kept so the resend relaunches on the same host.
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.host_id == _HOST_ID

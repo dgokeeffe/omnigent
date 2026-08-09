@@ -18,6 +18,9 @@ from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.host.frames import (
+    HOST_AT_CAPACITY_ERROR_CODE as _HOST_AT_CAPACITY_ERROR_CODE,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
@@ -229,8 +232,10 @@ async def _start_codex_goal_runner_on_bound_host(
     :param conversation_store: Store used for runner-id rotation.
     :returns: Runner id expected to connect, or ``None`` if no launch was
         possible.
-    :raises OmnigentError: If the host reports a non-retryable harness
-        configuration failure or the session disappears.
+    :raises OmnigentError: ``HOST_AT_CAPACITY`` (429) if the host refused
+        for capacity/memory pressure, ``HARNESS_NOT_CONFIGURED`` if it
+        reports a non-retryable harness configuration failure, or
+        ``NOT_FOUND`` if the session disappears.
     """
     host_registry = getattr(app_state, "host_registry", None)
     if host_registry is None:
@@ -243,6 +248,17 @@ async def _start_codex_goal_runner_on_bound_host(
             host_registry,
             host_conn,
         )
+        if launch_attempt.error_code == _HOST_AT_CAPACITY_ERROR_CODE:
+            # The host refused before spawning, so nothing needs cleanup;
+            # 429 tells the caller a plain retry works once a slot frees.
+            raise OmnigentError(
+                launch_attempt.error
+                or (
+                    "This host is at capacity. Wait for a session to finish, "
+                    "stop one, or use another host."
+                ),
+                code=ErrorCode.HOST_AT_CAPACITY,
+            )
         if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
             raise OmnigentError(
                 launch_attempt.error or "host failed to launch runner: harness not configured",

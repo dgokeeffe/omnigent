@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostCapacitySnapshot,
+    HostCapacityUpdateFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -40,6 +42,7 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    capacity_snapshot_payload,
     decode_host_frame,
     encode_host_frame,
 )
@@ -1540,3 +1543,360 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+# ── capacity frames ──────────────────────────────────────────
+
+
+def _snapshot(**overrides: object) -> HostCapacitySnapshot:
+    """A fully-populated snapshot with optional field overrides."""
+    fields: dict[str, object] = {
+        "active": 3,
+        "pending": 1,
+        "limit": 10,
+        "available": 6,
+        "accepting": True,
+        "reason": None,
+        "pressure": None,
+        "memory_used": 1024,
+        "memory_limit": 8192,
+        "memory_percent": 12.5,
+        "memory_high_threshold": 80.0,
+        "memory_resume_threshold": 70.0,
+        "reserve_mb": 768,
+        "observed_at": 1234.5,
+    }
+    fields.update(overrides)
+    return HostCapacitySnapshot(**fields)  # type: ignore[arg-type]
+
+
+def test_hello_capacity_round_trip() -> None:
+    """Every capacity field survives the hello encode → decode round trip.
+
+    A dropped ``limit`` or ``observed_at`` would make the host picker show
+    "unknown" (or a stale snapshot as current) for a host that reported.
+    """
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="laptop",
+        capacity=_snapshot(reason=None),
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capacity == original.capacity
+
+
+def test_hello_without_capacity_decodes_as_unknown() -> None:
+    """An older host sends no ``capacity`` key; that must decode as None.
+
+    Raising (or defaulting to zeros) would break every pre-upgrade host's
+    handshake or make it look permanently full.
+    """
+    legacy = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "old-laptop",
+            "runners": [],
+        }
+    )
+    decoded = decode_host_frame(legacy)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capacity is None
+
+
+def test_hello_explicit_null_capacity_decodes_as_unknown() -> None:
+    """A new host with no snapshot yet sends ``capacity: null``."""
+    payload = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "laptop",
+            "runners": [],
+            "capacity": None,
+        }
+    )
+    decoded = decode_host_frame(payload)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capacity is None
+
+
+def test_hello_capacity_encodes_null_for_absent_snapshot() -> None:
+    """The wire carries an explicit null so consumers see "unknown"."""
+    payload = json.loads(
+        encode_host_frame(HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="laptop"))
+    )
+    assert payload["capacity"] is None
+
+
+def test_hello_capacity_ignores_unknown_fields() -> None:
+    """A newer host may add capacity fields; an older consumer ignores them."""
+    payload = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "laptop",
+            "runners": [],
+            "capacity": {
+                "active": 1,
+                "pending": 0,
+                "accepting": True,
+                "cpu_throttled_percent": 4.5,
+            },
+        }
+    )
+    decoded = decode_host_frame(payload)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capacity is not None
+    assert decoded.capacity.active == 1
+    assert decoded.capacity.limit is None
+
+
+def test_capacity_update_frame_round_trip() -> None:
+    """host.capacity_update carries a full snapshot in both directions."""
+    original = HostCapacityUpdateFrame(
+        capacity=_snapshot(accepting=False, reason="host_at_capacity")
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    assert decoded.capacity == original.capacity
+
+
+def test_capacity_update_requires_a_snapshot() -> None:
+    """A capacity update with no snapshot is malformed, not "unknown"."""
+    with pytest.raises(ValueError, match="capacity snapshot must be an object"):
+        decode_host_frame(json.dumps({"kind": "host.capacity_update"}))
+    with pytest.raises(ValueError, match="capacity snapshot must be an object"):
+        decode_host_frame(json.dumps({"kind": "host.capacity_update", "capacity": 5}))
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [
+        {"pending": 0, "accepting": True},
+        {"active": 0, "accepting": True},
+        {"active": 0, "pending": 0},
+        {"active": "1", "pending": 0, "accepting": True},
+        {"active": True, "pending": 0, "accepting": True},
+        {"active": 1, "pending": 1.5, "accepting": True},
+        {"active": 1, "pending": 0, "accepting": "yes"},
+    ],
+)
+def test_capacity_rejects_invalid_required_fields(capacity: dict[str, object]) -> None:
+    """active/pending/accepting are structural: a bad one must raise.
+
+    A consumer cannot render "N of M, accepting" without them, so silently
+    coercing would publish a fabricated capacity state.
+    """
+    with pytest.raises(ValueError, match="invalid required fields"):
+        decode_host_frame(json.dumps({"kind": "host.capacity_update", "capacity": capacity}))
+
+
+def test_capacity_optional_fields_tolerate_bad_types() -> None:
+    """A malformed optional field decodes as None rather than raising."""
+    payload = json.dumps(
+        {
+            "kind": "host.capacity_update",
+            "capacity": {
+                "active": 2,
+                "pending": 0,
+                "accepting": False,
+                "reason": 17,
+                "limit": "ten",
+                "available": None,
+                "memory_percent": "high",
+                "reserve_mb": 1.5,
+                "observed_at": 42,
+            },
+        }
+    )
+    decoded = decode_host_frame(payload)
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    snapshot = decoded.capacity
+    assert snapshot.reason is None
+    assert snapshot.limit is None
+    assert snapshot.available is None
+    assert snapshot.memory_percent is None
+    assert snapshot.reserve_mb is None
+    assert snapshot.observed_at == 42.0
+
+
+def test_old_consumer_ignores_capacity_update_kind() -> None:
+    """An older peer that never learned the kind must reject it explicitly.
+
+    decode_host_frame raises for an unknown kind, and the tunnel's receive
+    loop already logs-and-drops a frame it cannot decode — so a new host
+    talking to an old server degrades to "no capacity", not a dropped
+    connection.
+    """
+    with pytest.raises(ValueError):
+        decode_host_frame(json.dumps({"kind": "host.totally_unknown", "capacity": {}}))
+
+
+def test_capacity_snapshot_payload_shape() -> None:
+    """The shared serializer is the one used by both wire and API paths."""
+    assert capacity_snapshot_payload(None) is None
+    payload = capacity_snapshot_payload(_snapshot())
+    assert payload == {
+        "active": 3,
+        "pending": 1,
+        "limit": 10,
+        "available": 6,
+        "accepting": True,
+        "reason": None,
+        "pressure": None,
+        "memory_used": 1024,
+        "memory_limit": 8192,
+        "memory_percent": 12.5,
+        "memory_high_threshold": 80.0,
+        "memory_resume_threshold": 70.0,
+        "reserve_mb": 768,
+        "observed_at": 1234.5,
+    }
+
+
+def test_capacity_rejects_hostile_numeric_values() -> None:
+    """Non-finite and oversized numbers decode as unknown, never propagate.
+
+    ``json.loads`` accepts NaN/Infinity and an arbitrarily large int
+    overflows ``float()``. Either reaching the registry would make the host
+    API return invalid JSON (or 500) for the owner's own host list, and an
+    OverflowError escaping the decoder would drop the host tunnel because the
+    receive loop only handles ValueError.
+    """
+    payload = json.dumps(
+        {
+            "kind": "host.capacity_update",
+            "capacity": {
+                "active": 1,
+                "pending": 0,
+                "accepting": True,
+                "memory_percent": 10**400,
+            },
+        }
+    )
+    decoded = decode_host_frame(payload)
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    assert decoded.capacity.memory_percent is None
+
+    for literal in ("NaN", "Infinity", "-Infinity"):
+        raw = (
+            '{"kind": "host.capacity_update", "capacity": {"active": 1, '
+            '"pending": 0, "accepting": true, "memory_percent": ' + literal + ", "
+            '"observed_at": ' + literal + "}}"
+        )
+        decoded = decode_host_frame(raw)
+        assert isinstance(decoded, HostCapacityUpdateFrame)
+        assert decoded.capacity.memory_percent is None
+        assert decoded.capacity.observed_at is None
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [
+        {"active": -1, "pending": 0, "accepting": True},
+        {"active": 0, "pending": -2, "accepting": True},
+        {"active": 10**9, "pending": 0, "accepting": True},
+    ],
+)
+def test_capacity_rejects_negative_or_absurd_counts(capacity: dict[str, object]) -> None:
+    """Negative/absurd required counts are malformed, not \"unknown\".
+
+    Accepting them renders \"-1 of 10 runners\" to a user and lets a buggy
+    host publish fabricated availability.
+    """
+    with pytest.raises(ValueError, match="invalid required fields"):
+        decode_host_frame(json.dumps({"kind": "host.capacity_update", "capacity": capacity}))
+
+
+def test_capacity_negative_optional_counts_decode_as_unknown() -> None:
+    """A negative limit/available is unknown rather than a nonsense number."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.capacity_update",
+                "capacity": {
+                    "active": 1,
+                    "pending": 0,
+                    "accepting": True,
+                    "limit": -5,
+                    "available": -3,
+                    "reserve_mb": -1,
+                },
+            }
+        )
+    )
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    assert decoded.capacity.limit is None
+    assert decoded.capacity.available is None
+    assert decoded.capacity.reserve_mb is None
+
+
+def test_capacity_pressure_round_trips_and_defaults_unknown() -> None:
+    """`pressure` travels explicitly; an older host that omits it is unknown."""
+    original = HostCapacityUpdateFrame(capacity=_snapshot(pressure=True))
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    assert decoded.capacity.pressure is True
+
+    legacy = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.capacity_update",
+                "capacity": {"active": 0, "pending": 0, "accepting": True},
+            }
+        )
+    )
+    assert isinstance(legacy, HostCapacityUpdateFrame)
+    assert legacy.capacity.pressure is None
+
+
+def test_capacity_byte_fields_survive_realistic_magnitudes() -> None:
+    """Memory bytes are in the billions and must not be clamped as counts.
+
+    A shared count/byte ceiling silently dropped `memory_used`/`memory_limit`
+    from every real snapshot (an 8 GiB limit is ~8.6e9), so the API reported
+    a percentage with no numbers behind it.
+    """
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.capacity_update",
+                "capacity": {
+                    "active": 10,
+                    "pending": 0,
+                    "accepting": False,
+                    "limit": 10,
+                    "available": 0,
+                    "memory_used": 6565818368,
+                    "memory_limit": 8589934592,
+                    "memory_percent": 54.8,
+                    "reserve_mb": 768,
+                },
+            }
+        )
+    )
+    assert isinstance(decoded, HostCapacityUpdateFrame)
+    assert decoded.capacity.memory_used == 6565818368
+    assert decoded.capacity.memory_limit == 8589934592
+    assert decoded.capacity.reserve_mb == 768
+    # Counts stay bounded, so a bogus huge count is still unknown.
+    bogus = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.capacity_update",
+                "capacity": {
+                    "active": 1,
+                    "pending": 0,
+                    "accepting": True,
+                    "limit": 10**9,
+                },
+            }
+        )
+    )
+    assert isinstance(bogus, HostCapacityUpdateFrame)
+    assert bogus.capacity.limit is None

@@ -644,11 +644,19 @@ def register_core_routes(
                     # host still refuses there, that path consults the daemon
                     # and persists a transcript error (see post_event's
                     # relaunch branch). No create-time harness gating.
+                    #
+                    # A host_at_capacity refusal is deliberately lenient too:
+                    # it is transient, the picker shows advisory N/limit so
+                    # the user rarely lands here, and the first message
+                    # retries the launch and surfaces a typed 429 if the host
+                    # is still full. Failing the create instead would leave
+                    # the same bound-but-runnerless row plus an error.
                     _logger.warning(
-                        "Host %s failed to launch runner for session %s: %s",
+                        "Host %s failed to launch runner for session %s: %s (code=%s)",
                         launch_host_id,
                         resp.id,
                         launch_result.get("error"),
+                        launch_result.get("error_code"),
                     )
                     # The runner never booted, so its pending=False clear
                     # will never fire. Clear the spin-up flag here so a

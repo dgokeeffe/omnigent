@@ -20,6 +20,7 @@ see.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -37,6 +38,7 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+HOST_AT_CAPACITY_ERROR_CODE = "host_at_capacity"
 
 
 class HostFrameKind(str, Enum):
@@ -73,6 +75,7 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    CAPACITY_UPDATE = "host.capacity_update"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -114,6 +117,43 @@ class HostHelloFrame:
     gateway_inference: dict[str, bool] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    capacity: HostCapacitySnapshot | None = None
+
+
+@dataclass
+class HostCapacitySnapshot:
+    """Advisory host runner/resource admission snapshot.
+
+    Published on hello and on every launch/stop/exit transition (plus a
+    periodic refresh). A consumer must treat it as possibly stale — the
+    host's launch admission is the authoritative gate. ``limit`` and
+    ``available`` are ``None`` when the host runs without a count ceiling,
+    which means *unknown*, never zero.
+    """
+
+    active: int
+    pending: int
+    limit: int | None
+    available: int | None
+    accepting: bool
+    reason: str | None = None
+    #: Whether the memory gate is latched. ``None`` = the host did not report
+    #: it (older host), which is unknown rather than "no pressure".
+    pressure: bool | None = None
+    memory_used: int | None = None
+    memory_limit: int | None = None
+    memory_percent: float | None = None
+    memory_high_threshold: float | None = None
+    memory_resume_threshold: float | None = None
+    reserve_mb: int | None = None
+    observed_at: float | None = None
+
+
+@dataclass
+class HostCapacityUpdateFrame:
+    """Host → server one-way capacity refresh."""
+
+    capacity: HostCapacitySnapshot
 
 
 @dataclass
@@ -881,6 +921,7 @@ HostFrame = (
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostCapacityUpdateFrame
 )
 
 
@@ -932,6 +973,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "capacity": capacity_snapshot_payload(frame.capacity),
             }
         )
     if isinstance(frame, HostHarnessReadinessFrame):
@@ -940,6 +982,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+            }
+        )
+    if isinstance(frame, HostCapacityUpdateFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CAPACITY_UPDATE.value,
+                "capacity": capacity_snapshot_payload(frame.capacity),
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -1297,6 +1346,8 @@ def _decode_known_host_frame(
             return _decode_host_hello(msg)
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
+        case HostFrameKind.CAPACITY_UPDATE:
+            return _decode_capacity_update(msg)
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
@@ -1358,6 +1409,150 @@ def _decode_known_host_frame(
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
+def capacity_snapshot_payload(
+    snapshot: HostCapacitySnapshot | None,
+) -> dict[str, object] | None:
+    """Serialize a capacity snapshot, or ``None`` when the host has none.
+
+    Shared by the wire encoder and the server's registry/API projection so
+    the two representations cannot drift.
+    """
+    if snapshot is None:
+        return None
+    return {
+        "active": snapshot.active,
+        "pending": snapshot.pending,
+        "limit": snapshot.limit,
+        "available": snapshot.available,
+        "accepting": snapshot.accepting,
+        "reason": snapshot.reason,
+        "pressure": snapshot.pressure,
+        "memory_used": snapshot.memory_used,
+        "memory_limit": snapshot.memory_limit,
+        "memory_percent": snapshot.memory_percent,
+        "memory_high_threshold": snapshot.memory_high_threshold,
+        "memory_resume_threshold": snapshot.memory_resume_threshold,
+        "reserve_mb": snapshot.reserve_mb,
+        "observed_at": snapshot.observed_at,
+    }
+
+
+#: Reject absurd counts/limits outright: a real host cannot have more than
+#: this many runners, and accepting huge values only pollutes the API and UI.
+_CAPACITY_MAX_COUNT = 1_000_000
+
+
+def _capacity_number(raw: _JsonObject, name: str) -> int | float | None:
+    """Read an optional JSON number, rejecting bools and non-finite values.
+
+    ``json.loads`` accepts ``NaN``/``Infinity``, and an arbitrarily large
+    integer overflows ``float()``. Either would propagate into the registry
+    and then fail (or lie) when the host API re-serializes it, so both decode
+    as "absent" rather than poisoning the snapshot.
+    """
+    value = raw.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if not math.isfinite(value):
+            return None
+    except (OverflowError, TypeError):
+        return None
+    return value
+
+
+#: Byte-valued fields are legitimately in the billions, so they only need the
+#: non-negative and JSON-safe bounds — not the count ceiling.
+_CAPACITY_MAX_BYTES = 1 << 62
+
+
+def _capacity_int(raw: _JsonObject, name: str, *, maximum: int) -> int | None:
+    """Read an optional non-negative integral field, else ``None``.
+
+    A float, bool, negative, or out-of-range value decodes as ``None``
+    (unknown) rather than a nonsense number a client would render verbatim.
+    """
+    value = _capacity_number(raw, name)
+    if not isinstance(value, int):
+        return None
+    return value if 0 <= value <= maximum else None
+
+
+def _capacity_float(raw: _JsonObject, name: str) -> float | None:
+    """Read an optional finite numeric field as a float."""
+    value = _capacity_number(raw, name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (OverflowError, ValueError):  # pragma: no cover - guarded above
+        return None
+
+
+def _decode_capacity_snapshot(raw: object) -> HostCapacitySnapshot:
+    """Decode a capacity object, requiring its three structural fields.
+
+    Unknown keys are ignored so a newer host can add fields; ``active``,
+    ``pending``, and ``accepting`` are required because a consumer cannot
+    render "N of M, accepting" without them.
+
+    :raises ValueError: If the payload is not an object or a required
+        field is missing or of the wrong type.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("capacity snapshot must be an object")
+    active = raw.get("active")
+    pending = raw.get("pending")
+    accepting = raw.get("accepting")
+    if (
+        not isinstance(active, int)
+        or isinstance(active, bool)
+        or not isinstance(pending, int)
+        or isinstance(pending, bool)
+        or not isinstance(accepting, bool)
+        # Negative or absurd counts are structurally invalid, not "unknown":
+        # rendering them would show "-1 of 10 runners" to a user.
+        or not 0 <= active <= _CAPACITY_MAX_COUNT
+        or not 0 <= pending <= _CAPACITY_MAX_COUNT
+    ):
+        raise ValueError("capacity snapshot has invalid required fields")
+    reason = raw.get("reason")
+    pressure = raw.get("pressure")
+    return HostCapacitySnapshot(
+        active=active,
+        pending=pending,
+        pressure=pressure if isinstance(pressure, bool) else None,
+        limit=_capacity_int(raw, "limit", maximum=_CAPACITY_MAX_COUNT),
+        available=_capacity_int(raw, "available", maximum=_CAPACITY_MAX_COUNT),
+        accepting=accepting,
+        reason=reason if isinstance(reason, str) else None,
+        memory_used=_capacity_int(raw, "memory_used", maximum=_CAPACITY_MAX_BYTES),
+        memory_limit=_capacity_int(raw, "memory_limit", maximum=_CAPACITY_MAX_BYTES),
+        memory_percent=_capacity_float(raw, "memory_percent"),
+        memory_high_threshold=_capacity_float(raw, "memory_high_threshold"),
+        memory_resume_threshold=_capacity_float(raw, "memory_resume_threshold"),
+        reserve_mb=_capacity_int(raw, "reserve_mb", maximum=_CAPACITY_MAX_COUNT),
+        observed_at=_capacity_float(raw, "observed_at"),
+    )
+
+
+def _decode_optional_capacity(msg: _JsonObject) -> HostCapacitySnapshot | None:
+    """Decode ``capacity`` from a hello frame; absent/null stays ``None``.
+
+    An older host sends no ``capacity`` key at all, which must decode
+    cleanly rather than raise.
+    """
+    raw = msg.get("capacity")
+    if raw is None:
+        return None
+    return _decode_capacity_snapshot(raw)
+
+
+def _decode_capacity_update(msg: _JsonObject) -> HostCapacityUpdateFrame:
+    """Decode ``host.capacity_update``, which requires a full snapshot."""
+    return HostCapacityUpdateFrame(_decode_capacity_snapshot(msg.get("capacity")))
+
+
 def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     """Decode a host hello frame.
 
@@ -1373,6 +1568,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        capacity=_decode_optional_capacity(msg),
     )
 
 

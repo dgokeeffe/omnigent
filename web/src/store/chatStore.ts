@@ -5201,6 +5201,13 @@ function finalizeActive(
 // within the connect-grace + relaunch window.
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
+// Mirrors the server's ErrorCode.HOST_AT_CAPACITY (omnigent/errors.py) — the
+// 429 returned when the session's host refuses a runner launch because its
+// active + in-flight runners hit its ceiling, or its memory is above the safe
+// launch watermark. The message is NOT consumed server-side, so resending
+// after a session frees up works.
+const HOST_AT_CAPACITY_CODE = "host_at_capacity";
+
 /**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
@@ -5214,6 +5221,15 @@ function describeSendFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
     return {
       message: "The runner didn't come online in time. Please try again.",
+      code: "",
+    };
+  }
+  if (err instanceof ApiError && err.code === HOST_AT_CAPACITY_CODE) {
+    // The host's own message already names the actionable next step (wait,
+    // stop a session, or use another host); add that the message was not
+    // consumed so retrying is safe.
+    return {
+      message: `${err.message} Your message was not sent — send it again once a slot frees up.`,
       code: "",
     };
   }

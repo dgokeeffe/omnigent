@@ -615,16 +615,25 @@ export async function launchRunner(
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    // hosts.py raises HTTPException → ``{"detail": "..."}``. Surface the
-    // server's reason (bad branch, offline host, already-bound) verbatim.
-    let detail = `${res.status} ${res.statusText}`;
+    // hosts.py raises HTTPException → ``{"detail": "..."}`` for validation
+    // failures, and OmnigentError → ``{"error": {"code", "message"}}`` for
+    // typed ones (e.g. ``host_at_capacity`` / 429). Read both so a typed
+    // refusal surfaces its actionable message and code instead of a bare
+    // "429 Too Many Requests".
+    let message = `${res.status} ${res.statusText}`;
+    let code: string | null = null;
     try {
-      const err = (await res.json()) as { detail?: string };
-      if (typeof err.detail === "string" && err.detail) detail = err.detail;
+      const err = (await res.json()) as {
+        detail?: string;
+        error?: { code?: string; message?: string };
+      };
+      if (err.error?.message) message = err.error.message;
+      else if (typeof err.detail === "string" && err.detail) message = err.detail;
+      if (err.error?.code) code = err.error.code;
     } catch {
       // Non-JSON body — keep the status-line fallback.
     }
-    throw new Error(detail);
+    throw new ApiError(message, res.status, code);
   }
   const wire = (await res.json()) as { runner_id: string };
   return { runnerId: wire.runner_id };

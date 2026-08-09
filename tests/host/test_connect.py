@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import subprocess
 import threading
@@ -963,6 +964,17 @@ class _FakeTunnel:
         """
         self.sent.append(data)
 
+    @property
+    def reports(self) -> list[str]:
+        """Sent frames excluding advisory ``host.capacity_update`` refreshes.
+
+        Capacity snapshots are published on every launch/stop/exit, so a
+        test asserting on lifecycle reports must not count them.
+
+        :returns: Encoded non-capacity frames, in order.
+        """
+        return [raw for raw in self.sent if json.loads(raw).get("kind") != "host.capacity_update"]
+
     async def recv(self) -> str:
         """Simulate an immediate disconnect.
 
@@ -1250,8 +1262,8 @@ async def test_watch_runner_reports_unexpected_exit(
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # Exactly one report; a second would double-record server-side.
-    assert len(tunnel.sent) == 1
-    report = decode_host_frame(tunnel.sent[0])
+    assert len(tunnel.reports) == 1
+    report = decode_host_frame(tunnel.reports[0])
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == token_bound_runner_id("tok_watch")
     # The report carries the exit code and the log tail with the cause.
@@ -1314,7 +1326,7 @@ async def test_watch_runner_silent_on_intentional_stop(
 
     # No runner_exited report and nothing parked for a reconnect —
     # either would mark a clean stop as a crash.
-    assert tunnel.sent == []
+    assert tunnel.reports == []
     assert host._unreported_exits == {}
 
 
@@ -1374,7 +1386,7 @@ async def test_watch_runner_silent_on_clean_exit(
     await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
 
     # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
-    assert tunnel.sent == []
+    assert tunnel.reports == []
     assert host._unreported_exits == {}
 
 
@@ -1397,10 +1409,10 @@ async def test_unreported_exit_flushes_after_reconnect(
     with pytest.raises(ConnectionError, match="test disconnect"):
         await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
 
-    assert len(tunnel.sent) == 2
-    hello = decode_host_frame(tunnel.sent[0])
+    assert len(tunnel.reports) == 2
+    hello = decode_host_frame(tunnel.reports[0])
     assert isinstance(hello, HostHelloFrame)
-    report = decode_host_frame(tunnel.sent[1])
+    report = decode_host_frame(tunnel.reports[1])
     assert isinstance(report, HostRunnerExitedFrame)
     assert report.runner_id == "runner_parked"
     assert report.error == "runner process exited with code 1"

@@ -1,3 +1,5 @@
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
@@ -7,7 +9,7 @@ import { ResumeWithDirectoryDialog } from "./ResumeWithDirectoryDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
-import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
+import { ApiError, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 
 // Heavy children are exercised by their own tests; stub them so this
@@ -25,7 +27,13 @@ vi.mock("./WorkspacePicker", () => ({
   WorkspacePicker: () => <div data-testid="mock-workspace-picker" />,
   isNavigablePath: () => false,
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+// Partial mock: only useHosts is stubbed. The capacity helpers
+// (hostCapacityLabel / isHostAtCapacity) are pure and must stay real, or the
+// host rows silently lose their advisory N/limit label and disabled state.
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHostsModule>()),
+  useHosts: vi.fn(),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: vi.fn(),
@@ -33,7 +41,11 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: [], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSlim: vi.fn(),
+  launchRunner: vi.fn(),
+}));
 // Radix Select uses a portal + pointer events that jsdom can't drive, so
 // stub it to a native <select>; lets tests switch the selected host.
 vi.mock("@/components/ui/select", () => ({
@@ -57,8 +69,20 @@ vi.mock("@/components/ui/select", () => ({
   SelectTrigger: ({ children }: { children: ReactNode }) => children,
   SelectValue: () => null,
   SelectContent: ({ children }: { children: ReactNode }) => children,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
+  // Forward disabled + data-testid so capacity gating is observable here.
+  SelectItem: ({
+    value,
+    children,
+    disabled,
+    ...rest
+  }: {
+    value: string;
+    children: ReactNode;
+    disabled?: boolean;
+  }) => (
+    <option value={value} disabled={disabled} {...rest}>
+      {children}
+    </option>
   ),
 }));
 
@@ -141,6 +165,134 @@ describe("ResumeWithDirectoryDialog", () => {
         baseBranch: undefined,
       }),
     );
+  });
+
+  it("shows advisory N/limit runner capacity on each online host row", async () => {
+    // The picker must expose the ACTIVE-RUNNER ceiling (not a browser PTY or
+    // managed-lease cap) so a user can see 10/10 before trying to launch.
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_src",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          capacity: {
+            active: 7,
+            pending: 1,
+            limit: 10,
+            available: 2,
+            accepting: true,
+            reason: null,
+            observed_at: Date.now() / 1000,
+          },
+        },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const label = await screen.findByTestId("resume-dir-host-capacity-host_src");
+    // active + pending, because an in-flight launch already holds a slot.
+    expect(label.textContent).toBe("8/10 runners");
+    const option = screen.getByTestId("resume-dir-host-option-host_src") as HTMLOptionElement;
+    expect(option.disabled).toBe(false);
+  });
+
+  it("disables a host only when a FRESH snapshot says it is not accepting", async () => {
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_src",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          capacity: {
+            active: 10,
+            pending: 0,
+            limit: 10,
+            available: 0,
+            accepting: false,
+            reason: "host_at_capacity",
+            observed_at: Date.now() / 1000,
+          },
+        },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const option = (await screen.findByTestId(
+      "resume-dir-host-option-host_src",
+    )) as HTMLOptionElement;
+    expect(option.disabled).toBe(true);
+    expect(screen.getByTestId("resume-dir-host-capacity-host_src").textContent).toBe(
+      "10/10 runners",
+    );
+  });
+
+  it("labels unknown capacity as unknown instead of disabling the host", async () => {
+    // An older host (or a replica with no report yet) sends no capacity. It
+    // must stay selectable and simply show no label — never 0 free slots.
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_src", name: "laptop", owner: "me", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+
+    renderDialog();
+
+    const option = (await screen.findByTestId(
+      "resume-dir-host-option-host_src",
+    )) as HTMLOptionElement;
+    expect(option.disabled).toBe(false);
+    expect(screen.getByTestId("resume-dir-host-capacity-host_src").textContent).toBe(
+      "capacity unknown",
+    );
+  });
+
+  it("surfaces an authoritative 429 race with actionable retry guidance", async () => {
+    // The advisory snapshot said "accepting", so the user could select this
+    // host; the host's own gate then refused. The dialog must explain the
+    // next step rather than showing a bare failure.
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_src",
+          name: "laptop",
+          owner: "me",
+          status: "online",
+          capacity: {
+            active: 3,
+            pending: 0,
+            limit: 10,
+            available: 7,
+            accepting: true,
+            reason: null,
+            observed_at: Date.now() / 1000,
+          },
+        },
+      ],
+    } as unknown as ReturnType<typeof useHosts>);
+    getSessionMock.mockResolvedValue(sourceSession({ workspace: "/Users/alice/repo" }));
+    launchRunnerMock.mockRejectedValue(
+      new ApiError(
+        "This host is at capacity (10 running, 0 starting, limit 10). " +
+          "Wait for a session to finish, stop one, or use another host.",
+        429,
+        "host_at_capacity",
+      ),
+    );
+
+    renderDialog();
+    const bindBtn = await screen.findByTestId("resume-dir-bind-button");
+    await waitFor(() => expect((bindBtn as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(bindBtn);
+
+    const error = await screen.findByText(/at capacity/i);
+    expect(error.textContent).toContain("use another host");
+    expect(error.textContent).toContain("refreshes as sessions finish");
   });
 
   it("binds the source directory directly when no branch is named", async () => {

@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
+    HostCapacityUpdateFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -481,6 +482,19 @@ async def _receive_loop(
                 host_id,
                 type(runner_frame).__name__,
             )
+            continue
+
+        if isinstance(frame, HostCapacityUpdateFrame):
+            # Advisory refresh: store it and nudge subscribers so a host
+            # picker can re-render N/limit. No DB write — capacity is live
+            # per-connection state, not durable host configuration.
+            conn.capacity = frame.capacity
+            if on_host_update is not None:
+                try:
+                    await on_host_update(host_id, conn.owner)
+                except Exception:
+                    # A bad subscriber must not drop the host tunnel.
+                    _logger.exception("on_host_update callback failed for %s", host_id)
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):

@@ -16,6 +16,7 @@ import {
   getSession,
   getSessionSlim,
   interrupt,
+  launchRunner,
   listRunners,
   openSessionStream,
   postEvent,
@@ -926,5 +927,55 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("launchRunner error mapping", () => {
+  it("surfaces a typed OmnigentError body as an ApiError with its code", async () => {
+    // hosts.py raises OmnigentError for a capacity refusal, which serializes
+    // as {"error": {"code", "message"}} — not FastAPI's {"detail"}. Reading
+    // only `detail` would show a bare "429 Too Many Requests" and lose the
+    // actionable wait / close-a-session / other-host guidance.
+    const message =
+      "This host is at capacity (10 running, 0 starting, limit 10). " +
+      "Wait for a session to finish, stop one, or use another host.";
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "host_at_capacity", message } },
+        { ok: false, status: 429 },
+      ),
+    );
+    await expect(launchRunner("host_1", "conv_1", "/work")).rejects.toMatchObject({
+      name: "ApiError",
+      status: 429,
+      code: "host_at_capacity",
+      message,
+    });
+  });
+
+  it("still surfaces a FastAPI detail body", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ detail: "host is offline" }, { ok: false, status: 409 }),
+    );
+    await expect(launchRunner("host_1", "conv_1", "/work")).rejects.toMatchObject({
+      status: 409,
+      code: null,
+      message: "host is offline",
+    });
+  });
+
+  it("falls back to the status line for a non-JSON body", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: async () => {
+        throw new Error("not json");
+      },
+    } as unknown as Response);
+    await expect(launchRunner("host_1", "conv_1", "/work")).rejects.toMatchObject({
+      status: 502,
+      message: "502 Bad Gateway",
+    });
   });
 });

@@ -6,6 +6,12 @@
 
 bundle:
   name: omnigent
+  # Direct engine (no Terraform): the Terraform databricks_app provider updates
+  # an app through an API that rejects compute_size, which is why this file used
+  # to omit it and deploy.py resized out-of-band. The direct engine calls the
+  # apps API itself, so compute_size is declarable and a resize is an ordinary
+  # in-plan update. `databricks bundle plan` migrates existing Terraform state.
+  engine: direct
 
 variables:
   app_name:
@@ -16,6 +22,9 @@ variables:
     description: "projects/<app>/branches/production/databases/databricks-postgres"
   volume_name:
     description: "<catalog>.<schema>.<volume> for artifact storage"
+  compute_size:
+    description: "App compute size: SMALL, MEDIUM or LARGE."
+    default: LARGE
   otel_table_schema:
     description: >
       UC schema (catalog.schema) holding the OTel destination tables.
@@ -85,11 +94,7 @@ resources:
       name: ${var.app_name}
       description: "Omnigent server backed by Lakebase + UC Volumes."
       source_code_path: ./src
-      # compute_size is intentionally NOT declared here. Terraform's
-      # databricks_app provider uses an apps update API that rejects
-      # compute_size changes ("not supported in this update API"). We
-      # set it out-of-band via apps.create_update in deploy.py before
-      # the bundle deploy runs.
+      compute_size: ${var.compute_size}
       config:
         command: ${var.app_command}
         env: ${var.app_env}

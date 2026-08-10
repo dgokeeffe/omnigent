@@ -1058,38 +1058,21 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     raise SystemExit(f"bundle deployment bind failed (exit {result.returncode})")
 
 
-def _ensure_compute_size(
-    wc: WorkspaceClient,
-    app_name: str,
-    desired: str,
-) -> None:
-    """Resize the app to `desired` if it's not already there.
+def assert_compute_size(wc: WorkspaceClient, app_name: str, desired: str) -> None:
+    """Fail if the deployed app is not the compute size that was asked for.
 
-    The bundle's Terraform databricks_app resource can't update
-    compute_size on an existing app (the old apps update API rejects
-    it). The newer ``apps.create_update`` endpoint can. Run that here
-    so the subsequent bundle deploy sees no diff and doesn't error.
+    ``compute_size`` is declared in databricks.yml and applied by the direct
+    engine, so this is a post-deploy assertion rather than an out-of-band
+    resize. Under the Terraform engine the app update silently dropped the
+    field, which left a deploy asking for LARGE running on MEDIUM.
     """
-    from databricks.sdk.errors.platform import NotFound
-    from databricks.sdk.service.apps import App, ComputeSize
-
-    try:
-        current = wc.apps.get(name=app_name)
-    except NotFound:
-        _log(f"app {app_name!r} not found; bundle deploy will create at {desired}")
-        return
-
-    current_value = current.compute_size.value if current.compute_size else None
-    if current_value == desired:
-        _log(f"compute_size already {desired}; skipping resize")
-        return
-
-    _log(f"resizing app {app_name!r}: {current_value} → {desired}")
-    wc.apps.create_update_and_wait(
-        app_name=app_name,
-        update_mask="compute_size",
-        app=App(name=app_name, compute_size=ComputeSize(desired)),
-    )
+    current = wc.apps.get(name=app_name)
+    actual = current.compute_size.value if current.compute_size else None
+    if actual != desired:
+        raise SystemExit(
+            f"app {app_name!r} is {actual!r} after deploy but {desired!r} was requested"
+        )
+    _log(f"compute_size ok: {actual}")
 
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
@@ -1103,6 +1086,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"lakebase_database={args.lakebase_database}",
         "--var",
         f"volume_name={args.volume_name}",
+        "--var",
+        f"compute_size={args.compute_size}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
         "--var",
@@ -1248,13 +1233,6 @@ def main() -> int:
     # 4) Bind the bundle to the existing app (if any).
     _ensure_bound(args)
 
-    # 4a) Reconcile compute_size out-of-band. Terraform's databricks_app
-    # update path doesn't support compute_size changes ("not supported
-    # in this update API"). The new SDK apps.create_update endpoint
-    # does — call it ourselves so the subsequent bundle deploy sees no
-    # diff. Skipped when already matching.
-    _ensure_compute_size(wc, args.app_name, args.compute_size)
-
     # 5) databricks bundle deploy --target <target> (syncs src/ to the
     # bundle workspace folder and creates/updates the app resource).
     _log(f"databricks bundle deploy --target {args.target}")
@@ -1289,6 +1267,9 @@ def main() -> int:
         cwd=_deploy_dir(),
         check=True,
     )
+
+    # 5a) The bundle owns compute_size now; confirm the platform agrees.
+    assert_compute_size(wc, args.app_name, args.compute_size)
 
     # 6) Resolve URL + smoke-check.
     app = wc.apps.get(name=args.app_name)

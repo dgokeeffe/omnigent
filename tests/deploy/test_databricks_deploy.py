@@ -201,3 +201,44 @@ def test_no_otel_target_keeps_managed_coda_wiring(deploy_mod: ModuleType) -> Non
         bundle["targets"]["prod-no-otel"]["variables"]["app_env"]["default"],
     ):
         assert expected <= {entry["name"] for entry in entries}
+
+
+def test_bundle_declares_compute_size_and_the_direct_engine(deploy_mod: ModuleType) -> None:
+    """The bundle owns compute_size; the Terraform engine silently dropped it."""
+    bundle = yaml.safe_load(_BUNDLE_YML.read_text())
+    assert bundle["bundle"]["engine"] == "direct"
+    assert bundle["resources"]["apps"]["omnigent"]["compute_size"] == "${var.compute_size}"
+    assert "compute_size" in bundle["variables"]
+
+
+def test_bundle_vars_pass_the_requested_compute_size(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _parse(deploy_mod, monkeypatch, "--compute-size", "SMALL")
+    assert "compute_size=SMALL" in deploy_mod._bundle_vars(args)
+
+
+def test_assert_compute_size_rejects_a_downsized_app(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deploy asking for LARGE must not quietly finish on MEDIUM."""
+    from types import SimpleNamespace
+
+    wc = SimpleNamespace(
+        apps=SimpleNamespace(
+            get=lambda name: SimpleNamespace(compute_size=SimpleNamespace(value="MEDIUM"))
+        )
+    )
+    with pytest.raises(SystemExit, match="MEDIUM"):
+        deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")
+
+
+def test_assert_compute_size_accepts_a_matching_app(deploy_mod: ModuleType) -> None:
+    from types import SimpleNamespace
+
+    wc = SimpleNamespace(
+        apps=SimpleNamespace(
+            get=lambda name: SimpleNamespace(compute_size=SimpleNamespace(value="LARGE"))
+        )
+    )
+    deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")

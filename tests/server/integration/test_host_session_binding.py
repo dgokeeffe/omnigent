@@ -1600,6 +1600,67 @@ async def test_managed_launch_fails_when_runner_never_connects(
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
+async def test_managed_launch_waits_for_host_registration_before_runner_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initial provisioning must not settle ready before the host tunnel registers."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "0c5b32d0bb2a4b4e88ebcce6d7092b57"
+    conv = SimpleNamespace(id=session_id)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    launch_calls: list[str] = []
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        launch_calls.append("launch")
+        return sessions_module._HostLaunchAttempt(runner_id="runner-connects")
+
+    class _HostRegistry:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, _host_id: str) -> object | None:
+            self.calls += 1
+            return None if self.calls == 1 else object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> object:
+            del timeout_s
+            return object()
+
+    registry = _HostRegistry()
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_args: None)
+    entry = tracker.get(session_id)
+    assert entry is not None
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=session_id,
+        managed=ManagedHostLaunch(
+            host_id="3c8cdcdb61903904849174c864620a5c",
+            workspace="/root/workspace",
+        ),
+        sandbox_config=ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: FakeSandboxLauncher(),
+            token_ttl_s=3600,
+        ),
+        tracker=tracker,
+        conversation_store=SimpleNamespace(
+            set_host_id=lambda _sid, _host_id, _workspace: conv,
+        ),
+        host_store=SimpleNamespace(),
+        host_registry=registry,  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    assert entry.error is None
+    assert entry.settled.is_set()
+    assert registry.calls >= 2
+    assert launch_calls == ["launch"]
+
+
 async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,

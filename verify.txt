@@ -60,12 +60,12 @@ uv run --extra dev pytest -q \
   tests/server/integration/test_host_session_binding.py
 ```
 
-Result: exit 0, **288 passed**. Coverage includes registry validation/legacy normalization, process-shared concurrent round robin, unavailable/full/existing-owner spillover, same-App ambiguity retry/fail-closed behavior, App-fenced allocation/termination, removed IDs, strict CoDA release uncertainty, adoption, relaunch and cancellation paths, deployment CLI/bundle variables, legacy deploy flags, and `--no-otel` environment parity.
+Result: exit 0, **290 passed**. Coverage includes registry validation/legacy normalization, process-shared concurrent round robin, unavailable/full/existing-owner spillover, same-App ambiguity retry/fail-closed behavior, App-fenced allocation/termination, removed IDs, strict CoDA release uncertainty, adoption, relaunch and cancellation paths, deployment CLI/bundle variables, legacy deploy flags, and `--no-otel` environment parity.
 
 Static gates:
 
 - Focused `ruff check`: exit 0 (`All checks passed`).
 - `python -m compileall` on changed Python production files: exit 0.
 - `git diff --check`: exit 0.
-- Changed-file budget: 11 files total versus `fork/dev` (including this evidence and the pre-existing design), below the maximum 12; zero migrations, API endpoints, UI files, durable scheduler state, or CoDA-repository changes.
+- Changed-file budget: exactly 12 files total versus `fork/dev` (including this evidence, the pre-existing design, and the pure deployment bootstrap normalizer), at the maximum 12; zero migrations, API endpoints, UI files, durable scheduler state, or CoDA-repository changes.
 - `databricks bundle validate --strict --target prod-no-otel` reached auth resolution with no schema finding, then stopped because the checked-in bundle host is the intentional `https://example.databricks.com` placeholder and did not match profile `daveok`. No deployment was attempted. A real target/profile must be selected only through the live discovery gate.

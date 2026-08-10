@@ -24,6 +24,7 @@ import yaml
 _ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY_PY = _ROOT / "deploy" / "databricks" / "deploy.py"
 _BUNDLE_YML = _ROOT / "deploy" / "databricks" / "databricks.yml"
+_CODA_CONFIG_PY = _ROOT / "deploy" / "databricks" / "src" / "coda_config.py"
 
 _REQUIRED_ARGS = [
     "--app-name",
@@ -44,6 +45,16 @@ def deploy_mod() -> ModuleType:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def coda_config_mod() -> ModuleType:
+    """Load the deployed app's pure CoDA bootstrap normalizer."""
+    spec = importlib.util.spec_from_file_location("_databricks_coda_config", _CODA_CONFIG_PY)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -208,6 +219,54 @@ def test_bundle_vars_encode_repeatable_coda_pool_without_commas(
     ]
     assert f"coda_pool_b64={encoded}" in deploy_mod._bundle_vars(args)
     assert "," not in encoded
+
+
+def test_app_bootstrap_decodes_pool_and_preserves_legacy(
+    deploy_mod: ModuleType,
+    coda_config_mod: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _parse(
+        deploy_mod,
+        monkeypatch,
+        "--coda-app",
+        "stable-a,coda-one,https://one.example.com",
+        "--coda-app",
+        "stable-b,coda-two,https://two.example.com",
+        "--omnigent-public-server-url",
+        "https://omnigent.example.com",
+    )
+    raw = coda_config_mod.managed_coda_raw_config(
+        {
+            "CODA_POOL_B64": args.coda_pool_b64,
+            "OMNIGENT_PUBLIC_SERVER_URL": "https://omnigent.example.com",
+        }
+    )
+    assert raw["coda"]["pool"][1]["app_id"] == "stable-b"
+    assert coda_config_mod.managed_coda_raw_config(
+        {
+            "CODA_APP_NAME": "legacy",
+            "CODA_APP_URL": "https://legacy.example.com",
+            "OMNIGENT_PUBLIC_SERVER_URL": "https://omnigent.example.com",
+        }
+    )["coda"] == {
+        "app_name": "legacy",
+        "app_url": "https://legacy.example.com",
+    }
+
+
+def test_app_bootstrap_rejects_conflicting_pool_and_legacy(
+    coda_config_mod: ModuleType,
+) -> None:
+    with pytest.raises(RuntimeError, match="cannot be combined"):
+        coda_config_mod.managed_coda_raw_config(
+            {
+                "CODA_POOL_B64": "W10=",
+                "CODA_APP_NAME": "legacy",
+                "CODA_APP_URL": "https://legacy.example.com",
+                "OMNIGENT_PUBLIC_SERVER_URL": "https://omnigent.example.com",
+            }
+        )
 
 
 def test_parse_args_rejects_partial_managed_coda_configuration(

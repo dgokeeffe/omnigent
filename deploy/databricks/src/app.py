@@ -6,9 +6,7 @@ database and UC Volumes as the artifact store.
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import json
 import logging
 import os
 import sys
@@ -234,35 +232,14 @@ try:
         runner_secret = hashlib.sha256(f"omnigent-runner:{app_client_secret}".encode()).hexdigest()
         os.environ.setdefault("OMNIGENT_RUNNER_TOKEN_SECRET", runner_secret)
     auth_provider = create_auth_provider()
+    from coda_config import managed_coda_raw_config
+
     sandbox_config = None
-    coda_pool_b64 = os.environ.get("CODA_POOL_B64", "").strip()
-    coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()
-    coda_app_url = os.environ.get("CODA_APP_URL", "").strip()
-    public_server_url = os.environ.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
-    legacy_values = (coda_app_name, coda_app_url)
-    if coda_pool_b64 and any(legacy_values):
-        raise RuntimeError("CODA_POOL_B64 cannot be combined with legacy CoDA variables")
-    if any(legacy_values) and not all(legacy_values):
-        raise RuntimeError("partial legacy managed CoDA configuration")
-    if (coda_pool_b64 or all(legacy_values)) and not public_server_url:
-        raise RuntimeError("OMNIGENT_PUBLIC_SERVER_URL is required with managed CoDA")
-    if public_server_url and not (coda_pool_b64 or all(legacy_values)):
-        raise RuntimeError("managed CoDA App configuration is missing")
-    coda_section: dict[str, object] | None = None
-    if coda_pool_b64:
-        try:
-            pool = json.loads(base64.urlsafe_b64decode(coda_pool_b64).decode())
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("CODA_POOL_B64 must contain URL-safe base64 JSON") from exc
-        coda_section = {"pool": pool}
-    elif all(legacy_values):
-        coda_section = {"app_name": coda_app_name, "app_url": coda_app_url}
-    if coda_section is not None:
+    coda_raw = managed_coda_raw_config(os.environ)
+    if coda_raw is not None:
         from omnigent.server.managed_hosts import parse_sandbox_config
 
-        sandbox_config = parse_sandbox_config(
-            {"provider": "coda", "server_url": public_server_url, "coda": coda_section}
-        )
+        sandbox_config = parse_sandbox_config(coda_raw)
         provider = sandbox_config.launcher_factory()
         app_ids = getattr(provider, "app_ids", ())
         logger.info("Configured managed CoDA pool app_ids=%s", ",".join(app_ids))

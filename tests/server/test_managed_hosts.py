@@ -575,7 +575,96 @@ def test_parse_valid_coda_config_builds_parameterized_factory() -> None:
     assert config.token_ttl_s == CODA_MANAGED_TOKEN_TTL_S
     assert config.token_ttl_s > CODA_MAX_LEASE_S
     assert config.max_sessions_per_lease == CODA_DEFAULT_MAX_SESSIONS_PER_LEASE
-    assert isinstance(config.launcher_factory(), CodaProvider)
+    provider = config.launcher_factory()
+    assert isinstance(provider, CodaProvider)
+    assert provider.app_ids == ("coda-main",)
+
+
+def test_parse_coda_pool_builds_stable_registry_and_shared_cursor() -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+    from omnigent.server.managed_hosts import parse_sandbox_config
+
+    config = parse_sandbox_config(
+        {
+            "provider": "coda",
+            "server_url": "https://omnigent.example.com",
+            "coda": {
+                "pool": [
+                    {
+                        "app_id": "primary",
+                        "app_name": "coda-one",
+                        "app_url": "https://one.example.com",
+                    },
+                    {
+                        "app_id": "overflow",
+                        "app_name": "coda-two",
+                        "app_url": "https://two.example.com/",
+                    },
+                ]
+            },
+        }
+    )
+    assert config is not None
+    first = config.launcher_factory()
+    second = config.launcher_factory()
+    assert isinstance(first, CodaProvider)
+    assert isinstance(second, CodaProvider)
+    assert first.app_ids == second.app_ids == ("primary", "overflow")
+
+
+@pytest.mark.parametrize(
+    ("coda", "error"),
+    [
+        ({"pool": []}, "non-empty"),
+        ({"pool": [{"app_id": "a"}]}, "requires non-empty"),
+        (
+            {
+                "pool": [
+                    {"app_id": "same", "app_name": "one", "app_url": "https://one.test"},
+                    {"app_id": "same", "app_name": "two", "app_url": "https://two.test"},
+                ]
+            },
+            "duplicate.*app_id",
+        ),
+        (
+            {
+                "pool": [
+                    {"app_id": "one", "app_name": "same", "app_url": "https://one.test"},
+                    {"app_id": "two", "app_name": "same", "app_url": "https://two.test"},
+                ]
+            },
+            "duplicate.*app_name",
+        ),
+        (
+            {
+                "pool": [
+                    {"app_id": "one", "app_name": "one", "app_url": "https://same.test"},
+                    {"app_id": "two", "app_name": "two", "app_url": "https://SAME.test/"},
+                ]
+            },
+            "duplicate.*app_url",
+        ),
+        (
+            {"pool": [{"app_id": "one", "app_name": "one", "app_url": "http://bad.test"}]},
+            "HTTPS origin",
+        ),
+        (
+            {
+                "app_name": "legacy",
+                "app_url": "https://legacy.test",
+                "pool": [{"app_id": "one", "app_name": "one", "app_url": "https://one.test"}],
+            },
+            "cannot combine",
+        ),
+    ],
+)
+def test_parse_coda_pool_rejects_invalid_config(coda: dict[str, object], error: str) -> None:
+    from omnigent.server.managed_hosts import parse_sandbox_config
+
+    with pytest.raises(ValueError, match=error):
+        parse_sandbox_config(
+            {"provider": "coda", "server_url": "https://omnigent.test", "coda": coda}
+        )
 
 
 def test_parse_valid_kubernetes_config_builds_parameterized_factory(
@@ -2352,8 +2441,11 @@ async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
     )
 
     assert result.host_id == host.host_id
-    lease_calls = [body for method, body in requests if method == "POST"]
-    assert len(lease_calls) == 1
+    post_calls = [body for method, body in requests if method == "POST"]
+    assert post_calls[0] == {"lease_id": "old-lease", "scrub": True}
+    assert post_calls[1] is not None
+    assert post_calls[1]["owner"] == _OWNER
+    assert len(post_calls) == 2
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
@@ -2707,6 +2799,36 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
+
+
+async def test_terminate_managed_coda_preserves_row_when_release_is_uncertain(
+    db_uri: str,
+) -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+    def fail(_method: str, _path: str, _body: object) -> dict[str, object]:
+        raise click.ClickException("network unavailable")
+
+    launcher = CodaProvider(
+        app_name="stable-a",
+        app_url="https://coda.example.com",
+        request_fn=fail,
+        app_getter=lambda _: SimpleNamespace(compute_status=SimpleNamespace(state="ACTIVE")),
+    )
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="c0da7fa3f1cdb40c0ec393a3d42affc7",
+        name="managed-coda-term",
+        user_id=_OWNER,
+        token="tok-coda-term",
+        provider="coda",
+        sandbox_id="coda:stable-a#lease-a",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    with pytest.raises(HTTPException, match="host preserved"):
+        await terminate_managed_host(host, host_store, _injected_config(launcher))
+    assert host_store.get_host(host.host_id) is not None
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:

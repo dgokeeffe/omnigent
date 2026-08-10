@@ -38,3 +38,34 @@ After committing this evidence/design:
 - `git diff --name-status fork/dev..HEAD` must list only `A designs/MULTI-CODA-POOL.md` and `A verify.txt`.
 - `.coverage` must match `fork/dev:.coverage` and must not appear in that diff.
 - `test ! -e .venv` must succeed.
+
+## Implementation source gate (2026-08-11)
+
+- Old feature HEAD: `63ffa93ce01ac70fdd9446712776a2932283699c`
+- Fetched `fork/dev`: `8558c8283f9b2aad2923d165398231bed1ef6a09`
+- `git merge --no-edit fork/dev`: exit 0, `Already up to date`; resulting HEAD remained the design commit.
+- Merge-base: exact `fork/dev` SHA; pre-implementation ancestry: 0 behind / 1 ahead.
+- The untracked task prompt was relocated to `/tmp/omnigent-multi-coda-goal.md` before editing so the source gate was clean.
+- Original workshop checkout was not touched and retained its previously recorded HEAD/status.
+
+## Deterministic MVP verification
+
+Final focused command:
+
+```
+uv run --extra dev pytest -q \
+  tests/onboarding/sandboxes/test_coda.py \
+  tests/server/test_managed_hosts.py \
+  tests/deploy/test_databricks_deploy.py \
+  tests/server/integration/test_host_session_binding.py
+```
+
+Result: exit 0, **288 passed**. Coverage includes registry validation/legacy normalization, process-shared concurrent round robin, unavailable/full/existing-owner spillover, same-App ambiguity retry/fail-closed behavior, App-fenced allocation/termination, removed IDs, strict CoDA release uncertainty, adoption, relaunch and cancellation paths, deployment CLI/bundle variables, legacy deploy flags, and `--no-otel` environment parity.
+
+Static gates:
+
+- Focused `ruff check`: exit 0 (`All checks passed`).
+- `python -m compileall` on changed Python production files: exit 0.
+- `git diff --check`: exit 0.
+- Changed-file budget: 11 files total versus `fork/dev` (including this evidence and the pre-existing design), below the maximum 12; zero migrations, API endpoints, UI files, durable scheduler state, or CoDA-repository changes.
+- `databricks bundle validate --strict --target prod-no-otel` reached auth resolution with no schema finding, then stopped because the checked-in bundle host is the intentional `https://example.databricks.com` placeholder and did not match profile `daveok`. No deployment was attempted. A real target/profile must be selected only through the live discovery gate.

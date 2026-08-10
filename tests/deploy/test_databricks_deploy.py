@@ -185,6 +185,31 @@ def test_bundle_vars_include_managed_coda_configuration(
     assert "omnigent_public_server_url=https://omnigent.example.com" in pairs
 
 
+def test_bundle_vars_encode_repeatable_coda_pool_without_commas(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+    import json
+
+    args = _parse(
+        deploy_mod,
+        monkeypatch,
+        "--coda-app",
+        "stable-a,coda-one,https://one.example.com",
+        "--coda-app",
+        "stable-b,coda-two,https://two.example.com",
+        "--omnigent-public-server-url",
+        "https://omnigent.example.com",
+    )
+    encoded = args.coda_pool_b64
+    assert json.loads(base64.urlsafe_b64decode(encoded)) == [
+        {"app_id": "stable-a", "app_name": "coda-one", "app_url": "https://one.example.com"},
+        {"app_id": "stable-b", "app_name": "coda-two", "app_url": "https://two.example.com"},
+    ]
+    assert f"coda_pool_b64={encoded}" in deploy_mod._bundle_vars(args)
+    assert "," not in encoded
+
+
 def test_parse_args_rejects_partial_managed_coda_configuration(
     deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -195,7 +220,7 @@ def test_parse_args_rejects_partial_managed_coda_configuration(
 def test_no_otel_target_keeps_managed_coda_wiring(deploy_mod: ModuleType) -> None:
     """--no-otel drops the tracer, never the managed CoDA env."""
     bundle = yaml.safe_load(_BUNDLE_YML.read_text())
-    expected = {"CODA_APP_NAME", "CODA_APP_URL", "OMNIGENT_PUBLIC_SERVER_URL"}
+    expected = {"CODA_POOL_B64", "CODA_APP_NAME", "CODA_APP_URL", "OMNIGENT_PUBLIC_SERVER_URL"}
     for entries in (
         bundle["variables"]["app_env"]["default"],
         bundle["targets"]["prod-no-otel"]["variables"]["app_env"]["default"],

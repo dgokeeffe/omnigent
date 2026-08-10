@@ -25,6 +25,7 @@ including first-time infrastructure setup.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -849,9 +850,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--coda-app",
+        action="append",
+        default=[],
+        metavar="APP_ID,APP_NAME,APP_URL",
+        help=(
+            "Repeatable managed CoDA pool binding with immutable id, Databricks App "
+            "name, and HTTPS URL. Cannot be combined with legacy CoDA flags."
+        ),
+    )
+    parser.add_argument(
         "--coda-app-name",
         default="",
-        help="Managed CoDA Databricks App name. Set with the other CoDA URL flags.",
+        help="Legacy single managed CoDA App name. Set with --coda-app-url.",
     )
     parser.add_argument(
         "--coda-app-url",
@@ -957,11 +968,24 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
-    coda_values = (args.coda_app_name, args.coda_app_url, args.omnigent_public_server_url)
-    if any(coda_values) and not all(coda_values):
+    parsed_pool: list[dict[str, str]] = []
+    for raw_binding in args.coda_app:
+        parts = [part.strip() for part in raw_binding.split(",", 2)]
+        if len(parts) != 3 or not all(parts):
+            parser.error("--coda-app must be APP_ID,APP_NAME,APP_URL with no empty field")
+        parsed_pool.append({"app_id": parts[0], "app_name": parts[1], "app_url": parts[2]})
+    pool_json = json.dumps(parsed_pool, separators=(",", ":")) if parsed_pool else ""
+    args.coda_pool_b64 = base64.urlsafe_b64encode(pool_json.encode()).decode() if pool_json else ""
+    legacy_values = (args.coda_app_name, args.coda_app_url)
+    if args.coda_pool_b64 and any(legacy_values):
+        parser.error("--coda-app cannot be combined with --coda-app-name/--coda-app-url")
+    if any(legacy_values) and not all(legacy_values):
+        parser.error("--coda-app-name and --coda-app-url must be set together")
+    if (args.coda_pool_b64 or all(legacy_values)) and not args.omnigent_public_server_url:
+        parser.error("--omnigent-public-server-url is required with managed CoDA")
+    if args.omnigent_public_server_url and not (args.coda_pool_b64 or all(legacy_values)):
         parser.error(
-            "--coda-app-name, --coda-app-url, and --omnigent-public-server-url "
-            "must be set together"
+            "managed CoDA App configuration is required with --omnigent-public-server-url"
         )
     # --no-otel selects the tracer-off DAB target (same workspace + state as
     # `prod`, OTel variables overridden off). Only auto-switch the default
@@ -1117,6 +1141,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"compute_size={args.compute_size}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"coda_pool_b64={getattr(args, 'coda_pool_b64', '')}",
         "--var",
         f"coda_app_name={args.coda_app_name}",
         "--var",

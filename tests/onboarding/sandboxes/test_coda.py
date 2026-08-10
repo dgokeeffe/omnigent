@@ -94,6 +94,12 @@ def test_capabilities_and_legacy_identity() -> None:
     assert provider.capabilities.programmatic_terminate is True
 
 
+def test_prepare_accepts_current_coda_status_without_ready_field() -> None:
+    control = FakeControl()
+    control.responses["/api/omnigent-host/status"] = {"running": False, "stage": "idle"}
+    launcher(control).prepare()
+
+
 def test_prepare_accepts_partial_availability() -> None:
     a = FakeControl("a")
     b = FakeControl("b")

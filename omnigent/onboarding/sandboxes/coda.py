@@ -221,7 +221,9 @@ class CodaProvider(SandboxHostLauncher):
                 f"CoDA app {binding.app_id!r} compute is not ACTIVE"
             )
         status = self._request_for(binding, "GET", "/api/omnigent-host/status", None)
-        if status.get("ready") is not True:
+        # Current CoDA status payloads omit ``ready`` and report detailed
+        # runtime state instead; only an explicit false is a readiness veto.
+        if status.get("ready") is False:
             raise CodaUnavailableError(f"CoDA app {binding.app_id!r} is not ready")
 
     def prepare(self) -> None:

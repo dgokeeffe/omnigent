@@ -198,13 +198,21 @@ def set_version_in_version_py(path: Path, new_version: str) -> str:
 def _stamp_versions(new_version: str) -> dict[Path, str]:
     """Stamp `new_version` into the pyprojects and the runtime version constant.
 
+    Transactional: a malformed later file would otherwise raise before the
+    caller ever receives the backups, leaving the files already rewritten with
+    nothing able to restore them.
+
     :returns: Original file contents keyed by path, for restore.
     """
     backups: dict[Path, str] = {}
-    for path in _pyproject_paths():
-        backups[path] = set_version_in_pyproject(path, new_version)
-    version_py = _version_py_path()
-    backups[version_py] = set_version_in_version_py(version_py, new_version)
+    try:
+        for path in _pyproject_paths():
+            backups[path] = set_version_in_pyproject(path, new_version)
+        version_py = _version_py_path()
+        backups[version_py] = set_version_in_version_py(version_py, new_version)
+    except BaseException:
+        _restore_versions(backups)
+        raise
     return backups
 
 
@@ -570,13 +578,50 @@ def write_uv_dependency_files(
     run_uv_lock(src)
 
 
-def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
+def assert_smoke_url_trusted(app_url: str, resolved_url: str | None) -> None:
+    """Refuse to send the workspace bearer anywhere but the app itself.
+
+    ``--app-url`` overrides the URL read off the App resource, and the smoke
+    check authenticates with the deploying identity's token — so an arbitrary
+    override would hand that token to whatever host was named. Allow only the
+    resolved app URL's own origin, or a Databricks Apps origin when the SDK
+    returned no URL to compare against.
+
+    :param app_url: URL the smoke check would call.
+    :param resolved_url: URL reported by the App resource, if any.
+    """
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(app_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise SystemExit(f"refusing to smoke-check {app_url!r}: not a bare https URL")
+    if resolved_url:
+        expected = urlsplit(resolved_url)
+        if (parsed.scheme, parsed.netloc) != (expected.scheme, expected.netloc):
+            raise SystemExit(
+                f"refusing to send the workspace token to {parsed.netloc!r}: "
+                f"the app resource reports {expected.netloc!r}"
+            )
+        return
+    if not parsed.hostname.endswith(".databricksapps.com"):
+        raise SystemExit(
+            f"refusing to send the workspace token to {parsed.netloc!r}: "
+            "not a Databricks Apps host"
+        )
+
+
+def _smoke_check(wc: WorkspaceClient, app_url: str, deploy_version: str | None = None) -> None:
     """Poll /health on the running app and fail if it never returns 200.
 
     ``databricks bundle run`` returns as soon as the app start is
     signalled, but uvicorn takes a few extra seconds to bind. Retry
     up to a minute to ride out the warm-up; surface the most recent
     error if it never goes green.
+
+    When ``deploy_version`` is given, also require the running app to report it
+    from ``/api/version``. Wheel-side stamping alone has already shipped an app
+    that answered the base version, so the deploy is only green once the live
+    app agrees with the version it was pinned to.
     """
     import urllib.error
     import urllib.request
@@ -592,6 +637,8 @@ def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
                 body = resp.read().decode()
                 if resp.status == 200:
                     _log(f"/health ok: {body!r}")
+                    if deploy_version:
+                        _assert_live_version(app_url, token, deploy_version)
                     return
                 last_err = f"HTTP {resp.status}: {body!r}"
         except urllib.error.HTTPError as exc:
@@ -601,6 +648,39 @@ def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
         if attempt < 11:
             time.sleep(5)
     raise RuntimeError(f"/health did not return 200 within 60s; last: {last_err}")
+
+
+def _assert_live_version(app_url: str, token: str, deploy_version: str) -> None:
+    """Fail the deploy unless the running app reports ``deploy_version``.
+
+    :param app_url: Base URL of the deployed app.
+    :param token: Bearer token for the app request.
+    :param deploy_version: Version this deploy pinned.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"{app_url.rstrip('/')}/api/version"
+    last_err = ""
+    for attempt in range(6):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = _json.loads(resp.read().decode())
+            live = payload.get("version")
+            if live == deploy_version:
+                _log(f"/api/version ok: {live}")
+                return
+            raise SystemExit(
+                f"/api/version reports {live!r} but this deploy pinned "
+                f"{deploy_version!r}; the app is not the artifact you think it is"
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
+            last_err = repr(exc)
+        if attempt < 5:
+            time.sleep(5)
+    raise RuntimeError(f"/api/version was unreadable within 30s; last: {last_err}")
 
 
 def _assert_clean_tree(skip: bool) -> None:
@@ -987,6 +1067,12 @@ def main() -> int:
     finally:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
+        elif backups:
+            _log(
+                "--keep-version-bump: leaving "
+                + ", ".join(sorted(str(p.relative_to(_repo_root())) for p in backups))
+                + f" stamped at {deploy_version} — revert them before the next build"
+            )
 
     classified = _classify_wheels(wheels)
     for wheel in wheels:
@@ -1086,7 +1172,8 @@ def main() -> int:
     if not args.no_smoke_check:
         if not app_url:
             raise SystemExit("no app URL available for smoke check")
-        _smoke_check(wc, app_url)
+        assert_smoke_url_trusted(app_url, app.url)
+        _smoke_check(wc, app_url, deploy_version)
     _log(f"done. app: {app_url}")
     return 0
 

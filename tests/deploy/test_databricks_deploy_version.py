@@ -250,3 +250,32 @@ def test_smoke_url_without_a_resolved_url_requires_a_databricks_apps_host(
     deploy_mod.assert_smoke_url_trusted("https://app.databricksapps.com", None)
     with pytest.raises(SystemExit, match="not a Databricks Apps host"):
         deploy_mod.assert_smoke_url_trusted("https://collector.example.com", None)
+
+
+def test_run_uv_lock_drops_a_stale_lock_first(
+    deploy_mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-version lock from a previous deploy pins the old wheel hash.
+
+    uv treats it as up to date, so the Apps build rejects the freshly built
+    wheel with "Hash mismatch" — the lock has to be regenerated.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    lock = src / "uv.lock"
+    lock.write_text("# stale hashes from the previous build\n")
+    seen: dict[str, object] = {}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> None:
+        seen["cmd"] = cmd
+        seen["lock_existed_at_call"] = lock.exists()
+        lock.write_text("# freshly resolved\n")
+
+    monkeypatch.setattr(deploy_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(deploy_mod, "_repo_root", lambda: tmp_path)
+
+    deploy_mod.run_uv_lock(src)
+
+    assert seen["lock_existed_at_call"] is False
+    assert seen["cmd"][:2] == ["uv", "lock"]
+    assert lock.read_text() == "# freshly resolved\n"

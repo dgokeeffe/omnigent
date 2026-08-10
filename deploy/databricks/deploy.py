@@ -582,6 +582,14 @@ def run_uv_lock(src: Path) -> None:
     env.pop("UV_INDEX", None)
     env.pop("UV_DEFAULT_INDEX", None)
     env["UV_INDEX_URL"] = index_url
+    # Re-resolve from scratch. Wheels are not byte-reproducible (the SPA hashes
+    # and zip timestamps move), and a lock from a previous deploy of the *same*
+    # version is considered up to date by uv, so its recorded wheel hashes stick.
+    # The Apps build then rejects the freshly uploaded wheel with "Hash mismatch".
+    stale_lock = src / "uv.lock"
+    if stale_lock.exists():
+        _log(f"removing stale {stale_lock.relative_to(_repo_root())} before re-locking")
+        stale_lock.unlink()
     _log(f"uv lock --python 3.12 --index-url {index_url}")
     subprocess.run(
         ["uv", "lock", "--python", "3.12", "--index-url", index_url],

@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,11 @@ _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
 
+# The runtime reads `omnigent.version.VERSION` rather than package metadata, so
+# the deploy has to stamp this constant too or the app reports the unstamped
+# base version (e.g. `0.9.0.dev0`) from `/api/version`.
+_VERSION_ASSIGN_RE = re.compile(r'(?m)^VERSION = "[^"]*"$')
+
 
 def _log(msg: str) -> None:
     print(f"[deploy] {msg}", flush=True)
@@ -93,6 +99,10 @@ def _pyproject_paths() -> list[Path]:
         root / "sdks" / "python-client" / "pyproject.toml",
         root / "sdks" / "ui" / "pyproject.toml",
     ]
+
+
+def _version_py_path() -> Path:
+    return _repo_root() / "omnigent" / "version.py"
 
 
 def _read_base_version() -> str:
@@ -165,12 +175,71 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     return original
 
 
+def set_version_in_version_py(path: Path, new_version: str) -> str:
+    """Rewrite the runtime ``VERSION`` constant in ``omnigent/version.py``.
+
+    ``/api/version``, ``omnigent --version`` and the host/runner hello frames
+    read this constant instead of package metadata. Stamping only the
+    pyprojects therefore ships wheels whose filename carries the deploy
+    version while the running app still reports the base version.
+
+    :param path: Path to ``omnigent/version.py``.
+    :param new_version: Stamped deploy version, e.g. ``"0.9.0.post123"``.
+    :returns: The original file text, for restore after the build.
+    """
+    original = path.read_text()
+    updated, count = _VERSION_ASSIGN_RE.subn(f'VERSION = "{new_version}"', original, count=1)
+    if count != 1:
+        raise RuntimeError(f"could not rewrite VERSION in {path}")
+    path.write_text(updated)
+    return original
+
+
 def _stamp_versions(new_version: str) -> dict[Path, str]:
-    """Stamp `new_version` into all three pyprojects. Returns originals for restore."""
+    """Stamp `new_version` into the pyprojects and the runtime version constant.
+
+    :returns: Original file contents keyed by path, for restore.
+    """
     backups: dict[Path, str] = {}
     for path in _pyproject_paths():
         backups[path] = set_version_in_pyproject(path, new_version)
+    version_py = _version_py_path()
+    backups[version_py] = set_version_in_version_py(version_py, new_version)
     return backups
+
+
+def read_wheel_runtime_version(main_wheel: Path) -> str:
+    """Return the ``VERSION`` constant baked into an ``omnigent`` wheel.
+
+    :param main_wheel: Built ``omnigent`` wheel path.
+    :returns: Runtime version string, e.g. ``"0.9.0.post123"``.
+    :raises RuntimeError: If the wheel has no unique ``VERSION`` assignment.
+    """
+    with zipfile.ZipFile(main_wheel) as bundle:
+        text = bundle.read("omnigent/version.py").decode("utf-8")
+    matches = _VERSION_ASSIGN_RE.findall(text)
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one VERSION assignment in {main_wheel.name}")
+    return matches[0].split('"')[1]
+
+
+def assert_wheel_runtime_version(main_wheel: Path, deploy_version: str) -> None:
+    """Fail the deploy when the wheel would report the wrong version.
+
+    Guards the exact regression that made a deploy report
+    ``/api/version = 0.9.0.dev0`` while its wheels were named ``.postN``.
+
+    :param main_wheel: Built ``omnigent`` wheel path.
+    :param deploy_version: Version this deploy is pinning.
+    """
+    runtime_version = read_wheel_runtime_version(main_wheel)
+    if runtime_version != deploy_version:
+        raise SystemExit(
+            f"{main_wheel.name} reports runtime version {runtime_version!r} but "
+            f"the deploy pins {deploy_version!r}; /api/version would be wrong. "
+            "Rebuild without --skip-build so the version constant is stamped."
+        )
+    _log(f"wheel runtime version: {runtime_version}")
 
 
 def _restore_versions(backups: dict[Path, str]) -> None:
@@ -931,6 +1000,7 @@ def main() -> int:
             "--skip-web-ui; UC Volume wheel paths are not used because uv lock "
             "validates path sources locally."
         )
+    assert_wheel_runtime_version(classified.main, deploy_version)
 
     # Late-import the SDK so `--help` works without it installed.
     from databricks.sdk import WorkspaceClient

@@ -25,12 +25,14 @@ including first-time infrastructure setup.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +41,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
-_WORKSPACE_WHEEL_LIMIT_BYTES = 10 * 1024 * 1024
+# Databricks Apps uploads the app source directory as Workspace files, and the
+# Workspace import API rejects any single file over 10 MB. Applies to wheels and
+# to loose SPA assets alike.
+_WORKSPACE_FILE_LIMIT_BYTES = 10 * 1024 * 1024
+_WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
+# SPA assets live beside app.py in the app source tree rather than inside the
+# wheel; src/app.py points the server at them via OMNIGENT_WEB_UI_DIST.
+_WEB_UI_DIR_NAME = "web-ui"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
 # Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
 # proxy instead (see run_uv_lock).
@@ -49,7 +58,18 @@ _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # silently route us to the wrong workspace, or upload code under the
 # wrong account. The deploy must use --profile / DATABRICKS_HOST +
 # DATABRICKS_CLIENT_ID explicitly.
+#
+# DATABRICKS_HOST is only cleared when --profile names the workspace (see
+# _host_env_keep): both the SDK and `databricks auth env` honour an ambient
+# host, so a stale export would otherwise outrank the profile. Without
+# --profile it is a legitimate auth input and stays.
 _ENV_VARS_TO_CLEAR = (
+    # An ambient engine selection must never decide how apps get deployed: the
+    # Terraform engine drops compute_size on update. databricks.yml pins the
+    # engine and takes priority over this variable, but drop it anyway so a
+    # stray shell export can't muddy the picture.
+    "DATABRICKS_BUNDLE_ENGINE",
+    "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "ANTHROPIC_API_KEY",
     "CODEX",
@@ -60,6 +80,11 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+
+# The runtime reads `omnigent.version.VERSION` rather than package metadata, so
+# the deploy has to stamp this constant too or the app reports the unstamped
+# base version (e.g. `0.9.0.dev0`) from `/api/version`.
+_VERSION_ASSIGN_RE = re.compile(r'(?m)^VERSION = "[^"]*"$')
 
 
 def _log(msg: str) -> None:
@@ -86,6 +111,10 @@ def _pyproject_paths() -> list[Path]:
         root / "sdks" / "python-client" / "pyproject.toml",
         root / "sdks" / "ui" / "pyproject.toml",
     ]
+
+
+def _version_py_path() -> Path:
+    return _repo_root() / "omnigent" / "version.py"
 
 
 def _read_base_version() -> str:
@@ -158,12 +187,79 @@ def set_version_in_pyproject(path: Path, new_version: str) -> str:
     return original
 
 
+def set_version_in_version_py(path: Path, new_version: str) -> str:
+    """Rewrite the runtime ``VERSION`` constant in ``omnigent/version.py``.
+
+    ``/api/version``, ``omnigent --version`` and the host/runner hello frames
+    read this constant instead of package metadata. Stamping only the
+    pyprojects therefore ships wheels whose filename carries the deploy
+    version while the running app still reports the base version.
+
+    :param path: Path to ``omnigent/version.py``.
+    :param new_version: Stamped deploy version, e.g. ``"0.9.0.post123"``.
+    :returns: The original file text, for restore after the build.
+    """
+    original = path.read_text()
+    updated, count = _VERSION_ASSIGN_RE.subn(f'VERSION = "{new_version}"', original, count=1)
+    if count != 1:
+        raise RuntimeError(f"could not rewrite VERSION in {path}")
+    path.write_text(updated)
+    return original
+
+
 def _stamp_versions(new_version: str) -> dict[Path, str]:
-    """Stamp `new_version` into all three pyprojects. Returns originals for restore."""
+    """Stamp `new_version` into the pyprojects and the runtime version constant.
+
+    Transactional: a malformed later file would otherwise raise before the
+    caller ever receives the backups, leaving the files already rewritten with
+    nothing able to restore them.
+
+    :returns: Original file contents keyed by path, for restore.
+    """
     backups: dict[Path, str] = {}
-    for path in _pyproject_paths():
-        backups[path] = set_version_in_pyproject(path, new_version)
+    try:
+        for path in _pyproject_paths():
+            backups[path] = set_version_in_pyproject(path, new_version)
+        version_py = _version_py_path()
+        backups[version_py] = set_version_in_version_py(version_py, new_version)
+    except BaseException:
+        _restore_versions(backups)
+        raise
     return backups
+
+
+def read_wheel_runtime_version(main_wheel: Path) -> str:
+    """Return the ``VERSION`` constant baked into an ``omnigent`` wheel.
+
+    :param main_wheel: Built ``omnigent`` wheel path.
+    :returns: Runtime version string, e.g. ``"0.9.0.post123"``.
+    :raises RuntimeError: If the wheel has no unique ``VERSION`` assignment.
+    """
+    with zipfile.ZipFile(main_wheel) as bundle:
+        text = bundle.read("omnigent/version.py").decode("utf-8")
+    matches = _VERSION_ASSIGN_RE.findall(text)
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one VERSION assignment in {main_wheel.name}")
+    return matches[0].split('"')[1]
+
+
+def assert_wheel_runtime_version(main_wheel: Path, deploy_version: str) -> None:
+    """Fail the deploy when the wheel would report the wrong version.
+
+    Guards the exact regression that made a deploy report
+    ``/api/version = 0.9.0.dev0`` while its wheels were named ``.postN``.
+
+    :param main_wheel: Built ``omnigent`` wheel path.
+    :param deploy_version: Version this deploy is pinning.
+    """
+    runtime_version = read_wheel_runtime_version(main_wheel)
+    if runtime_version != deploy_version:
+        raise SystemExit(
+            f"{main_wheel.name} reports runtime version {runtime_version!r} but "
+            f"the deploy pins {deploy_version!r}; /api/version would be wrong. "
+            "Rebuild without --skip-build so the version constant is stamped."
+        )
+    _log(f"wheel runtime version: {runtime_version}")
 
 
 def _restore_versions(backups: dict[Path, str]) -> None:
@@ -192,6 +288,11 @@ def _clean_build_artifacts() -> None:
             shutil.rmtree(target)
 
 
+def _dist_web_ui_dir() -> Path:
+    """Where build.sh leaves the SPA when it builds it outside the wheel."""
+    return _repo_root() / "dist" / _WEB_UI_DIR_NAME
+
+
 def _build_wheels(skip_web_ui: bool) -> list[Path]:
     """Invoke build.sh and return the resulting wheel paths."""
     root = _repo_root()
@@ -199,6 +300,10 @@ def _build_wheels(skip_web_ui: bool) -> list[Path]:
     env = os.environ.copy()
     if skip_web_ui:
         env["SKIP_WEB_UI"] = "1"
+    else:
+        # Keep the SPA out of the wheel: bundled it takes the main wheel over
+        # the 10 MB Workspace per-file cap, which fails the deploy outright.
+        env["WEB_UI_OUT_DIR"] = str(_dist_web_ui_dir())
     _log(f"$ {build_sh}" + (" (SKIP_WEB_UI=1)" if skip_web_ui else ""))
     subprocess.run([str(build_sh)], cwd=root, env=env, check=True)
     wheels = sorted((root / "dist").glob("*.whl"))
@@ -297,6 +402,50 @@ def _sweep_local_src_wheels(keep: set[str]) -> None:
         entry.unlink()
 
 
+def _assert_web_ui_files_fit(source: Path) -> None:
+    """Fail before upload if any SPA asset exceeds the Workspace file cap."""
+    oversize = [
+        p
+        for p in source.rglob("*")
+        if p.is_file() and p.stat().st_size > _WORKSPACE_FILE_LIMIT_BYTES
+    ]
+    if not oversize:
+        return
+    listing = ", ".join(f"{p.name} ({p.stat().st_size / 1024 / 1024:.2f} MB)" for p in oversize)
+    raise SystemExit(
+        f"SPA asset(s) over the 10 MB Workspace file cap: {listing}. "
+        "Split the chunk in web/, or deploy with --skip-web-ui."
+    )
+
+
+def _sync_src_web_ui(skip_web_ui: bool) -> None:
+    """Copy the built SPA into the app source tree, replacing any stale copy.
+
+    The assets ride along as loose files rather than wheel package data, so no
+    single file trips the Workspace 10 MB cap (the bundled SPA takes the main
+    wheel ~1 MB over it). ``src/app.py`` points the server at them via
+    ``OMNIGENT_WEB_UI_DIST``.
+    """
+    dest = _src_dir() / _WEB_UI_DIR_NAME
+    if dest.exists():
+        shutil.rmtree(dest)
+        _log(f"removed stale {dest.relative_to(_repo_root())}")
+    if skip_web_ui:
+        _log("--skip-web-ui: deploying without the SPA (API-only)")
+        return
+    source = _dist_web_ui_dir()
+    if not (source / "index.html").is_file():
+        raise SystemExit(
+            f"no SPA build at {source}; drop --skip-build to rebuild it, "
+            "or pass --skip-web-ui for an API-only deploy"
+        )
+    _assert_web_ui_files_fit(source)
+    shutil.copytree(source, dest)
+    files = [p for p in dest.rglob("*") if p.is_file()]
+    total_mb = sum(p.stat().st_size for p in files) / 1024 / 1024
+    _log(f"copy SPA → {dest.relative_to(_repo_root())} ({len(files)} files, {total_mb:.2f} MB)")
+
+
 def _toml_string(value: str) -> str:
     """Return ``value`` encoded as a TOML basic string.
 
@@ -385,6 +534,45 @@ def build_uv_pyproject(
     )
 
 
+def _sanitize_lock_proxy_urls(lock: Path) -> None:
+    """Rewrite internal pypi-proxy URLs in ``uv.lock`` to public PyPI.
+
+    The Databricks Apps build environment cannot reach
+    ``pypi-proxy.cloud.databricks.com``, so any URL pointing at it 404s
+    at install time. But a machine whose global uv config pins the proxy
+    as the default index bakes proxy hostnames into every lock entry
+    regardless of ``--index-url``. The proxy is a caching mirror of PyPI
+    with an identical ``/packages/<hash>/`` layout, so swapping only the
+    hostname preserves every version and sha256 pin; uv re-verifies the
+    hashes on install.
+    """
+    text = lock.read_text()
+    rewritten = (
+        text.replace(
+            "https://pypi-proxy.cloud.databricks.com/packages/",
+            "https://files.pythonhosted.org/packages/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple/",
+            "https://pypi.org/simple/",
+        )
+        .replace(
+            "https://pypi-proxy.cloud.databricks.com/simple",
+            "https://pypi.org/simple",
+        )
+    )
+    if rewritten != text:
+        lock.write_text(rewritten)
+        _log(f"rewrote pypi-proxy URLs → public PyPI in {lock.name}")
+    # Scan unconditionally: a lock carrying only an uncovered proxy form
+    # (a bare host root, a non-packages/simple path) would slip through the
+    # three replaces above and ship an unreachable URL to the Apps build env.
+    if "pypi-proxy.cloud.databricks.com" in rewritten:
+        raise RuntimeError(
+            f"{lock} still references pypi-proxy after rewrite; the Apps build env cannot reach it"
+        )
+
+
 def run_uv_lock(src: Path) -> None:
     """Generate ``uv.lock`` for the Databricks Apps source directory.
 
@@ -399,6 +587,14 @@ def run_uv_lock(src: Path) -> None:
     env.pop("UV_INDEX", None)
     env.pop("UV_DEFAULT_INDEX", None)
     env["UV_INDEX_URL"] = index_url
+    # Re-resolve from scratch. Wheels are not byte-reproducible (the SPA hashes
+    # and zip timestamps move), and a lock from a previous deploy of the *same*
+    # version is considered up to date by uv, so its recorded wheel hashes stick.
+    # The Apps build then rejects the freshly uploaded wheel with "Hash mismatch".
+    stale_lock = src / "uv.lock"
+    if stale_lock.exists():
+        _log(f"removing stale {stale_lock.relative_to(_repo_root())} before re-locking")
+        stale_lock.unlink()
     _log(f"uv lock --python 3.12 --index-url {index_url}")
     subprocess.run(
         ["uv", "lock", "--python", "3.12", "--index-url", index_url],
@@ -406,6 +602,10 @@ def run_uv_lock(src: Path) -> None:
         env=env,
         check=True,
     )
+    # A global uv config pinning the proxy as default can still bake proxy
+    # hostnames into the lock even when we pass --index-url. The Apps build
+    # env can't reach the proxy, so sanitize the resolved lock to public PyPI.
+    _sanitize_lock_proxy_urls(src / "uv.lock")
 
 
 def write_uv_dependency_files(
@@ -441,13 +641,50 @@ def write_uv_dependency_files(
     run_uv_lock(src)
 
 
-def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
+def assert_smoke_url_trusted(app_url: str, resolved_url: str | None) -> None:
+    """Refuse to send the workspace bearer anywhere but the app itself.
+
+    ``--app-url`` overrides the URL read off the App resource, and the smoke
+    check authenticates with the deploying identity's token — so an arbitrary
+    override would hand that token to whatever host was named. Allow only the
+    resolved app URL's own origin, or a Databricks Apps origin when the SDK
+    returned no URL to compare against.
+
+    :param app_url: URL the smoke check would call.
+    :param resolved_url: URL reported by the App resource, if any.
+    """
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(app_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise SystemExit(f"refusing to smoke-check {app_url!r}: not a bare https URL")
+    if resolved_url:
+        expected = urlsplit(resolved_url)
+        if (parsed.scheme, parsed.netloc) != (expected.scheme, expected.netloc):
+            raise SystemExit(
+                f"refusing to send the workspace token to {parsed.netloc!r}: "
+                f"the app resource reports {expected.netloc!r}"
+            )
+        return
+    if not parsed.hostname.endswith(".databricksapps.com"):
+        raise SystemExit(
+            f"refusing to send the workspace token to {parsed.netloc!r}: "
+            "not a Databricks Apps host"
+        )
+
+
+def _smoke_check(wc: WorkspaceClient, app_url: str, deploy_version: str | None = None) -> None:
     """Poll /health on the running app and fail if it never returns 200.
 
     ``databricks bundle run`` returns as soon as the app start is
     signalled, but uvicorn takes a few extra seconds to bind. Retry
     up to a minute to ride out the warm-up; surface the most recent
     error if it never goes green.
+
+    When ``deploy_version`` is given, also require the running app to report it
+    from ``/api/version``. Wheel-side stamping alone has already shipped an app
+    that answered the base version, so the deploy is only green once the live
+    app agrees with the version it was pinned to.
     """
     import urllib.error
     import urllib.request
@@ -463,6 +700,8 @@ def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
                 body = resp.read().decode()
                 if resp.status == 200:
                     _log(f"/health ok: {body!r}")
+                    if deploy_version:
+                        _assert_live_version(app_url, token, deploy_version)
                     return
                 last_err = f"HTTP {resp.status}: {body!r}"
         except urllib.error.HTTPError as exc:
@@ -472,6 +711,39 @@ def _smoke_check(wc: WorkspaceClient, app_url: str) -> None:
         if attempt < 11:
             time.sleep(5)
     raise RuntimeError(f"/health did not return 200 within 60s; last: {last_err}")
+
+
+def _assert_live_version(app_url: str, token: str, deploy_version: str) -> None:
+    """Fail the deploy unless the running app reports ``deploy_version``.
+
+    :param app_url: Base URL of the deployed app.
+    :param token: Bearer token for the app request.
+    :param deploy_version: Version this deploy pinned.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"{app_url.rstrip('/')}/api/version"
+    last_err = ""
+    for attempt in range(6):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = _json.loads(resp.read().decode())
+            live = payload.get("version")
+            if live == deploy_version:
+                _log(f"/api/version ok: {live}")
+                return
+            raise SystemExit(
+                f"/api/version reports {live!r} but this deploy pinned "
+                f"{deploy_version!r}; the app is not the artifact you think it is"
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as exc:
+            last_err = repr(exc)
+        if attempt < 5:
+            time.sleep(5)
+    raise RuntimeError(f"/api/version was unreadable within 30s; last: {last_err}")
 
 
 def _assert_clean_tree(skip: bool) -> None:
@@ -522,6 +794,30 @@ def _assert_clean_tree(skip: bool) -> None:
             f"rebase or pass --allow-dirty to override."
         )
     _log(f"clean tree at origin/main {head[:12]}")
+
+
+# Variables a target must override for --no-otel to actually take effect;
+# `prod-no-otel` in databricks.yml is the reference implementation.
+_OTEL_OFF_VARS = ("app_command", "app_env", "otel_export_destinations")
+
+
+def _target_overrides_otel_vars(target: str) -> bool | None:
+    """Whether ``target`` overrides every OTel-off variable in databricks.yml.
+
+    Returns ``None`` when the bundle can't be inspected (no PyYAML, unreadable
+    or malformed file) so callers warn rather than assert either way.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        bundle = yaml.safe_load((Path(__file__).parent / "databricks.yml").read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    targets = (bundle or {}).get("targets") or {}
+    variables = (targets.get(target) or {}).get("variables") or {}
+    return all(name in variables for name in _OTEL_OFF_VARS)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -580,6 +876,17 @@ def _parse_args() -> argparse.Namespace:
             "UC schema (catalog.schema) holding the OTel destination tables. "
             "The Databricks Apps platform writes logs/metrics/spans to "
             "<schema>.otel_{logs,metrics,spans}."
+        ),
+    )
+    parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: run 'python app.py' instead of "
+            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
+            "drop the platform telemetry_export_destinations. Use for "
+            "workspaces with no OTel collector / UC OTel tables — otherwise "
+            "span exports fail DEADLINE_EXCEEDED to localhost:4317."
         ),
     )
     parser.add_argument(
@@ -656,14 +963,50 @@ def _parse_args() -> argparse.Namespace:
             "--coda-app-name, --coda-app-url, and --omnigent-public-server-url "
             "must be set together"
         )
+    # --no-otel selects the tracer-off DAB target (same workspace + state as
+    # `prod`, OTel variables overridden off). Only auto-switch the default
+    # target so an explicit --target still wins — but then the flag is a no-op
+    # unless that target defines the OTel-off overrides itself, so say so
+    # instead of silently deploying with OTel on.
+    if args.no_otel:
+        if args.target == "prod":
+            args.target = "prod-no-otel"
+        elif _target_overrides_otel_vars(args.target) is not True:
+            _log(
+                f"warning: --no-otel has no effect on --target {args.target!r}: it "
+                f"only swaps the default 'prod' target for 'prod-no-otel'. That "
+                f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
+                "stays ON for this deploy — copy the overrides from the "
+                "prod-no-otel block in databricks.yml, or drop --target."
+            )
     return args
 
 
-def _clear_env_vars() -> None:
+def _clear_env_vars(keep: Iterable[str] = ()) -> None:
+    keep = set(keep)
     for name in _ENV_VARS_TO_CLEAR:
+        if name in keep:
+            continue
         if name in os.environ:
             _log(f"unsetting {name} to avoid leaking into the SDK")
             del os.environ[name]
+
+
+def _host_env_keep(args: argparse.Namespace) -> set[str]:
+    """Env vars _clear_env_vars must preserve for this invocation.
+
+    With --profile the profile is authoritative, so an ambient
+    DATABRICKS_HOST is cleared. Without one, DATABRICKS_HOST (+
+    DATABRICKS_CLIENT_ID/_SECRET) *is* the auth input and must survive.
+    """
+    return set() if args.profile else {"DATABRICKS_HOST"}
+
+
+def _workspace_client(args: argparse.Namespace) -> WorkspaceClient:
+    """Construct the SDK client."""
+    from databricks.sdk import WorkspaceClient as _WorkspaceClient
+
+    return _WorkspaceClient(profile=args.profile) if args.profile else _WorkspaceClient()
 
 
 def _ensure_bound(args: argparse.Namespace) -> None:
@@ -682,10 +1025,9 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     success.
     """
     # Late-import so --help works without the SDK.
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import NotFound
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
     try:
         wc.apps.get(name=args.app_name)
     except NotFound:
@@ -721,38 +1063,43 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     raise SystemExit(f"bundle deployment bind failed (exit {result.returncode})")
 
 
-def _ensure_compute_size(
-    wc: WorkspaceClient,
-    app_name: str,
-    desired: str,
-) -> None:
-    """Resize the app to `desired` if it's not already there.
+def assert_direct_engine(bundle_yml: Path | None = None) -> None:
+    """Refuse to deploy unless the bundle pins the direct engine.
 
-    The bundle's Terraform databricks_app resource can't update
-    compute_size on an existing app (the old apps update API rejects
-    it). The newer ``apps.create_update`` endpoint can. Run that here
-    so the subsequent bundle deploy sees no diff and doesn't error.
+    The Terraform engine updates an app through an API that silently drops
+    ``compute_size``, so a deploy asking for LARGE finishes on MEDIUM. The
+    engine is a property of the committed bundle rather than of whoever runs the
+    deploy, so verify it here instead of trusting the environment.
+
+    :param bundle_yml: Bundle config to check; defaults to this deploy's.
     """
-    from databricks.sdk.errors.platform import NotFound
-    from databricks.sdk.service.apps import App, ComputeSize
+    import yaml
 
-    try:
-        current = wc.apps.get(name=app_name)
-    except NotFound:
-        _log(f"app {app_name!r} not found; bundle deploy will create at {desired}")
-        return
+    path = bundle_yml or (_deploy_dir() / "databricks.yml")
+    engine = (yaml.safe_load(path.read_text()).get("bundle") or {}).get("engine")
+    if engine != "direct":
+        raise SystemExit(
+            f"{path.name} sets bundle.engine={engine!r}; this deploy requires "
+            "'direct' because the Terraform engine drops the app's compute_size"
+        )
+    _log("bundle engine: direct")
 
-    current_value = current.compute_size.value if current.compute_size else None
-    if current_value == desired:
-        _log(f"compute_size already {desired}; skipping resize")
-        return
 
-    _log(f"resizing app {app_name!r}: {current_value} → {desired}")
-    wc.apps.create_update_and_wait(
-        app_name=app_name,
-        update_mask="compute_size",
-        app=App(name=app_name, compute_size=ComputeSize(desired)),
-    )
+def assert_compute_size(wc: WorkspaceClient, app_name: str, desired: str) -> None:
+    """Fail if the deployed app is not the compute size that was asked for.
+
+    ``compute_size`` is declared in databricks.yml and applied by the direct
+    engine, so this is a post-deploy assertion rather than an out-of-band
+    resize. Under the Terraform engine the app update silently dropped the
+    field, which left a deploy asking for LARGE running on MEDIUM.
+    """
+    current = wc.apps.get(name=app_name)
+    actual = current.compute_size.value if current.compute_size else None
+    if actual != desired:
+        raise SystemExit(
+            f"app {app_name!r} is {actual!r} after deploy but {desired!r} was requested"
+        )
+    _log(f"compute_size ok: {actual}")
 
 
 def _bundle_vars(args: argparse.Namespace) -> list[str]:
@@ -766,6 +1113,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"lakebase_database={args.lakebase_database}",
         "--var",
         f"volume_name={args.volume_name}",
+        "--var",
+        f"compute_size={args.compute_size}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
         "--var",
@@ -801,34 +1150,39 @@ def _ensure_app_sp_uc_traversal(
     catalog, schema_only, _ = parts
     schema_fqn = f"{catalog}.{schema_only}"
 
-    import json as _json
-
     for kind, fqn, priv in (
         ("catalog", catalog, "USE_CATALOG"),
         ("schema", schema_fqn, "USE_SCHEMA"),
     ):
         _log(f"granting {priv} on {kind} {fqn} → app SP {app_sp}")
-        payload = _json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
-        subprocess.run(
-            [
-                "databricks",
-                "grants",
-                "update",
-                kind,
-                fqn,
-                *_profile_arg(args),
-                "--json",
-                payload,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        payload = json.dumps({"changes": [{"principal": app_sp, "add": [priv]}]})
+        try:
+            subprocess.run(
+                [
+                    "databricks",
+                    "grants",
+                    "update",
+                    kind,
+                    fqn,
+                    *_profile_arg(args),
+                    "--json",
+                    payload,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # SP may already have access via group inheritance, or the
+            # deployer lacks MANAGE on a shared catalog; warn, don't abort.
+            detail = exc.stderr.strip()[:200] if exc.stderr else f"rc={exc.returncode}"
+            _log(f"warning: {priv} grant on {fqn} failed ({detail})")
 
 
 def main() -> int:
     args = _parse_args()
-    _clear_env_vars()
+    assert_direct_engine()
+    _clear_env_vars(keep=_host_env_keep(args))
     _assert_clean_tree(skip=args.allow_dirty)
 
     base_version = _read_base_version()
@@ -858,6 +1212,12 @@ def main() -> int:
     finally:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
+        elif backups:
+            _log(
+                "--keep-version-bump: leaving "
+                + ", ".join(sorted(str(p.relative_to(_repo_root())) for p in backups))
+                + f" stamped at {deploy_version} — revert them before the next build"
+            )
 
     classified = _classify_wheels(wheels)
     for wheel in wheels:
@@ -865,16 +1225,15 @@ def main() -> int:
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
     if classified.oversize:
         raise SystemExit(
-            "uv-based Databricks Apps deploys require all Omnigent wheels "
-            "to fit in the app source snapshot. Rebuild with --skip-web-ui "
-            "or reduce wheel size; UC Volume wheel paths are not used "
-            "because uv lock validates path sources locally."
+            "uv-based Databricks Apps deploys require every Omnigent wheel to "
+            "fit under the 10 MB Workspace file cap. The SPA already ships "
+            "outside the wheel, so this is Python payload — reduce it or pass "
+            "--skip-web-ui; UC Volume wheel paths are not used because uv lock "
+            "validates path sources locally."
         )
+    assert_wheel_runtime_version(classified.main, deploy_version)
 
-    # Late-import the SDK so `--help` works without it installed.
-    from databricks.sdk import WorkspaceClient
-
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    wc = _workspace_client(args)
 
     # 1) Prep the bundle's source_code_path (src/) — sweep stale
     # wheels locally, then copy the new small wheels in.
@@ -885,6 +1244,9 @@ def main() -> int:
         dest = src / wheel.name
         _log(f"copy {wheel.name} → {dest.relative_to(_repo_root())}")
         shutil.copy2(wheel, dest)
+
+    # 1a) Ship the SPA as loose files beside app.py (see _sync_src_web_ui).
+    _sync_src_web_ui(args.skip_web_ui)
 
     # 2) Generate pyproject.toml + uv.lock. Remove requirements.txt
     # first because Databricks Apps gives it precedence over uv.
@@ -898,13 +1260,6 @@ def main() -> int:
 
     # 4) Bind the bundle to the existing app (if any).
     _ensure_bound(args)
-
-    # 4a) Reconcile compute_size out-of-band. Terraform's databricks_app
-    # update path doesn't support compute_size changes ("not supported
-    # in this update API"). The new SDK apps.create_update endpoint
-    # does — call it ourselves so the subsequent bundle deploy sees no
-    # diff. Skipped when already matching.
-    _ensure_compute_size(wc, args.app_name, args.compute_size)
 
     # 5) databricks bundle deploy --target <target> (syncs src/ to the
     # bundle workspace folder and creates/updates the app resource).
@@ -941,6 +1296,9 @@ def main() -> int:
         check=True,
     )
 
+    # 5a) The bundle owns compute_size now; confirm the platform agrees.
+    assert_compute_size(wc, args.app_name, args.compute_size)
+
     # 6) Resolve URL + smoke-check.
     app = wc.apps.get(name=args.app_name)
     app_url = args.app_url or app.url
@@ -952,7 +1310,8 @@ def main() -> int:
     if not args.no_smoke_check:
         if not app_url:
             raise SystemExit("no app URL available for smoke check")
-        _smoke_check(wc, app_url)
+        assert_smoke_url_trusted(app_url, app.url)
+        _smoke_check(wc, app_url, deploy_version)
     _log(f"done. app: {app_url}")
     return 0
 

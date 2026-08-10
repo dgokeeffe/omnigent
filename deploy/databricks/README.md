@@ -155,15 +155,21 @@ wheel, server URL, and server-client-ID resources with its
 `grant_omnigent_host.sh` and `attach_omnigent_resources.sh` helpers.
 
 The script builds wheels, classifies them by size, copies wheels into
-`src/`, regenerates `src/pyproject.toml` and `src/uv.lock`, runs
+`src/`, copies the built SPA into `src/web-ui/`, regenerates
+`src/pyproject.toml` and `src/uv.lock`, runs
 `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
 with backoff until 200.
 
-All Omnigent wheels must fit under the Databricks Apps source
-snapshot limit (10 MB). If a wheel exceeds it, rebuild with
-`--skip-web-ui` or reduce the wheel size; uv lockfiles cannot point at
-UC Volume wheel paths because `uv lock` validates path sources locally.
+Every file in the app source snapshot must stay under the Workspace
+file limit (10 MB) — wheels included. The SPA (~25 MB of assets) would
+take the main wheel over that cap, so `build.sh` moves it out of the
+wheel's package data (`WEB_UI_OUT_DIR`) and the deploy ships it as loose
+files in `src/web-ui/`; `src/app.py` then points the server at them with
+`OMNIGENT_WEB_UI_DIST`. Each asset is comfortably under the cap on its
+own. If a *wheel* still exceeds it, reduce the Python payload or pass
+`--skip-web-ui`; uv lockfiles cannot point at UC Volume wheel paths
+because `uv lock` validates path sources locally.
 
 Re-running is safe — every step is idempotent.
 
@@ -281,7 +287,23 @@ uv run python deploy/databricks/deploy.py --skip-build --allow-dirty ...
 
 # API-only deploy (drops the SPA from the main wheel).
 uv run python deploy/databricks/deploy.py --skip-web-ui ...
+
+# No-OpenTelemetry deploy: runs `python app.py` instead of under
+# opentelemetry-instrument, drops OTEL_TRACES_SAMPLER, and drops the platform
+# telemetry_export_destinations. Use for workspaces with no OTel collector /
+# UC OTel tables -- otherwise every span export fails DEADLINE_EXCEEDED to
+# localhost:4317. Selects the `prod-no-otel` DAB target (same workspace/state
+# as `prod`).
+uv run python deploy/databricks/deploy.py --no-otel ...
 ```
+
+> [!NOTE]
+> `--no-otel` auto-switches the default `--target prod` to `prod-no-otel`.
+> If you deploy to a custom `--target`, add the OTel-off variable overrides
+> (`app_command`, `app_env`, `otel_export_destinations`) to that target too
+> — see the `prod-no-otel` block in `databricks.yml` for the template. The
+> deploy warns when `--no-otel` is paired with a target that lacks those
+> overrides, since OTel then stays on.
 
 ## Troubleshooting
 
@@ -295,7 +317,9 @@ uv run python deploy/databricks/deploy.py --skip-web-ui ...
 | `schema "dbos" already exists` | Same for the DBOS schema | `DROP SCHEMA dbos CASCADE` and redeploy |
 | `permission denied for schema public` | App SP missing schema grants | Run `grant_sp_perms.py` (one-time) |
 | `Field 'spec.role' cannot be empty` | Lakebase requires explicit role for extra databases | Use the project's default database; don't create extras |
-| Deploy refuses because a wheel is over 10 MB | uv app payload requires local wheel path sources | Rebuild with `--skip-web-ui` or reduce wheel size |
+| Deploy refuses because a wheel is over 10 MB | Workspace files cap at 10 MB and uv needs local wheel path sources | Reduce the Python payload, or `--skip-web-ui` (the SPA already ships outside the wheel) |
+| Deploy refuses because an SPA asset is over 10 MB | A single Vite chunk crossed the Workspace file cap | Split the chunk in `web/`, or `--skip-web-ui` |
+| App serves the API-only landing page instead of the SPA | `src/web-ui/` missing (deployed with `--skip-web-ui`, or a stale `--skip-build` with no `dist/web-ui/`) | Redeploy without `--skip-web-ui`/`--skip-build` |
 | App starts cleanly but the first agent request 403s on the artifact volume | App SP has `WRITE_VOLUME` on the leaf but no `USE_CATALOG` / `USE_SCHEMA` on the parents | `deploy.py` grants both automatically — for a fresh catalog, redeploy or grant manually via `databricks grants update` |
 
 ## Files in this directory

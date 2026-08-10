@@ -1,0 +1,40 @@
+# omnigent-0hd.8 worktree evidence
+
+Recorded during the final feasibility pass; commands were run from the dedicated worktree unless an explicit `git -C` path is shown.
+
+- Dedicated implementation worktree path: `/Users/david.okeeffe/Repos/omnigent-multi-coda`
+- Branch: `feature/multi-coda-pool`
+- Exact fork/dev base SHA: `8558c8283f9b2aad2923d165398231bed1ef6a09`
+- Writable remote: `fork` → `https://github.com/dgokeeffe/omnigent.git`
+- Ancestry evidence: `git merge-base HEAD fork/dev` returned the exact base SHA; after the consolidated documentation commit, `git rev-list --left-right --count fork/dev...HEAD` returns `0 1` (0 behind, 1 ahead).
+- Handoff rule: push only to `fork`, never `origin`; do not implement from or modify the original workshop checkout.
+
+## Generated-state determination
+
+`.venv` was locally generated, not copied: its `pyvenv.cfg` identified uv 0.12.2 / CPython 3.12.9 while the original checkout's independently existing environment identified uv 0.11.17; the directories had different filesystem inode identities. The ignored dedicated-worktree `.venv` was removed.
+
+`.coverage` was not a copied worktree artifact: it is tracked in the fork/dev baseline (blob `876e657dcb634db525db993ef9263d6981519352`). A local test had rewritten its coverage SQLite contents/timestamp. The final pass restored it byte-for-byte from `fork/dev`; therefore `.coverage` does not appear in `git diff --name-status fork/dev..HEAD`. This preserves the repository baseline instead of including unrelated cleanup.
+
+No dedicated-worktree `.venv`, `node_modules`, Databricks state, cache, or deployment artifact remains.
+
+## Original checkout untouched evidence
+
+Original checkout: `/Users/david.okeeffe/Repos/omnigent`, branch `coda-managed-lease-increment1`, HEAD `f8f57a8b12effb3322511beebefaf07be8b8cc51`.
+
+Before and after this pass, `git -C /Users/david.okeeffe/Repos/omnigent status --porcelain=v1` was exactly:
+
+```
+ M uv.lock
+?? goal.md
+```
+
+Those are pre-existing changes. The original checkout is **not clean and is not claimed clean**. Its HEAD and status remained identical; no command in this pass wrote there.
+
+## Final dedicated-worktree clean-state gate
+
+After committing this evidence/design:
+
+- `git status --porcelain=v1` must print nothing.
+- `git diff --name-status fork/dev..HEAD` must list only `A designs/MULTI-CODA-POOL.md` and `A verify.txt`.
+- `.coverage` must match `fork/dev:.coverage` and must not appear in that diff.
+- `test ! -e .venv` must succeed.

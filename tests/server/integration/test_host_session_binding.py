@@ -1759,7 +1759,11 @@ async def test_managed_session_deleted_during_provision_terminates_sandbox(
     # that no longer exists.
     assert fake.terminated == ["sb-fake-1"]
     # The host row is gone too: the picker shows no ghost host and the
-    # token no longer resolves.
+    # token no longer resolves. Teardown deletes the row *after* the
+    # provider terminate, so wait for the row rather than racing it.
+    deadline = loop.time() + 15.0
+    while loop.time() < deadline and env.host_store.list_hosts(RESERVED_USER_LOCAL):
+        await asyncio.sleep(0.05)
     assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
     # The fake host coroutines wait for a launch frame that never comes
     # (the session is gone) — cancel them so their receive timeouts

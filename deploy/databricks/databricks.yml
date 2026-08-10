@@ -32,13 +32,13 @@ variables:
     default: main.omnigent_logs
   coda_pool_b64:
     description: "Optional URL-safe base64 JSON array of immutable-id CoDA bindings (non-secret)."
-    default: ""
+    default: "__UNSET__"
   coda_app_name:
     description: "Legacy optional single managed CoDA Databricks App name."
-    default: ""
+    default: "__UNSET__"
   coda_app_url:
     description: "Optional managed CoDA Databricks App URL."
-    default: ""
+    default: "__UNSET__"
   omnigent_public_server_url:
     description: "Public URL this Omnigent App exposes to managed CoDA hosts."
     default: ""

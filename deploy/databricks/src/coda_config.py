@@ -9,10 +9,14 @@ from collections.abc import Mapping
 
 def managed_coda_raw_config(env: Mapping[str, str]) -> dict[str, object] | None:
     """Build server sandbox config from pool or legacy environment variables."""
-    pool_b64 = env.get("CODA_POOL_B64", "").strip()
-    app_name = env.get("CODA_APP_NAME", "").strip()
-    app_url = env.get("CODA_APP_URL", "").strip()
-    server_url = env.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
+    def _optional(name: str) -> str:
+        value = env.get(name, "").strip()
+        return "" if value == "__UNSET__" else value
+
+    pool_b64 = _optional("CODA_POOL_B64")
+    app_name = _optional("CODA_APP_NAME")
+    app_url = _optional("CODA_APP_URL")
+    server_url = _optional("OMNIGENT_PUBLIC_SERVER_URL")
     legacy_values = (app_name, app_url)
     if pool_b64 and any(legacy_values):
         raise RuntimeError("CODA_POOL_B64 cannot be combined with legacy CoDA variables")

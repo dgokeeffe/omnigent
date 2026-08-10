@@ -155,6 +155,16 @@ def test_bundle_vars_are_comma_free(
         assert "," not in value, f"comma in --var {value!r} would fail the CLI parser"
 
 
+def test_optional_bundle_vars_use_nonempty_unset_sentinel(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _parse(deploy_mod, monkeypatch)
+    pairs = deploy_mod._bundle_vars(args)
+    assert "coda_pool_b64=__UNSET__" in pairs
+    assert "coda_app_name=__UNSET__" in pairs
+    assert "coda_app_url=__UNSET__" in pairs
+
+
 def test_uc_grant_failure_is_non_fatal(
     deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -253,6 +263,19 @@ def test_app_bootstrap_decodes_pool_and_preserves_legacy(
         "app_name": "legacy",
         "app_url": "https://legacy.example.com",
     }
+
+
+def test_app_bootstrap_treats_bundle_unset_sentinel_as_absent(
+    coda_config_mod: ModuleType,
+) -> None:
+    assert coda_config_mod.managed_coda_raw_config(
+        {
+            "CODA_POOL_B64": "__UNSET__",
+            "CODA_APP_NAME": "__UNSET__",
+            "CODA_APP_URL": "__UNSET__",
+            "OMNIGENT_PUBLIC_SERVER_URL": "__UNSET__",
+        }
+    ) is None
 
 
 def test_app_bootstrap_rejects_conflicting_pool_and_legacy(

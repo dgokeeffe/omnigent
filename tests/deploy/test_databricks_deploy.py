@@ -242,3 +242,34 @@ def test_assert_compute_size_accepts_a_matching_app(deploy_mod: ModuleType) -> N
         )
     )
     deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")
+
+
+def test_assert_direct_engine_accepts_the_committed_bundle(deploy_mod: ModuleType) -> None:
+    deploy_mod.assert_direct_engine(_BUNDLE_YML)
+
+
+@pytest.mark.parametrize("engine", ["terraform", None])
+def test_assert_direct_engine_refuses_anything_else(
+    deploy_mod: ModuleType, tmp_path: Path, engine: str | None
+) -> None:
+    """Terraform drops the app's compute_size, so the deploy must not proceed."""
+    bundle = yaml.safe_load(_BUNDLE_YML.read_text())
+    if engine is None:
+        bundle["bundle"].pop("engine", None)
+    else:
+        bundle["bundle"]["engine"] = engine
+    path = tmp_path / "databricks.yml"
+    path.write_text(yaml.safe_dump(bundle))
+
+    with pytest.raises(SystemExit, match="requires 'direct'"):
+        deploy_mod.assert_direct_engine(path)
+
+
+def test_ambient_bundle_engine_is_cleared(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shell export must not be able to pick the engine for a deploy."""
+    monkeypatch.setenv("DATABRICKS_BUNDLE_ENGINE", "terraform")
+    args = _parse(deploy_mod, monkeypatch, "--profile", "myprof")
+    deploy_mod._clear_env_vars(keep=deploy_mod._host_env_keep(args))
+    assert "DATABRICKS_BUNDLE_ENGINE" not in deploy_mod.os.environ

@@ -64,6 +64,11 @@ _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # host, so a stale export would otherwise outrank the profile. Without
 # --profile it is a legitimate auth input and stays.
 _ENV_VARS_TO_CLEAR = (
+    # An ambient engine selection must never decide how apps get deployed: the
+    # Terraform engine drops compute_size on update. databricks.yml pins the
+    # engine and takes priority over this variable, but drop it anyway so a
+    # stray shell export can't muddy the picture.
+    "DATABRICKS_BUNDLE_ENGINE",
     "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -1058,6 +1063,28 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     raise SystemExit(f"bundle deployment bind failed (exit {result.returncode})")
 
 
+def assert_direct_engine(bundle_yml: Path | None = None) -> None:
+    """Refuse to deploy unless the bundle pins the direct engine.
+
+    The Terraform engine updates an app through an API that silently drops
+    ``compute_size``, so a deploy asking for LARGE finishes on MEDIUM. The
+    engine is a property of the committed bundle rather than of whoever runs the
+    deploy, so verify it here instead of trusting the environment.
+
+    :param bundle_yml: Bundle config to check; defaults to this deploy's.
+    """
+    import yaml
+
+    path = bundle_yml or (_deploy_dir() / "databricks.yml")
+    engine = (yaml.safe_load(path.read_text()).get("bundle") or {}).get("engine")
+    if engine != "direct":
+        raise SystemExit(
+            f"{path.name} sets bundle.engine={engine!r}; this deploy requires "
+            "'direct' because the Terraform engine drops the app's compute_size"
+        )
+    _log("bundle engine: direct")
+
+
 def assert_compute_size(wc: WorkspaceClient, app_name: str, desired: str) -> None:
     """Fail if the deployed app is not the compute size that was asked for.
 
@@ -1154,6 +1181,7 @@ def _ensure_app_sp_uc_traversal(
 
 def main() -> int:
     args = _parse_args()
+    assert_direct_engine()
     _clear_env_vars(keep=_host_env_keep(args))
     _assert_clean_tree(skip=args.allow_dirty)
 

@@ -36,6 +36,10 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.databricks_model_discovery import (
+    claude_family_of,
+    preferred_served_claude_model,
+)
 from omnigent.model_metadata import ModelWireAPI
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
@@ -450,6 +454,25 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         or (credential_warning is not None and selected_model.startswith("databricks-claude-"))
         else selected_model
     )
+    # A bundled/curated catalog default can name a Claude model this workspace
+    # never enabled (e.g. ``databricks-claude-fable-5`` where only
+    # ``system.ai.claude-opus-5`` is served). Rendering it anyway fails every
+    # turn with an opaque gateway 404, so when discovery DID answer and the id
+    # is absent from it, fall back to a served model of the nearest tier. Only
+    # the resolved default is substituted: an explicit ``model`` override stays
+    # verbatim so a caller's choice is never silently swapped.
+    if model is None and rendered_model not in catalog_ids and claude_models:
+        served = preferred_served_claude_model(
+            (str(item.get("id")) for item in claude_models),
+            preferred_family=claude_family_of(selected_model),
+        )
+        if served is not None:
+            _LOGGER.warning(
+                "pi-native: default model %s is not served by this workspace; using %s",
+                selected_model,
+                served,
+            )
+            rendered_model = served
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}/ai-gateway/mlflow/v1",

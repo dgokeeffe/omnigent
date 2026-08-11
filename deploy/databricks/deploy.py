@@ -877,7 +877,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compute-size",
         default="LARGE",
-        choices=["SMALL", "MEDIUM", "LARGE"],
+        choices=["SMALL", "MEDIUM", "LARGE", "XLARGE"],
         help="App compute size. Pinned via databricks.yml so it doesn't drift.",
     )
     parser.add_argument(
@@ -1118,7 +1118,13 @@ def assert_compute_size(wc: WorkspaceClient, app_name: str, desired: str) -> Non
     field, which left a deploy asking for LARGE running on MEDIUM.
     """
     current = wc.apps.get(name=app_name)
-    actual = current.compute_size.value if current.compute_size else None
+    # The SDK models compute_size as an enum, but the API keeps adding members
+    # (XLARGE, LIQUID) and this repo pins only a FLOOR on databricks-sdk. An SDK
+    # older than the requested size hands back a plain string, so read the value
+    # tolerantly rather than assuming an enum and crashing the check that exists
+    # to catch a silently downsized app.
+    raw_size = current.compute_size
+    actual = getattr(raw_size, "value", raw_size) if raw_size else None
     if actual != desired:
         raise SystemExit(
             f"app {app_name!r} is {actual!r} after deploy but {desired!r} was requested"

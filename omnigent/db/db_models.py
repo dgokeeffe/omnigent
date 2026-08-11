@@ -644,6 +644,13 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Epoch seconds when Release cleared the operational binding. NULL means
+    # the session has never been explicitly detached (an ordinary unbound
+    # session is not implicitly detached).
+    detached_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Cleanup-only link to the durable host row whose persisted App/lease fence
+    # still needs definitive reconciliation. This is not live affinity.
+    detached_claim_host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
@@ -657,6 +664,14 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        # Release/claim inventory must seek by host rather than scan sessions.
+        Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
+        Index(
+            "ix_conversation_metadata_detached_claim_host_id",
+            "workspace_id",
+            "detached_claim_host_id",
+            "id",
+        ),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
     )

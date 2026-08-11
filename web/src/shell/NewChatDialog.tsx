@@ -1967,8 +1967,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
-  const codaPickerEnabled =
-    managedSandboxesEnabled && info !== "loading" && info.sandbox_provider === "coda";
+  const codaPickerEnabled = managedSandboxesEnabled && info.sandbox_provider === "coda";
   const { data: codaSandboxes = [] } = useCodaSandboxes(codaPickerEnabled);
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers

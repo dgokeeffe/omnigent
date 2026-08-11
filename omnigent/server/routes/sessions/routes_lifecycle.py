@@ -1,0 +1,473 @@
+"""History-preserving managed CoDA release and resume routes."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from pydantic import BaseModel, ConfigDict, Field
+
+from omnigent.entities import Conversation
+from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.routes._auth_helpers import require_user
+from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.permission_store import PermissionStore
+
+
+class CodaClaimSession(BaseModel):
+    """A retained session affected by a claim-level release."""
+
+    id: str
+    title: str | None = None
+    detached: bool = False
+
+
+class CodaClaim(BaseModel):
+    """Sanitized claim inventory; provider and lease identities are omitted."""
+
+    anchor_session_id: str
+    sessions: list[CodaClaimSession]
+
+
+class CodaClaimInventory(BaseModel):
+    claims: list[CodaClaim] = Field(default_factory=list)
+
+
+class ResumeSessionRequest(BaseModel):
+    """Resume target. A lease or host identifier is intentionally not accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+    sandbox_app_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+def _owned_session(
+    session_id: str,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> Conversation:
+    """Resolve owner access without disclosing whether a foreign session exists."""
+    conv = conversation_store.get_conversation(session_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if permission_store is not None:
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        grant = permission_store.get(user_id, session_id)
+        if grant is None or grant.level < LEVEL_OWNER:
+            raise HTTPException(status_code=404, detail="Session not found")
+    return conv
+
+
+def _claim_lock(request: Request) -> asyncio.Lock:
+    """Use the create/adopt lock so acquired lifecycle operations cannot cross-route."""
+    lock = getattr(request.app.state, "coda_adoption_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.coda_adoption_lock = lock
+    return lock
+
+
+def _host_is_owned(host: Any, owner: str) -> bool:
+    return host is not None and host.user_id == owner and host.sandbox_provider == "coda"
+
+
+def register_lifecycle_routes(
+    router: APIRouter,
+    *,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Register authenticated CoDA claim, release, and resume operations."""
+
+    @router.get("/coda/claims", response_model=CodaClaimInventory)
+    async def list_coda_claims(request: Request) -> CodaClaimInventory:
+        user_id = require_user(request, auth_provider)
+        owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_store is None:
+            return CodaClaimInventory()
+        hosts = await asyncio.to_thread(host_store.list_hosts, owner)
+        claims: list[CodaClaim] = []
+        for host in hosts:
+            if not _host_is_owned(host, owner) or host.sandbox_id is None:
+                continue
+            sessions = await asyncio.to_thread(
+                conversation_store.list_conversations_by_host_id, host.host_id
+            )
+            detached_sessions = await asyncio.to_thread(
+                conversation_store.list_conversations_by_detached_claim_host_id,
+                host.host_id,
+            )
+            by_id = {session.id: session for session in [*sessions, *detached_sessions]}
+            owned = [
+                session
+                for session in by_id.values()
+                if permission_store is None
+                or (
+                    user_id is not None
+                    and (grant := permission_store.get(user_id, session.id)) is not None
+                    and grant.level >= LEVEL_OWNER
+                )
+            ]
+            if not owned:
+                continue
+            public_sessions = [
+                CodaClaimSession(
+                    id=session.id,
+                    title=session.title,
+                    detached=session.detached_at is not None,
+                )
+                for session in sorted(owned, key=lambda item: (item.created_at, item.id))
+            ]
+            claims.append(
+                CodaClaim(
+                    anchor_session_id=public_sessions[0].id,
+                    sessions=public_sessions,
+                )
+            )
+        return CodaClaimInventory(claims=claims)
+
+    @router.post("/sessions/{session_id}/release", status_code=204, response_model=None)
+    async def release_session(request: Request, session_id: str) -> Response:
+        user_id = require_user(request, auth_provider)
+        owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+        conv = await asyncio.to_thread(
+            _owned_session,
+            session_id,
+            user_id,
+            conversation_store,
+            permission_store,
+        )
+        if conv.kind == "sub_agent":
+            raise HTTPException(status_code=409, detail="Release the root session or sandbox")
+        if (
+            conv.detached_at is not None
+            and conv.host_id is None
+            and conv.detached_claim_host_id is None
+        ):
+            return Response(status_code=204)
+        if conv.live_status in ("running", "waiting"):
+            raise HTTPException(status_code=409, detail="Session is busy; stop it and retry")
+        if conv.host_id is None and conv.detached_claim_host_id is None:
+            await asyncio.to_thread(conversation_store.detach_conversation, session_id)
+            return Response(status_code=204)
+
+        async with _claim_lock(request):
+            conv = await asyncio.to_thread(
+                _owned_session,
+                session_id,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            if (
+                conv.detached_at is not None
+                and conv.host_id is None
+                and conv.detached_claim_host_id is None
+            ):
+                return Response(status_code=204)
+            claim_host_id = conv.host_id or conv.detached_claim_host_id
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+            host = (
+                await asyncio.to_thread(host_store.get_host, claim_host_id)
+                if claim_host_id is not None
+                else None
+            )
+            if host is None or not _host_is_owned(host, owner) or host.sandbox_id is None:
+                raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+            siblings = await asyncio.to_thread(
+                conversation_store.list_conversations_by_host_id, host.host_id
+            )
+            await asyncio.to_thread(
+                conversation_store.detach_conversation,
+                session_id,
+                expected_host_id=host.host_id,
+            )
+            if any(item.id != session_id for item in siblings):
+                # This session is definitively detached while the shared lease
+                # remains fenced by live siblings; it owes no provider cleanup.
+                await asyncio.to_thread(
+                    conversation_store.clear_detached_claim_host_id, host.host_id
+                )
+                return Response(status_code=204)
+            from omnigent.server.managed_hosts import terminate_managed_host
+
+            try:
+                await terminate_managed_host(
+                    host,
+                    host_store,
+                    getattr(request.app.state, "sandbox_config", None),
+                )
+                await asyncio.to_thread(
+                    conversation_store.clear_detached_claim_host_id, host.host_id
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Sandbox release is uncertain; retry this release",
+                ) from exc
+        return Response(status_code=204)
+
+    @router.post("/coda/claims/{session_id}/release", status_code=204, response_model=None)
+    async def release_sandbox(request: Request, session_id: str) -> Response:
+        user_id = require_user(request, auth_provider)
+        owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+        anchor = await asyncio.to_thread(
+            _owned_session,
+            session_id,
+            user_id,
+            conversation_store,
+            permission_store,
+        )
+        if (
+            anchor.detached_at is not None
+            and anchor.host_id is None
+            and anchor.detached_claim_host_id is None
+        ):
+            return Response(status_code=204)
+        if anchor.host_id is None and anchor.detached_claim_host_id is None:
+            raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+
+        async with _claim_lock(request):
+            anchor = await asyncio.to_thread(
+                _owned_session,
+                session_id,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            if (
+                anchor.detached_at is not None
+                and anchor.host_id is None
+                and anchor.detached_claim_host_id is None
+            ):
+                return Response(status_code=204)
+            claim_host_id = anchor.host_id or anchor.detached_claim_host_id
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+            host = (
+                await asyncio.to_thread(host_store.get_host, claim_host_id)
+                if claim_host_id is not None
+                else None
+            )
+            if host is None or not _host_is_owned(host, owner) or host.sandbox_id is None:
+                raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+            sessions = await asyncio.to_thread(
+                conversation_store.list_conversations_by_host_id, host.host_id
+            )
+            for session in sessions:
+                await asyncio.to_thread(
+                    _owned_session,
+                    session.id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                )
+                if session.live_status in ("running", "waiting"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A sandbox session is busy; stop it and retry",
+                    )
+            await asyncio.to_thread(
+                conversation_store.detach_conversations_by_host_id, host.host_id
+            )
+            from omnigent.server.managed_hosts import terminate_managed_host
+
+            try:
+                await terminate_managed_host(
+                    host,
+                    host_store,
+                    getattr(request.app.state, "sandbox_config", None),
+                )
+                await asyncio.to_thread(
+                    conversation_store.clear_detached_claim_host_id, host.host_id
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Sandbox release is uncertain; retry this release",
+                ) from exc
+        return Response(status_code=204)
+
+    @router.post("/sessions/{session_id}/resume", status_code=204, response_model=None)
+    async def resume_session(
+        request: Request,
+        session_id: str,
+        body: ResumeSessionRequest | None = None,
+    ) -> Response:
+        user_id = require_user(request, auth_provider)
+        owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+        conv = await asyncio.to_thread(
+            _owned_session,
+            session_id,
+            user_id,
+            conversation_store,
+            permission_store,
+        )
+        if conv.kind == "sub_agent":
+            raise HTTPException(status_code=409, detail="Resume the root session")
+        if conv.host_id is not None and conv.detached_at is None:
+            return Response(status_code=204)
+        if conv.detached_at is None:
+            raise HTTPException(status_code=409, detail="Session is not detached")
+        if conv.detached_claim_host_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Prior sandbox release is unresolved; retry Release before Resume",
+            )
+
+        config = getattr(request.app.state, "sandbox_config", None)
+        host_store = getattr(request.app.state, "host_store", None)
+        tracker = getattr(request.app.state, "managed_launches", None)
+        if config is None or host_store is None or tracker is None or config.provider != "coda":
+            raise HTTPException(status_code=409, detail="CoDA sandbox resume is unavailable")
+        app_id = body.sandbox_app_id if body is not None else None
+
+        async with _claim_lock(request):
+            conv = await asyncio.to_thread(
+                _owned_session,
+                session_id,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            if conv.host_id is not None and conv.detached_at is None:
+                return Response(status_code=204)
+            if conv.detached_at is None:
+                raise HTTPException(status_code=409, detail="Session is not detached")
+            if conv.detached_claim_host_id is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Prior sandbox release is unresolved; retry Release before Resume",
+                )
+
+            from omnigent.onboarding.sandboxes.coda import CodaProvider
+            from omnigent.server.managed_hosts import (
+                MANAGED_REPO_LABEL_KEY,
+                ManagedHostLaunch,
+                parse_repo_workspace,
+                terminate_managed_host,
+            )
+            from omnigent.server.routes._sessions.orchestration import (
+                _bind_and_launch_managed_runner,
+                _run_managed_launch,
+            )
+            from omnigent.stores.host_store import host_is_live
+
+            if app_id is not None:
+                try:
+                    target_launcher = config.launcher_factory()
+                    if not isinstance(target_launcher, CodaProvider):
+                        raise RuntimeError("CoDA provider is unavailable")
+                    await asyncio.to_thread(target_launcher.prepare, app_id)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Selected sandbox is full, removed, or unavailable",
+                    ) from exc
+
+            hosts = await asyncio.to_thread(host_store.list_hosts, owner)
+            candidates = [
+                host
+                for host in hosts
+                if _host_is_owned(host, owner)
+                and host.sandbox_id is not None
+                and host_is_live(host)
+                and (app_id is None or host.sandbox_id.startswith(f"coda:{app_id}#"))
+            ]
+            cap = config.max_sessions_per_lease or 10
+            adopted = None
+            for host in candidates:
+                bound = await asyncio.to_thread(
+                    conversation_store.list_conversations_by_host_id, host.host_id
+                )
+                if len(bound) < cap:
+                    adopted = host
+                    break
+
+            tracker.begin(session_id)
+            launch_state = tracker.get(session_id)
+            new_host_id: str | None = adopted.host_id if adopted is not None else None
+            try:
+                if adopted is not None:
+                    launcher = config.launcher_factory()
+                    if not isinstance(launcher, CodaProvider):
+                        raise RuntimeError("CoDA provider is unavailable")
+                    workspace = await asyncio.to_thread(
+                        launcher.allocate_workspace,
+                        adopted.sandbox_id,
+                        session_id,
+                    )
+                    await _bind_and_launch_managed_runner(
+                        session_id=session_id,
+                        managed=ManagedHostLaunch(adopted.host_id, workspace),
+                        sandbox_config=config,
+                        tracker=tracker,
+                        conversation_store=conversation_store,
+                        host_store=host_store,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    )
+                else:
+                    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+                    repo = parse_repo_workspace(raw_repo) if raw_repo else None
+                    before_ids = {host.host_id for host in hosts}
+                    await _run_managed_launch(
+                        session_id=session_id,
+                        owner=owner,
+                        sandbox_config=config,
+                        repo=repo,
+                        tracker=tracker,
+                        conversation_store=conversation_store,
+                        host_store=host_store,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                        coda_app_id=app_id,
+                        agent_store=agent_store,
+                        agent_id=conv.agent_id,
+                    )
+                    rebound = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
+                    )
+                    if rebound is not None and rebound.host_id not in before_ids:
+                        new_host_id = rebound.host_id
+                if launch_state is not None and launch_state.error is not None:
+                    raise RuntimeError("resume failed")
+                rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if rebound is None or rebound.host_id is None or rebound.detached_at is not None:
+                    raise RuntimeError("resume failed")
+            except Exception as exc:
+                tracker.fail(session_id, "resume failed")
+                rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if (
+                    rebound is not None
+                    and new_host_id is not None
+                    and rebound.host_id == new_host_id
+                ):
+                    with contextlib.suppress(ValueError):
+                        await asyncio.to_thread(
+                            conversation_store.detach_conversation,
+                            session_id,
+                            expected_host_id=new_host_id,
+                        )
+                    # A newly acquired claim is ours to clean up. An adopted
+                    # shared claim must remain for its sibling sessions.
+                    if adopted is None:
+                        failed_host = await asyncio.to_thread(host_store.get_host, new_host_id)
+                        if failed_host is not None:
+                            with contextlib.suppress(Exception):
+                                await terminate_managed_host(failed_host, host_store, config)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Resume failed; the session remains detached and can be retried",
+                ) from exc
+        return Response(status_code=204)

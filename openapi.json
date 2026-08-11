@@ -640,6 +640,71 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CodaClaim": {
+        "description": "Sanitized claim inventory; provider and lease identities are omitted.",
+        "properties": {
+          "anchor_session_id": {
+            "title": "Anchor Session Id",
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/CodaClaimSession"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "anchor_session_id",
+          "sessions"
+        ],
+        "title": "CodaClaim",
+        "type": "object"
+      },
+      "CodaClaimInventory": {
+        "properties": {
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/CodaClaim"
+            },
+            "title": "Claims",
+            "type": "array"
+          }
+        },
+        "title": "CodaClaimInventory",
+        "type": "object"
+      },
+      "CodaClaimSession": {
+        "description": "A retained session affected by a claim-level release.",
+        "properties": {
+          "detached": {
+            "default": false,
+            "title": "Detached",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "CodaClaimSession",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -3093,6 +3158,27 @@
         "title": "ResponseObject",
         "type": "object"
       },
+      "ResumeSessionRequest": {
+        "additionalProperties": false,
+        "description": "Resume target. A lease or host identifier is intentionally not accepted.",
+        "properties": {
+          "sandbox_app_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox App Id"
+          }
+        },
+        "title": "ResumeSessionRequest",
+        "type": "object"
+      },
       "RetryErrorDetail": {
         "description": "Error block carried by `RetryEvent` and `ErrorEvent`.\n\nMirrors the shape that `llm_retry.py` and `tool_retry.py`\nemit today \u2014 flat `code` / `message` plus an optional\n`detail` for provider-specific structured fields.",
         "properties": {
@@ -4952,6 +5038,22 @@
             "description": "Unix epoch seconds of creation.",
             "title": "Created At",
             "type": "integer"
+          },
+          "detached": {
+            "default": false,
+            "title": "Detached",
+            "type": "boolean"
+          },
+          "detached_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detached At"
           },
           "external_session_id": {
             "anyOf": [
@@ -7159,6 +7261,62 @@
         "summary": "List Builtin Agents",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/v1/coda/claims": {
+      "get": {
+        "operationId": "list_coda_claims_v1_coda_claims_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodaClaimInventory"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Coda Claims",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/coda/claims/{session_id}/release": {
+      "post": {
+        "operationId": "release_sandbox_v1_coda_claims__session_id__release_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Sandbox",
+        "tags": [
+          "sessions"
         ]
       }
     },
@@ -10751,6 +10909,41 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/release": {
+      "post": {
+        "operationId": "release_session_v1_sessions__session_id__release_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources": {
       "get": {
         "description": "Return the runner-authoritative resource inventory for a session.\n\nRequires the session to be bound to a runner via\n`PATCH /v1/sessions/{id}`; raises `conflict` otherwise.\nThe server validates the session exists, then proxies to the\nrunner's `GET /v1/sessions/{id}/resources` endpoint. In\nunit-test / in-process setups with no runner router/client, the\nroute falls back to adapting the local terminal registry.",
@@ -12123,6 +12316,58 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resume": {
+      "post": {
+        "operationId": "resume_session_v1_sessions__session_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ResumeSessionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

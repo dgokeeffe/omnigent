@@ -1,0 +1,102 @@
+## REVIEW COMPLETE: History-Preserving CoDA Release & Resume
+
+**Status: FINDINGS IDENTIFIED - See details below**
+
+### ✓ Evidence-Backed Compliance Findings
+
+#### **FINDING 1: Resume Failure Error Code Mismatch (MEDIUM SEVERITY)**
+
+**File:line:** `omnigent/server/routes/sessions/routes_lifecycle.py:409`
+
+**Spec Requirement (line 46):** *"Resume acquisition/reconstruction/bind failure | Best-effort cleanup of the newly acquired claim. Atomically restore/retain detached state; `503 RESUME_FAILED`."*
+
+**Spec Requirement (line 45):** *"Resume target removed/full/unavailable | Sanitized actionable `409 SANDBOX_UNAVAILABLE`"*
+
+**Issue:** The code returns `409` for all resume failures including acquisition/reconstruction/bind failures that should return `503 RESUME_FAILED`:
+
+```python
+except Exception as exc:
+    # ... cleanup ...
+    raise HTTPException(
+        status_code=409,  # Should be 503 for reconstruction/bind failures
+        detail="Selected sandbox is unavailable; the session remains detached",
+    ) from exc
+```
+
+**Impact:** Clients cannot distinguish between "target unavailable" (409) and "acquisition/reconstruction failure" (503), violating the spec's requirement for distinct error codes. Error message says "sandbox unavailable" but covers acquisition failures too.
+
+**Reproduction:** Call `POST /v1/sessions/{id}/resume` where the sandbox app is available but repository reconstruction fails (e.g., git clone failure). The response will be `409` instead of `503`.
+
+**Test confirms issue:** `test_resume_failure_leaves_session_detached_and_redacts_provider_error` expects `409` but spec requires `503` for this failure class.
+
+---
+
+#### **FINDING 2: Error Message Accuracy (LOW SEVERITY)**
+
+**File:line:** `omnigent/server/routes/sessions/routes_lifecycle.py:409`
+
+**Issue:** Error message "Selected sandbox is unavailable" is inaccurate when failure is due to acquisition/reconstruction (git clone, etc.) rather than target unavailability.
+
+**Impact:** Misleading guidance to operators about failure root cause.
+
+---
+
+### ✓ Verified Compliance (Clean on Core Requirements)
+
+✅ **Release/Resume State Machine:** All transitions correctly implemented (9.1-9.2)
+- Sibling handling: ✓ Atomically detaches selected session, preserves shared claim if siblings remain
+- Single-session release: ✓ Disconnects and scrubs fence after definitive disconnect
+- Idempotency: ✓ Already-detached sessions return 204 with no mutation
+- Sub-agent rejection: ✓ Both release and resume reject with `409`
+- Running session rejection: ✓ Returns `409` for live_status in ("running", "waiting")
+
+✅ **Atomicity & Fencing (9.3-9.4):**
+- Detach uses `SELECT...FOR UPDATE` with immediate commit ✓
+- Process-separated race test passes: `test_process_separated_repeated_detach_is_database_idempotent` ✓
+- In-process serialization: shared `_claim_lock` guards all release/resume operations ✓
+- Concurrent operations test: `test_concurrent_releases_serialize_and_disconnect_once` ✓
+
+✅ **Authorization & Disclosure (9.5):**
+- All endpoints require authentication ✓ (`test_lifecycle_requires_authentication`)
+- Cross-user access returns 404 not 403 ✓ (`test_cross_user_release_is_concealed_and_non_mutating`)
+- Inventory sanitized: no APP_ID, LEASE, HOST_ID, tokens, or owner identities leaked ✓ (`test_inventory_is_owner_scoped_and_sanitized`)
+- Error messages redacted: provider payloads not leaked ✓ (managed_hosts.py)
+- Clients cannot supply lease/host ID: `extra="forbid"` on ResumeSessionRequest ✓
+
+✅ **API Surface (9.6):**
+- `GET /v1/coda/claims` returns caller-owned sanitized inventory ✓
+- `POST /v1/sessions/{id}/release` returns `204` when detached/released ✓
+- `POST /v1/coda/claims/{session_id}/release` atomically detaches all sessions on claim ✓
+- `POST /v1/sessions/{id}/resume` accepts optional `{"sandbox_app_id": "..."}` only ✓
+
+✅ **History Preservation:**
+- Conversation title retained ✓
+- Labels retained ✓
+- Session state retained ✓
+- Workspace reference cleared ✓ (meta.workspace = None)
+- Runner affinity cleared ✓ (meta.runner_id = None)
+- Live status cleared ✓ (meta.live_status = None)
+
+✅ **Operator Guidance (docs/CODA_RELEASE_RESUME_OPERATIONS.md):**
+- Safe rollback steps documented ✓
+- Disconnect ambiguity handling: preserve fence and retry ✓
+- Database queries use proper indices ✓
+
+✅ **Database Schema:**
+- `detached_at` migration correct ✓
+- `detached_claim_host_id` added with proper semantics ✓
+- Indices created: `ix_conversation_metadata_host_id` and `ix_conversation_metadata_detached_claim_host_id` ✓
+- Clear-fence operation only after definitive disconnect ✓
+
+✅ **UI & Client (9.6 non-goals):**
+- Warning message displayed: "Conversation history is kept. Sandbox files and uncommitted changes will be permanently erased." ✓
+- Detached state visible in ChatPage ✓
+- CodaLifecycleControls component shows Release/Resume controls with state-dependent visibility ✓
+
+---
+
+### Summary
+
+**Clean on invariants:** Detached-session state machine, atomicity, authorization, history preservation, and operator docs are correctly implemented per spec tranches 9.1-9.6.
+
+**Two findings:** Minor error-code misalignment (503 vs 409 for resume failures) and non-critical error message accuracy. Both findings are localized to exception handling paths and do not affect the core state machine correctness. Session is correctly left detached if any resume step fails.

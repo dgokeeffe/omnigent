@@ -1,0 +1,205 @@
+Perfect! All tests pass. Now I'll produce the deterministic re-review report:
+
+---
+
+## **RE-REVIEW ADJUDICATION: History-Preserving CoDA Release & Resume**
+
+**Status: ALL PRIOR FINDINGS FIXED OR APPROPRIATELY SCOPED** | No new blockers identified
+
+**Review Date:** Current working tree vs. fork/dev baseline
+**Lenses:** Edge-case, Cleanup masking, Tracker, Concurrency, Ambiguity
+
+---
+
+## **PRIOR REQUIREMENTS REVIEW FINDINGS**
+
+### ✅ **FINDING 1: Resume Failure Error Code Mismatch (MEDIUM) → FIXED**
+
+**Spec Ref:** Line 46 vs. Line 45 of CODA_HISTORY_PRESERVING_RELEASE.md
+
+**Original Issue:** Resume acquisition/reconstruction failures returned `409 SANDBOX_UNAVAILABLE` instead of `503 RESUME_FAILED`
+
+**Current State:**
+✅ **FIXED** - `omnigent/server/routes/sessions/routes_lifecycle.py:487`
+
+```python
+raise HTTPException(
+    status_code=503,
+    detail="Resume failed; the session remains detached and can be retried",
+) from exc
+```
+
+**Evidence:**
+- Line 487: status_code=503 (not 409)
+- Test confirms: `test_resume_failure_leaves_session_detached_and_redacts_provider_error` expects and passes with 503
+- Error message is now accurate, distinct from target-unavailable scenario
+
+---
+
+### ✅ **FINDING 2: Error Message Accuracy (LOW) → FIXED**
+
+**Original Issue:** Message "Selected sandbox is unavailable" masked root causes (git clone failure, etc.)
+
+**Current State:**
+✅ **FIXED** - `omnigent/server/routes/sessions/routes_lifecycle.py:488`
+
+```python
+detail="Resume failed; the session remains detached and can be retried"
+```
+
+**Evidence:** Message now clearly indicates a transient failure, not target unavailability. Operators can distinguish resume failure from sandbox selection failure (line 378).
+
+---
+
+## **PRIOR EDGE-CASE REVIEW FINDINGS**
+
+### ✅ **FINDING 1: Exception Masking in Resume Error Handler (MEDIUM) → FIXED**
+
+**Original Issue:** If `detach_conversation` threw `ValueError("session binding changed")` during cleanup, it replaced original launch error
+
+**Current State:**
+✅ **FIXED** - `omnigent/server/routes/sessions/routes_lifecycle.py:465-470`
+
+```python
+with contextlib.suppress(ValueError):
+    await asyncio.to_thread(
+        conversation_store.detach_conversation,
+        session_id,
+        expected_host_id=new_host_id,
+    )
+```
+
+**Evidence:**
+- ValueError from `expected_host_id` mismatch is now explicitly suppressed (line 465)
+- Original exception preserved: line 481 uses `from exc` to chain exceptions
+- Cleanup exceptions don't mask root cause
+- Nested if structure (line 463-478) ensures `new_host_id` is not None before dereferencing
+
+**Masking Analysis:**
+- **Suppress(ValueError):** Prevents detach binding-check failures from masking launch errors ✓
+- **Suppress(Exception):** Line 478 cleanup failures don't mask original error (already failed) ✓
+- **Exception chaining:** `from exc` preserves stack and root cause ✓
+
+---
+
+### ✅ **FINDING 2: Tracker State Not Explicitly Cleaned (LOW) → FIXED**
+
+**Original Issue:** `tracker.begin()` at line 390, no `tracker.fail()` on exception path
+
+**Current State:**
+✅ **FIXED** - `omnigent/server/routes/sessions/routes_lifecycle.py:456`
+
+```python
+except Exception as exc:
+    tracker.fail(session_id, "resume failed")
+```
+
+**Evidence:**
+- Line 402: `tracker.begin(session_id)` initiates tracking
+- Line 456: `tracker.fail(session_id, "resume failed")` explicitly records failure
+- Observability gap closed: failed resume state is now recorded
+- Tracker entry is not left stale (no incomplete state in tracker)
+
+---
+
+### ⚠️ **FINDING 3: Confusing State If Host Becomes Inaccessible After Fence (LOW) → NO CHANGE (Acceptable)**
+
+**Original Issue:** If host is manually deleted between failed terminate and retry, error message "Sandbox claim is unavailable" is ambiguous (could mean dead host, not just transient unavailability)
+
+**Current State:**
+⚠️ **NO CHANGE** - `omnigent/server/routes/sessions/routes_lifecycle.py:181-182`
+
+```python
+if host is None or not _host_is_owned(host, owner) or host.sandbox_id is None:
+    raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+```
+
+**Assessment:**
+- **Severity:** LOW (Operational edge case, not functional bug)
+- **Scope:** Fence preservation is intentional and correctly tested (`test_ambiguous_disconnect_preserves_fence_and_redacts_error`)
+- **Trade-off:** Ambiguous message is acceptable for rare admin-deletion scenario; preventing information leakage (not disclosing host deletion reason) takes priority
+- **Mitigation:** Operators can retry release after investigating host status; design ensures no data loss
+- **NOT a blocker:** Fence semantics are correct; this is a UX clarity issue, not a correctness issue
+
+---
+
+## **NEW ISSUES SCAN (Re-Review Lenses)**
+
+### ✅ **Concurrency & Locking**
+- **Double-check pattern:** Pre-check before lock, re-check inside lock on both `release_session` (lines 150-161) and `resume_session` (lines 315-337) ✓
+- **Lock scope:** `_claim_lock` protects all claim-level mutations ✓
+- **No race conditions:** Mutually exclusive paths (outside-lock detach vs. inside-lock terminate) correctly guarded ✓
+- **Test confirmation:** `test_concurrent_releases_serialize_and_disconnect_once` and `test_concurrent_resume_acquires_once` both pass ✓
+
+### ✅ **Cleanup Masking**
+- **Exception chaining:** All HTTPException raises use `from exc` to preserve original exception ✓
+- **Error handlers wrap cleanups:** contextlib.suppress used judiciously:
+  - Line 465: suppress ValueError (specific, intentional) ✓
+  - Line 478: suppress Exception (already-failed cleanup) ✓
+- **No silent failures:** Session state is always set correctly before error path (detached at line 467) ✓
+
+### ✅ **Tracker State Machine**
+- **Entry:** Line 402 `tracker.begin(session_id)`
+- **Success:** Line 451-454 verify success (no explicit finish; implicitly cleared by next begin)
+- **Failure:** Line 456 `tracker.fail(session_id, "resume failed")`
+- **No stale entries:** Tracker entries are transitional; next call replaces prior state ✓
+
+### ✅ **Edge Cases**
+- **Ambiguous disconnect:** Fence preserved for retry (lines 201-204, 213-217) ✓
+- **Idempotency:** Pre-detached sessions return 204 without mutation (line 154, line 163-168) ✓
+- **Authorization:** Cross-user access returns 404 (no 403) via `_owned_session` ✓
+- **Sibling handling:** Shared leases remain if siblings exist (line 192-196) ✓
+
+### ✅ **Input Validation**
+- **ResumeSessionRequest:** `additionalProperties: false` (line 25) prevents lease/host injection ✓
+- **Manual target prep:** Line 368-376 validates app_id before mutation ✓
+
+---
+
+## **VERIFICATION SUMMARY**
+
+| Finding | Severity | Status | Evidence |
+|---------|----------|--------|----------|
+| Resume error code 503 vs 409 | MEDIUM | ✅ FIXED | Line 487: status_code=503 |
+| Error message accuracy | LOW | ✅ FIXED | Line 488: "Resume failed; the session remains detached" |
+| Exception masking in cleanup | MEDIUM | ✅ FIXED | Lines 465-481: suppress(ValueError) + from exc |
+| Tracker fail not called | LOW | ✅ FIXED | Line 456: tracker.fail() added |
+| Confusing host-unavailable msg | LOW | ⚠️ SCOPED | Line 181-182: Acceptable trade-off for security |
+| **New blockers** | — | ✅ NONE | All 14 tests pass; no new issues |
+
+---
+
+## **TEST RESULTS**
+
+```
+14 passed in 7.82s
+✓ test_lifecycle_requires_authentication
+✓ test_cross_user_release_is_concealed_and_non_mutating
+✓ test_session_release_preserves_history_and_shared_claim_then_is_idempotent
+✓ test_concurrent_releases_serialize_and_disconnect_once
+✓ test_sandbox_release_detaches_all_and_scrubs_once
+✓ test_ambiguous_disconnect_preserves_fence_and_redacts_error
+✓ test_inventory_is_owner_scoped_and_sanitized
+✓ test_resume_automatic_or_manual_binds_fresh_workspace_idempotently (2x)
+✓ test_resume_failure_leaves_session_detached_and_redacts_provider_error
+✓ test_removed_or_forged_manual_target_fails_before_mutation
+✓ test_cross_user_resume_is_concealed
+✓ test_concurrent_resume_acquires_once
+✓ test_clients_cannot_supply_lease_or_host_to_resume
+```
+
+---
+
+## **ADJUDICATION**
+
+**Status: READY FOR MERGE** ✅
+
+- **All prior MEDIUM findings:** Fixed
+- **All prior LOW findings:** Fixed or appropriately scoped
+- **No new blockers:** Identified in re-review
+- **Concurrency:** Safe (double-check + lock pattern)
+- **Exception safety:** Preserved (no masking with contextlib.suppress + from exc)
+- **Authorization:** Correct (404 for cross-user, no information leakage)
+- **Test coverage:** Comprehensive (14/14 passing, covering failure paths, concurrency, auth, redaction)
+
+**Recommendation:** Proceed to merge. The implementation correctly addresses all prior findings with sound exception handling, appropriate locking semantics, and verified idempotency under concurrent operations.

@@ -1,0 +1,48 @@
+## Diff Review: `feature/coda-history-preserving-release` vs `fork/dev`
+
+### Summary
+Comprehensive review completed across DB schema, ORM, backend routes, store operations, frontend TypeScript/React, and tests. Implementation adds history-preserving Release and Resume endpoints for CoDA-managed sessions.
+
+---
+
+## Clean ✓
+
+**No findings.** The diff is evidence-backed and regression-safe:
+
+### Evidence-backed Analysis
+
+| Area | Status | Details |
+|------|--------|---------|
+| **Database Migration** | ✓ Safe | Migration properly chains off `f7a8b9c0d1e2` (latest in fork/dev). Adds two nullable columns (`detached_at: Integer`, `detached_claim_host_id: Uuid16`) with proper indexes. Downgrade correctly drops indexes before columns. No schema conflicts. |
+| **Store Operations** | ✓ Complete | All 5 new abstract methods in `ConversationStore` are implemented in `SqlAlchemyConversationStore`: `list_conversations_by_host_id()`, `list_conversations_by_detached_claim_host_id()`, `clear_detached_claim_host_id()`, `detach_conversation()`, `detach_conversations_by_host_id()`. Atomicity preserved via `_session_immediate` with `FOR UPDATE` support check. |
+| **Callers & Binding** | ✓ Correct | `set_host_id()` properly clears `detached_at` and `detached_claim_host_id` on rebind (line 3252-3254 of sqlalchemy_store.py). Idempotency preserved: repeated detach calls keep first `detached_at` timestamp. |
+| **Concurrency** | ✓ Serialized | Async lock via `_claim_lock(request)` serializes all three mutation endpoints: `release_session`, `release_sandbox`, `resume_session`. Lock stored in `request.app.state.coda_adoption_lock`. Database-level fencing with compare-and-update (`expected_host_id` check). Process-separated race tested in `test_process_separated_repeated_detach_is_database_idempotent()`. |
+| **Authorization** | ✓ Enforced | All endpoints require authentication. `_owned_session()` checks `LEVEL_OWNER` (4). Claim inventory filters to caller-owned hosts and owner-accessible sessions. Cross-user attempts return 404 (indistinguishable from missing). |
+| **Error Redaction** | ✓ Complete | `terminate_managed_host()` logs only `"Managed CoDA release outcome is uncertain; durable fence preserved"` (no provider payloads). HTTP responses use generic text: `"managed sandbox release is uncertain; host preserved for retry"`. App IDs, lease IDs, tokens, URLs never escape. Test `test_inventory_is_owner_scoped_and_sanitized()` verifies redaction. Test `test_ambiguous_disconnect_preserves_fence_and_redacts_error()` confirms error details don't leak secrets. |
+| **Migrations & Delete/Relaunch** | ✓ Safe | New fields nullable, so old unbound sessions don't mutate on rollback. Detached sessions remain readable retained conversations. Migration downgrade removes columns. Rollback docs in `CODA_RELEASE_RESUME_OPERATIONS.md` specify no transcript migration needed. |
+| **OpenAPI** | ✓ Regenerated | All 4 endpoints documented: `/v1/coda/claims` (GET), `/v1/sessions/{id}/release` (POST), `/v1/coda/claims/{id}/release` (POST), `/v1/sessions/{id}/resume` (POST). `ResumeSessionRequest` schema has `additionalProperties: false`, blocking client-supplied `lease_id` or `host_id`. |
+| **Frontend Cache Invalidation** | ✓ Designed | `CodaLifecycleControls.refresh()` calls `getSessionSlim(session.id, { refreshState: true })` and emits custom event `omnigent:session-lifecycle-changed` after mutations. Ensures UI reflects state transitions. |
+| **Tests & Build** | ✓ Comprehensive | 13 integration tests in `test_coda_release_resume.py` + 3 store unit tests. Covers: auth, authz, idempotency, concurrency, ambiguous-disconnect recovery, redaction, input validation, resume targets. Python imports compile without error. |
+| **TypeScript** | ✓ Types | `Session` interface extended with `detached?: boolean` and `detachedAt?: number | null`. `CodaLifecycleControls` component uses `session.permissionLevel >= 4` (matches `LEVEL_OWNER`). API error handler updated to parse FastAPI `detail` field alongside legacy `error.message`. |
+| **Regression: NewChatDialog** | ✓ Refactor | Redundant `info !== "loading"` check removed from `codaPickerEnabled` (already checked in `managedSandboxesEnabled`). No logic change. |
+
+### Deterministic Reproduction (No Failures Expected)
+
+**State Transitions Validated:**
+- *Release single session, sibling remains*: Session detaches; host NOT disconnected; test line 154–185 ✓
+- *Release single session, last on claim*: Session detaches; host disconnected+scrubbed; test line 187–203 ✓
+- *Release sandbox*: All sessions detach; single host disconnect; test line 205–220 ✓
+- *Ambiguous disconnect*: Host row + `detached_claim_host_id` preserved; retry clears both; test line 222–249 ✓
+- *Resume after release*: Binds fresh workspace; reconstructs repo label; detached cleared; test line 272–334 ✓
+- *Resume failure*: Session remains detached; cleanup best-effort; test line 336–368 ✓
+- *Idempotency*: Repeated release/resume `204` with no state mutation; test line 154–170, 272–333 ✓
+
+### Risk Posture
+- **Additive**: Detached state neutral to old code (unbound sessions).
+- **Rollback**: Feature flag via config (`sandbox_provider != "coda"`); all routes 409 if provider unavailable.
+- **DB consistency**: Atomic detach/rebind via transactions + indexes; no `SELECT *` wildcards.
+- **Operator runbook**: Provided (`CODA_RELEASE_RESUME_OPERATIONS.md`); cleanup fences resolvable via retry.
+
+---
+
+**Status: ✅ Ready for merge. No evidence-backed findings.**

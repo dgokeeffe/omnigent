@@ -1111,6 +1111,8 @@ def _build_session_response(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
+        detached=conv.detached_at is not None,
+        detached_at=conv.detached_at,
         # Replay the latest todo list for claude-native sessions.
         # Populated by _handle_external_session_todos; empty list for
         # non-claude-native sessions or before the first poll tick.

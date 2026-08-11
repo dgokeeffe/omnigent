@@ -116,6 +116,9 @@ interface SessionResponseWire {
    * Absent/`false` for non-managed/non-resumable hosts.
    */
   host_resumable?: boolean;
+  /** Explicit history-preserving Release state. */
+  detached?: boolean;
+  detached_at?: number | null;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -285,6 +288,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
     hostResumable: wire.host_resumable ?? false,
+    detached: wire.detached ?? false,
+    detachedAt: wire.detached_at ?? null,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     createdAt: wire.created_at,
@@ -362,8 +367,12 @@ async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`;
   let code: string | null = null;
   try {
-    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string };
+      detail?: string;
+    };
     if (body.error?.message) message = body.error.message;
+    else if (body.detail) message = body.detail;
     if (body.error?.code) code = body.error.code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
@@ -722,6 +731,71 @@ function runnerFromWire(wire: RunnerSummaryWire): RunnerSummary {
     online: wire.online,
     harnesses: wire.harnesses ?? [],
   };
+}
+
+export interface CodaClaimSession {
+  id: string;
+  title: string | null;
+  detached: boolean;
+}
+
+export interface CodaClaim {
+  anchorSessionId: string;
+  sessions: CodaClaimSession[];
+}
+
+export interface CodaSandboxOption {
+  app_id: string;
+  label: string;
+  ownership: "unclaimed" | "mine" | "other";
+  state: "available" | "full" | "unavailable";
+  capacity: { used: number | null; limit: number };
+}
+
+/** Fetch sanitized automatic/manual Resume targets. */
+export async function listCodaSandboxOptions(): Promise<CodaSandboxOption[]> {
+  const res = await authenticatedFetch("/v1/sandboxes/coda");
+  const body = await readJsonOrThrow<{ sandboxes?: CodaSandboxOption[] }>(res);
+  return body.sandboxes ?? [];
+}
+
+/** List only the authenticated owner's sanitized CoDA claims. */
+export async function listCodaClaims(): Promise<CodaClaim[]> {
+  const res = await authenticatedFetch("/v1/coda/claims");
+  const wire = await readJsonOrThrow<{
+    claims: { anchor_session_id: string; sessions: CodaClaimSession[] }[];
+  }>(res);
+  return wire.claims.map((claim) => ({
+    anchorSessionId: claim.anchor_session_id,
+    sessions: claim.sessions,
+  }));
+}
+
+/** Detach one session, preserving its conversation history. */
+export async function releaseSession(sessionId: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/release`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/** Detach every session on the owned claim and scrub that exact sandbox. */
+export async function releaseCodaClaim(anchorSessionId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/coda/claims/${encodeURIComponent(anchorSessionId)}/release`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/** Reconstruct a detached session in a fresh automatic or selected sandbox. */
+export async function resumeSession(sessionId: string, sandboxAppId?: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(sandboxAppId ? { sandbox_app_id: sandboxAppId } : {}),
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
 }
 
 /** List currently online runners known to the server. */

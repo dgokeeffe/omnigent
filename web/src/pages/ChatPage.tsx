@@ -149,6 +149,7 @@ import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
+import { CodaLifecycleControls } from "@/components/CodaLifecycleControls";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -4111,7 +4112,16 @@ function ComposerStatusLine({
   // the badge is where it lives and an unreachable session often has no
   // branch/ring at all.
   const showHostBadge = showHost && isHostBound;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHostBadge) return null;
+  const showCodaLifecycle = !!session && (session.detached === true || isHostBound);
+  if (
+    !showBranch &&
+    !showPlanMode &&
+    !showGoal &&
+    !showRing &&
+    !showHostBadge &&
+    !showCodaLifecycle
+  )
+    return null;
 
   return (
     <div
@@ -4127,6 +4137,7 @@ function ComposerStatusLine({
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
+        {showCodaLifecycle && session && <CodaLifecycleControls session={session} />}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="ui-icon" />

@@ -1298,6 +1298,37 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_conversations_by_host_id(self, host_id: str) -> list[Conversation]:
+        """Return sessions bound to ``host_id`` using the host index."""
+        ...
+
+    @abstractmethod
+    def list_conversations_by_detached_claim_host_id(self, host_id: str) -> list[Conversation]:
+        """Return detached sessions whose cleanup fence is ``host_id``."""
+        ...
+
+    @abstractmethod
+    def clear_detached_claim_host_id(self, host_id: str) -> None:
+        """Clear cleanup references after definitive provider disconnect."""
+        ...
+
+    @abstractmethod
+    def detach_conversation(
+        self, conversation_id: str, *, expected_host_id: str | None = None
+    ) -> Conversation:
+        """Atomically clear live affinity and mark one retained session detached.
+
+        ``expected_host_id`` is a compare-and-update fence used by release so a
+        concurrent rebind cannot detach a session from a different claim.
+        """
+        ...
+
+    @abstractmethod
+    def detach_conversations_by_host_id(self, host_id: str) -> list[str]:
+        """Atomically detach every session currently bound to ``host_id``."""
+        ...
+
+    @abstractmethod
     def list_conversations_by_runner_id(
         self,
         runner_id: str,

@@ -1,0 +1,46 @@
+## Security Review Complete
+
+**Status: NO FINDINGS**
+
+After comprehensive analysis of the working tree diff against fork/dev, I found **no evidence-backed security findings**. The implementation demonstrates strong security engineering across all threat surfaces:
+
+### Authentication & Authorization ✓
+- All lifecycle endpoints require authentication via `require_user()`
+- Permission enforcement checks LEVEL_OWNER via permission_store
+- Cross-user access returns identical 404 as missing sessions (no information leakage)
+
+### Data Privacy & Workspace Isolation ✓
+- All store queries include `current_workspace_id()` filters
+- Detached sessions preserve conversation history, titles, labels, permissions, files
+- Operational bindings cleared: host_id, runner_id, workspace, git_branch, live_status
+- Internal field `detached_claim_host_id` never serialized to clients or exposed in OpenAPI
+- Claims inventory sanitized: only session IDs, titles, detached state (no App IDs, lease IDs, host IDs, user identities)
+
+### API/Log/Error Redaction ✓
+- Error messages are deliberately content-free (no App names, URLs, tokens, credentials, upstream bodies)
+- **Security improvement**: omnigent/server/managed_hosts.py redacted provider payload leakage in error details
+- ResumeSessionRequest uses `ConfigDict(extra="forbid")` to prevent clients supplying host_id or lease_id
+- Session detach/resume/claim APIs use non-revealing but descriptive error messages
+
+### Concurrency & Atomicity ✓
+- In-process lock (`_claim_lock`) serializes release/resume per host claim
+- Database compare-and-update with `expected_host_id` prevents concurrent rebind races
+- Process-separated detach is database-idempotent via FOR UPDATE
+- Comprehensive tests verify: idempotency, concurrent serialization, rebind validation, ambiguous failures
+
+### Data Retention & Cleanup ✓
+- Detached state is durable and first-class (distinct from never-bound)
+- Ambiguous provider failures preserve durable fence without deletion
+- Fence links cleared only after definitive provider disconnect
+- Detached sessions correctly track history-preserving Release state via `detached_at` timestamp
+
+### Test Coverage ✓
+Strong security-focused test suite (13 tests) including:
+- test_lifecycle_requires_authentication
+- test_cross_user_release_is_concealed_and_non_mutating
+- test_ambiguous_disconnect_preserves_fence_and_redacts_error
+- test_inventory_is_owner_scoped_and_sanitized
+- test_clients_cannot_supply_lease_or_host_to_resume
+- test_process_separated_repeated_detach_is_database_idempotent
+
+All critical security properties are implemented, tested, and documented in CODA_RELEASE_RESUME_OPERATIONS.md and CODA_HISTORY_PRESERVING_RELEASE.md.

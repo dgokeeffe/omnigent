@@ -403,7 +403,9 @@ def test_non_repository_connect_omits_repository_protocol_fields() -> None:
     body = control.calls[-1][2]
     assert not any(key.startswith("repo_") for key in body)
     assert "workspace_protocol_version" not in body
-    assert "session_id" not in body
+    # The session id is NOT repository protocol: CoDA needs it to give the
+    # lease-opening session its own workspace instead of the App's home dir.
+    assert body["session_id"] == "session"
 
 
 def test_manual_removed_app_id_fails_before_http() -> None:

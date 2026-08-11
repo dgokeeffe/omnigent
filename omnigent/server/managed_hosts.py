@@ -602,7 +602,7 @@ def _validate_clone_branch(fragment: str) -> str:
         or ".." in fragment
         or "@{" in fragment
     ):
-        raise ValueError(f"'{fragment}' is not a valid git branch name")
+        raise ValueError("the repository fragment is not a valid git branch name")
     return fragment
 
 
@@ -625,9 +625,8 @@ def _derive_repo_name(url: str) -> str:
     name = last[: -len(".git")] if last.endswith(".git") else last
     if not name or name in (".", "..") or not _REPO_NAME_RE.fullmatch(name):
         raise ValueError(
-            f"could not derive a repository directory name from '{url}' — "
-            "the URL must end in the repository name, e.g. "
-            "'https://github.com/org/repo'"
+            "could not derive a repository directory name — the URL must end "
+            "in a safe repository name, e.g. 'https://github.com/org/repo'"
         )
     return name
 
@@ -655,22 +654,26 @@ def parse_repo_workspace(workspace: str) -> RepoWorkspace:
     if any(ch.isspace() for ch in workspace):
         raise ValueError("a repository workspace must not contain whitespace")
     if url.startswith("https://"):
+        parsed = urlparse(url)
         host, slash, path = url[len("https://") :].partition("/")
         if not host or not slash or not path.strip("/"):
             raise ValueError(
-                f"'{url}' is not a usable https repository URL — expected "
-                "'https://<host>/<org>/<repo>'"
+                "not a usable https repository URL — expected 'https://<host>/<org>/<repo>'"
+            )
+        if parsed.username is not None or parsed.password is not None or parsed.query:
+            raise ValueError(
+                "a repository URL must be credential-free HTTPS with no query parameters"
             )
     elif url.startswith("git@"):
         host, colon, path = url[len("git@") :].partition(":")
         if not host or not colon or not path.strip("/"):
             raise ValueError(
-                f"'{url}' is not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
+                "not a usable ssh repository URL — expected 'git@<host>:<org>/<repo>'"
             )
     else:
         raise ValueError(
-            f"'{url}' is not a supported repository URL — use "
-            "'https://<host>/<org>/<repo>' or 'git@<host>:<org>/<repo>'"
+            "not a supported repository URL — use 'https://<host>/<org>/<repo>' "
+            "or 'git@<host>:<org>/<repo>'"
         )
     branch = _validate_clone_branch(fragment) if sep else None
     return RepoWorkspace(url=url, branch=branch, repo_name=_derive_repo_name(url))
@@ -2313,6 +2316,7 @@ async def launch_managed_host(
     config: ManagedSandboxConfig,
     owner: str,
     host_store: HostStore,
+    session_id: str | None = None,
     repo: RepoWorkspace | None = None,
     coda_app_id: str | None = None,
     agent_name: str | None = None,
@@ -2398,6 +2402,7 @@ async def launch_managed_host(
         host_name=host_name,
         owner=owner,
         sandbox_id=sandbox_id,
+        session_id=session_id,
         repo=repo,
         agent_name=agent_name,
         on_stage=on_stage,
@@ -2410,6 +2415,7 @@ async def relaunch_managed_host(
     config: ManagedSandboxConfig,
     host: Host,
     host_store: HostStore,
+    session_id: str | None = None,
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -2508,6 +2514,7 @@ async def relaunch_managed_host(
         host_name=host.name,
         owner=host.user_id,
         sandbox_id=sandbox_id,
+        session_id=session_id,
         repo=repo,
         agent_name=agent_name,
         on_stage=on_stage,
@@ -2530,8 +2537,27 @@ async def _start_sandbox_host(
     host_config: dict[str, object] | None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
+    # CoDA protocol v2 needs the durable session id to materialize the first
+    # claim's repository in an isolated per-session workspace.
+    if launcher.provider == "coda":
+        start_coda = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_coda,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            on_stage=on_stage,
+            session_id=session_id,
+        )
     # Gated on the capability, not on the value: start_host is side-effecting and
     # non-idempotent, so we never probe the signature by passing then retrying.
     # `agent_name` is declared on the classifying launcher's `start_host` alone,
@@ -2618,6 +2644,7 @@ async def _arm_and_start_host(
     host_name: str,
     owner: str,
     sandbox_id: str,
+    session_id: str | None = None,
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -2691,6 +2718,7 @@ async def _arm_and_start_host(
             host_config=config.host_config,
             agent_name=agent_name,
             on_stage=on_stage,
+            session_id=session_id,
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:

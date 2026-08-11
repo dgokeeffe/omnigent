@@ -1588,6 +1588,8 @@ def test_parse_repo_workspace_accepts_url_forms(workspace: str, expected: RepoWo
         # No repo path at all.
         ("https://github.com", "not a usable https repository URL"),
         ("git@github.com", "not a usable ssh repository URL"),
+        ("https://user:secret@github.com/org/repo", "credential-free HTTPS"),
+        ("https://github.com/org/repo?token=secret", "credential-free HTTPS"),
         # Commit SHAs would land the agent on a detached HEAD.
         ("https://github.com/org/repo#" + "a" * 40, "not a commit SHA"),
         # Empty / malformed branch fragments.
@@ -2584,7 +2586,13 @@ async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
     async def _arm(**kwargs: Any) -> str:
         assert kwargs["host_id"] == host.host_id
         assert kwargs["owner"] == _OWNER
-        return "/app/python/source_code"
+        assert kwargs["session_id"] == "retained-session"
+        assert kwargs["repo"] == RepoWorkspace(
+            url="https://github.com/example/repo.git",
+            branch="main",
+            repo_name="repo",
+        )
+        return "/app/python/source_code/coda-sessions/retained-session/repo"
 
     monkeypatch.setattr("omnigent.server.managed_hosts._arm_and_start_host", _arm)
     result = await relaunch_managed_host(
@@ -2595,9 +2603,16 @@ async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
         ),
         host=host,
         host_store=host_store,
+        session_id="retained-session",
+        repo=RepoWorkspace(
+            url="https://github.com/example/repo.git",
+            branch="main",
+            repo_name="repo",
+        ),
     )
 
     assert result.host_id == host.host_id
+    assert result.workspace.endswith("/retained-session/repo")
     post_calls = [body for method, body in requests if method == "POST"]
     assert post_calls[0] == {"lease_id": "old-lease", "scrub": True}
     assert post_calls[1] is not None

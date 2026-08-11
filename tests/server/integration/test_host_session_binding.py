@@ -508,6 +508,7 @@ async def test_coda_two_sessions_adopt_one_host(
     )
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+    allocation_calls: list[dict[str, object]] = []
 
     class FakeCoda(CodaProvider):
         def __init__(self) -> None:
@@ -537,8 +538,15 @@ async def test_coda_two_sessions_adopt_one_host(
             host_futures.append(asyncio.wrap_future(future, loop=loop))
             return "/app/python/source_code/coda-sessions/first"
 
-        def allocate_workspace(self, _sandbox_id: str, session_id: str) -> str:
-            return f"/app/python/source_code/coda-sessions/{session_id}"
+        def allocate_workspace(
+            self,
+            _sandbox_id: str,
+            session_id: str,
+            **repository: object,
+        ) -> str:
+            allocation_calls.append({"session_id": session_id, **repository})
+            suffix = "/project" if repository.get("repo_url") is not None else ""
+            return f"/app/python/source_code/coda-sessions/{session_id}{suffix}"
 
     fake = FakeCoda()
     env.app.state.sandbox_config = ManagedSandboxConfig(
@@ -561,7 +569,8 @@ async def test_coda_two_sessions_adopt_one_host(
         },
     )
     assert removed.status_code == 409
-    assert "removed or unknown app_id" in removed.text
+    assert "removed or unavailable" in removed.text
+    assert "removed-app" not in removed.text
     after_removed = {
         session.id for session in env.conv_store.list_conversations(limit=100, kind=None).data
     }
@@ -605,6 +614,7 @@ async def test_coda_two_sessions_adopt_one_host(
             "agent_id": agent["id"],
             "host_type": "managed",
             "sandbox_app_id": "coda-main",
+            "workspace": "https://github.com/example/project.git#release-1",
         },
     )
     await responder
@@ -613,17 +623,29 @@ async def test_coda_two_sessions_adopt_one_host(
     assert first.host_id == second.host_id
     assert first.runner_id != second.runner_id
     assert first.workspace != second.workspace
+    assert second.workspace.endswith("/project")
+    assert allocation_calls[-1] == {
+        "session_id": second.id,
+        "repo_url": "https://github.com/example/project.git",
+        "repo_branch": "release-1",
+        "repo_name": "project",
+    }
     assert len(env.host_store.list_hosts(RESERVED_USER_LOCAL)) == 1
 
     before_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
 
-    def _allocation_failure(_sandbox_id: str, _session_id: str) -> str:
+    def _allocation_failure(_sandbox_id: str, _session_id: str, **_kwargs: object) -> str:
         raise click.ClickException("allocation failed")
 
     monkeypatch.setattr(fake, "allocate_workspace", _allocation_failure)
     with pytest.raises(click.ClickException, match="allocation failed"):
         await env.client.post(
-            "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "workspace": "https://github.com/example/missing.git#invalid-branch",
+            },
         )
     after_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
     assert after_failure == before_failure
@@ -874,6 +896,23 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
     assert "takes a git repository URL" in detail[0]["msg"]
+
+
+async def test_managed_repository_validation_error_omits_credential_bearing_input(
+    managed_session_env: ManagedSessionEnv,
+) -> None:
+    response = await managed_session_env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": "d7a89f58205a70539a16fa4b7bd06270",
+            "host_type": "managed",
+            "workspace": "http://user:CREDENTIAL_MARKER@example.invalid/repo.git",
+        },
+    )
+    assert response.status_code == 422
+    assert "CREDENTIAL_MARKER" not in response.text
+    assert "user:" not in response.text
+    assert "not a supported repository URL" in response.text
 
 
 async def test_managed_session_create_without_config_fails_clearly(

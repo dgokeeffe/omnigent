@@ -41,6 +41,7 @@ class LifecycleHarness:
         self.hosts = HostStore(db_uri)
         self.calls: list[tuple[str, str, object]] = []
         self.fail_disconnect = False
+        self.fail_workspace = False
 
         def request(method: str, path: str, body: object) -> dict[str, object]:
             self.calls.append((method, path, body))
@@ -48,6 +49,21 @@ class LifecycleHarness:
                 raise click.ClickException(
                     "upstream https://private-app.example token=do-not-leak owner=alice"
                 )
+            if path.endswith("/workspaces"):
+                if self.fail_workspace:
+                    raise click.ClickException(
+                        "clone failed https://private-app.example token=do-not-leak owner=alice"
+                    )
+                if isinstance(body, dict) and body.get("action") == "release":
+                    return {"released": True, "workspace_protocol_version": 2}
+                session_id = body["session_id"] if isinstance(body, dict) else "unknown"
+                repository = isinstance(body, dict) and body.get("repo_url") is not None
+                suffix = "/repo" if repository else ""
+                return {
+                    "workspace": f"/fresh/{session_id}{suffix}",
+                    "workspace_protocol_version": 2,
+                    "repository_materialized": repository,
+                }
             return {"ready": True}
 
         self.provider = CodaProvider(
@@ -166,6 +182,7 @@ async def test_session_release_preserves_history_and_shared_claim_then_is_idempo
     assert sibling is not None and sibling.host_id == HOST_ID
     assert lifecycle.hosts.get_host(HOST_ID) is not None
     assert lifecycle.disconnects == []
+    assert not any(call[1].endswith("/workspaces") for call in lifecycle.calls)
 
     repeated = await lifecycle_client.post(
         f"/v1/sessions/{first}/release", headers=_headers(ALICE)
@@ -178,6 +195,30 @@ async def test_session_release_preserves_history_and_shared_claim_then_is_idempo
     assert len(lifecycle.disconnects) == 1
     assert lifecycle.disconnects[0][2] == {"lease_id": LEASE, "scrub": True}
     assert lifecycle.hosts.get_host(HOST_ID) is None
+
+
+async def test_shared_session_release_cleanup_failure_preserves_binding_and_sibling(
+    lifecycle_client: httpx.AsyncClient,
+    lifecycle: LifecycleHarness,
+) -> None:
+    session_id, sibling_id = lifecycle.add_claim(sessions=2)
+    lifecycle.conversations.set_labels(
+        session_id,
+        {"omnigent.sandbox.repo": "https://github.com/example/repo.git"},
+    )
+    lifecycle.fail_workspace = True
+
+    response = await lifecycle_client.post(
+        f"/v1/sessions/{session_id}/release", headers=_headers(ALICE)
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Session workspace release failed; retry Release"
+    session = lifecycle.conversations.get_conversation(session_id)
+    sibling = lifecycle.conversations.get_conversation(sibling_id)
+    assert session is not None and session.host_id == HOST_ID and session.detached_at is None
+    assert sibling is not None and sibling.host_id == HOST_ID
+    assert lifecycle.disconnects == []
 
 
 async def test_concurrent_releases_serialize_and_disconnect_once(
@@ -323,6 +364,113 @@ async def test_resume_automatic_or_manual_binds_fresh_workspace_idempotently(
     )
     assert repeated.status_code == 204
     assert calls == [expected_app_id]
+
+
+async def test_resume_adopts_shared_claim_and_reconstructs_repository_on_granting_app(
+    lifecycle_client: httpx.AsyncClient,
+    lifecycle: LifecycleHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.stores.host_store.host_is_live", lambda _host: True)
+
+    async def bind_without_live_tunnel(**kwargs: Any) -> None:
+        managed = kwargs["managed"]
+        lifecycle.conversations.set_host_id(
+            kwargs["session_id"], managed.host_id, workspace=managed.workspace
+        )
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._bind_and_launch_managed_runner",
+        bind_without_live_tunnel,
+    )
+    session_id, sibling_id = lifecycle.add_claim(sessions=2)
+    lifecycle.conversations.set_labels(
+        session_id,
+        {"omnigent.sandbox.repo": "https://github.com/example/repo.git#main"},
+    )
+    sibling_before = lifecycle.conversations.get_conversation(sibling_id)
+    assert (
+        await lifecycle_client.post(f"/v1/sessions/{session_id}/release", headers=_headers(ALICE))
+    ).status_code == 204
+
+    response = await lifecycle_client.post(
+        f"/v1/sessions/{session_id}/resume",
+        headers=_headers(ALICE),
+        json={},
+    )
+
+    assert response.status_code == 204
+    resumed = lifecycle.conversations.get_conversation(session_id)
+    sibling_after = lifecycle.conversations.get_conversation(sibling_id)
+    assert resumed is not None and resumed.host_id == HOST_ID
+    assert resumed.workspace == f"/fresh/{session_id}/repo"
+    assert sibling_after is not None and sibling_before is not None
+    assert sibling_after.host_id == sibling_before.host_id == HOST_ID
+    assert sibling_after.workspace == sibling_before.workspace
+    release_calls = [
+        call
+        for call in lifecycle.calls
+        if call[1].endswith("/workspaces")
+        and isinstance(call[2], dict)
+        and call[2].get("action") == "release"
+    ]
+    assert release_calls[0][2] == {
+        "action": "release",
+        "lease_id": LEASE,
+        "session_id": session_id,
+    }
+    workspace_calls = [
+        call
+        for call in lifecycle.calls
+        if call[1].endswith("/workspaces")
+        and isinstance(call[2], dict)
+        and call[2].get("action") != "release"
+    ]
+    assert len(workspace_calls) == 1
+    assert workspace_calls[0][2] == {
+        "lease_id": LEASE,
+        "session_id": session_id,
+        "repo_url": "https://github.com/example/repo.git",
+        "repo_branch": "main",
+        "repo_name": "repo",
+        "workspace_protocol_version": 2,
+    }
+
+
+async def test_resume_adoption_clone_failure_preserves_sibling_and_detached_session(
+    lifecycle_client: httpx.AsyncClient,
+    lifecycle: LifecycleHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.stores.host_store.host_is_live", lambda _host: True)
+    session_id, sibling_id = lifecycle.add_claim(sessions=2)
+    lifecycle.conversations.set_labels(
+        session_id,
+        {"omnigent.sandbox.repo": "https://github.com/example/private.git#main"},
+    )
+    assert (
+        await lifecycle_client.post(f"/v1/sessions/{session_id}/release", headers=_headers(ALICE))
+    ).status_code == 204
+    sibling_before = lifecycle.conversations.get_conversation(sibling_id)
+    lifecycle.fail_workspace = True
+
+    response = await lifecycle_client.post(
+        f"/v1/sessions/{session_id}/resume",
+        headers=_headers(ALICE),
+        json={},
+    )
+
+    assert response.status_code == 503
+    for secret in (APP_ID, LEASE, HOST_ID, "private-app", "alice", "token"):
+        assert secret not in response.text
+    detached = lifecycle.conversations.get_conversation(session_id)
+    sibling_after = lifecycle.conversations.get_conversation(sibling_id)
+    assert detached is not None and detached.detached_at is not None and detached.host_id is None
+    assert sibling_after is not None and sibling_before is not None
+    assert sibling_after.host_id == sibling_before.host_id == HOST_ID
+    assert sibling_after.workspace == sibling_before.workspace
+    assert lifecycle.hosts.get_host(HOST_ID) is not None
 
 
 async def test_resume_failure_leaves_session_detached_and_redacts_provider_error(

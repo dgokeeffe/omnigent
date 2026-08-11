@@ -44,6 +44,7 @@ import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.databricks_model_discovery import preferred_served_claude_model
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
 from omnigent.model_fallbacks import StaticModelFallback, static_model_fallback
@@ -313,6 +314,10 @@ def clear_model_catalog_cache() -> None:
         _listing_cache.clear()
 
 
+#: Family token :func:`model_family_token` assigns to Claude ids.
+_CLAUDE_FAMILY = "claude"
+
+
 def model_family_token(model_id: str) -> str:
     """Tag a model id with the harness family that can serve it.
 
@@ -388,7 +393,13 @@ def resolve_catalog_model(
     """Resolve a model from the live bundled provider catalog.
 
     Default intent preserves the onboarding provider's general-purpose model
-    policy after family and gateway-routing constraints are applied. Other
+    policy after family and gateway-routing constraints are applied. The one
+    exception is the Databricks ``"claude"`` family, where the Claude tier order
+    (:data:`~omnigent.databricks_model_discovery.CLAUDE_MODEL_FAMILIES`) ranks
+    ahead of release date, so a gateway default lands on the newest
+    flagship-tier id instead of whichever tier shipped last. That only holds on
+    the gateway: a vendor-direct key may not be entitled to the flagship tier,
+    so ``anthropic`` keeps the provider's broadly-accessible tier policy. Other
     intents continue to rank all compatible catalog candidates by metadata.
 
     :param provider_name: MLflow catalog provider name.
@@ -404,19 +415,23 @@ def resolve_catalog_model(
     from omnigent.onboarding.providers import default_chat_model
 
     models = list(catalog_model_entries(provider_name))
-    if provider_name.lower() == "databricks":
+    is_databricks = provider_name.lower() == "databricks"
+    if is_databricks:
         models = [model for model in models if model.id.lower().startswith("databricks-")]
 
     if configured_default is None and intent == ModelIntent.DEFAULT:
         compatible_ids = {model.id for model in models if family is None or model.family == family}
-        preferred_default = default_chat_model(
-            provider_name,
-            allowed_models=compatible_ids,
-        )
-        if preferred_default is not None and (
-            family is None or model_family_token(preferred_default) == family
-        ):
-            configured_default = preferred_default
+        if is_databricks and family == _CLAUDE_FAMILY:
+            configured_default = preferred_served_claude_model(compatible_ids)
+        if configured_default is None:
+            preferred_default = default_chat_model(
+                provider_name,
+                allowed_models=compatible_ids,
+            )
+            if preferred_default is not None and (
+                family is None or model_family_token(preferred_default) == family
+            ):
+                configured_default = preferred_default
 
     if configured_default is not None and all(model.id != configured_default for model in models):
         models.insert(

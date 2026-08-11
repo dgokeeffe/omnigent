@@ -310,3 +310,31 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
             transport=httpx.MockTransport(_handler),
         )
     assert families == {"opus": "system.ai.claude-opus-5"}
+
+
+def test_served_fallback_follows_the_flagship_first_tier_order() -> None:
+    """Tier order is opus → sonnet → haiku → fable, newest generation per tier.
+
+    This order is what makes a gateway default land on the flagship tier, and
+    it keeps the opt-in Fable tier from ever being chosen for a caller that
+    asked for no particular tier.
+    """
+    from omnigent.databricks_model_discovery import preferred_served_claude_model
+
+    served = [
+        "system.ai.claude-fable-9",
+        "system.ai.claude-haiku-9",
+        "system.ai.claude-sonnet-9",
+        "system.ai.claude-opus-4-10",
+        "system.ai.claude-opus-5",
+    ]
+
+    assert preferred_served_claude_model(served) == "system.ai.claude-opus-5"
+    # An explicit ask still wins over the standing order.
+    assert preferred_served_claude_model(served, preferred_family="haiku") == (
+        "system.ai.claude-haiku-9"
+    )
+    # Each tier hands off to the next one the workspace actually serves.
+    assert preferred_served_claude_model(["system.ai.claude-fable-9"]) == (
+        "system.ai.claude-fable-9"
+    )

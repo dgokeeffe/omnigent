@@ -351,6 +351,29 @@ def test_assert_compute_size_accepts_a_matching_app(deploy_mod: ModuleType) -> N
     deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")
 
 
+def test_bundle_vars_pass_an_xlarge_compute_size(
+    deploy_mod: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """XLARGE is a real Apps size, so the CLI must accept and forward it."""
+    args = _parse(deploy_mod, monkeypatch, "--compute-size", "XLARGE")
+    assert "compute_size=XLARGE" in deploy_mod._bundle_vars(args)
+
+
+def test_assert_compute_size_reads_a_plain_string_size(deploy_mod: ModuleType) -> None:
+    """A size the installed SDK's enum lacks arrives as a str, not an enum.
+
+    databricks-sdk is pinned by floor only and the API keeps adding sizes, so an
+    older SDK returns the raw value. Assuming ``.value`` there would crash the
+    very check that catches a silently downsized app.
+    """
+    from types import SimpleNamespace
+
+    wc = SimpleNamespace(apps=SimpleNamespace(get=lambda name: SimpleNamespace(compute_size="XLARGE")))
+    deploy_mod.assert_compute_size(wc, "omnigent", "XLARGE")
+    with pytest.raises(SystemExit, match="XLARGE"):
+        deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")
+
+
 def test_assert_direct_engine_accepts_the_committed_bundle(deploy_mod: ModuleType) -> None:
     deploy_mod.assert_direct_engine(_BUNDLE_YML)
 

@@ -13,6 +13,7 @@ Covers the pieces that silently mis-deploy rather than crash:
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -372,6 +373,43 @@ def test_assert_compute_size_reads_a_plain_string_size(deploy_mod: ModuleType) -
     deploy_mod.assert_compute_size(wc, "omnigent", "XLARGE")
     with pytest.raises(SystemExit, match="XLARGE"):
         deploy_mod.assert_compute_size(wc, "omnigent", "LARGE")
+
+
+_POOL_SCRIPT = _BUNDLE_YML.parent / "deploy_with_coda_pool.sh"
+
+
+def test_pool_wrapper_is_executable_and_parses() -> None:
+    """The committed pool wrapper must be runnable and syntactically valid."""
+    import os
+    import subprocess
+
+    assert _POOL_SCRIPT.is_file()
+    assert os.access(_POOL_SCRIPT, os.X_OK), "deploy_with_coda_pool.sh must be executable"
+    subprocess.run(["bash", "-n", str(_POOL_SCRIPT)], check=True)
+
+
+def test_pool_wrapper_hardcodes_no_workspace_identity() -> None:
+    """A committed workspace value silently deploys somewhere unintended.
+
+    The wrapper resolves the workspace host, every CoDA App URL, and the public
+    callback URL at run time. A literal host, workspace id, or App URL added here
+    would be trusted with no probe — and on a fork it also publishes a customer's
+    workspace identity.
+    """
+    text = _POOL_SCRIPT.read_text()
+    for pattern, why in (
+        (r"adb-\d+", "a workspace host"),
+        (r"\bdbc-[0-9a-f-]+", "a workspace host"),
+        (r"\d{10,}", "a workspace id"),
+        (r"[a-z0-9-]+\.databricksapps\.com", "an App URL"),
+        (r"azuredatabricks\.net|cloud\.databricks\.com|gcp\.databricks\.com", "a workspace host"),
+    ):
+        assert re.search(pattern, text) is None, f"{_POOL_SCRIPT.name} hardcodes {why}"
+
+
+def test_pool_wrapper_pins_the_tracer_off_target() -> None:
+    """Managed CoDA deploys must use --no-otel; the pool is not OTel-agnostic."""
+    assert "--no-otel" in _POOL_SCRIPT.read_text()
 
 
 def test_assert_direct_engine_accepts_the_committed_bundle(deploy_mod: ModuleType) -> None:

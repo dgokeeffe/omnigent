@@ -111,6 +111,49 @@ def _all_claude_models(model_ids: list[str], *, marker: str) -> tuple[str, ...]:
     return tuple(sorted(claude_ids, key=_natural_model_key, reverse=True))
 
 
+def claude_family_of(model_id: str) -> str | None:
+    """Return the Claude family a catalog id belongs to, in either spelling.
+
+    :param model_id: Catalog id, e.g. ``"system.ai.claude-opus-5"`` or
+        ``"databricks-claude-fable-5"``.
+    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``, or
+        ``None`` when the id names no Claude family.
+    """
+    return _claude_family_of(model_id, marker="claude-")
+
+
+def preferred_served_claude_model(
+    served_ids: Iterable[str],
+    *,
+    preferred_family: str | None = None,
+) -> str | None:
+    """Pick the newest Claude id a workspace actually serves.
+
+    A release-curated or bundled-catalog default can name a model this
+    workspace does not serve (its endpoint was never enabled here), and
+    launching that id fails with a gateway 404 that looks like a broken
+    harness. Callers use this to land on a served id instead, preferring the
+    tier the unavailable default asked for and then the standard alias tiers
+    (``fable`` → ``opus`` → ``sonnet`` → ``haiku``).
+
+    :param served_ids: Ids the workspace was observed to serve, in either
+        catalog spelling.
+    :param preferred_family: Family the caller wanted, e.g. ``"fable"``.
+    :returns: The chosen served id, or ``None`` when none names a Claude
+        family (the caller must keep its own value rather than guess).
+    """
+    claude_ids = [
+        model_id for model_id in served_ids if _claude_family_of(model_id, marker="claude-")
+    ]
+    if not claude_ids:
+        return None
+    newest_by_family = _models_by_claude_family(claude_ids, marker="claude-")
+    for family in (preferred_family, *CLAUDE_MODEL_FAMILIES):
+        if family is not None and family in newest_by_family:
+            return newest_by_family[family]
+    return max(claude_ids, key=_natural_model_key)
+
+
 def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,

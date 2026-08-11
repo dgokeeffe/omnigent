@@ -1508,3 +1508,103 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
 
     assert renders == 1
+
+
+def _live_claude_only(monkeypatch: pytest.MonkeyPatch, served: list[str]) -> None:
+    """Point the resolver at a workspace serving exactly *served* Claude ids."""
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
+    )
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda *_: ([{"id": model_id, "input": ["text", "image"]} for model_id in served], [], [], []),
+    )
+
+
+def test_unserved_catalog_default_falls_back_to_served_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A curated default the workspace never enabled must not be rendered.
+
+    Regression: the bundled catalog resolved ``databricks-claude-fable-5`` on a
+    workspace serving only ``system.ai.claude-*``, so every Pi turn died with
+    an opaque gateway ``404`` instead of running on a served model.
+    """
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id="databricks-claude-fable-5"
+        ),
+    )
+    _live_claude_only(
+        monkeypatch,
+        ["system.ai.claude-opus-5", "system.ai.claude-sonnet-4-6", "system.ai.claude-opus-4-8"],
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    # fable is unserved → next alias tier (opus), newest generation of it.
+    assert provider.model == "system.ai.claude-opus-5"
+
+
+def test_served_catalog_default_is_used_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default the workspace serves is still normalized, never substituted."""
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id="databricks-claude-sonnet-4-6"
+        ),
+    )
+    _live_claude_only(monkeypatch, ["system.ai.claude-opus-5", "system.ai.claude-sonnet-4-6"])
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-sonnet-4-6"
+
+
+def test_explicit_model_override_is_never_substituted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit override stays verbatim even when discovery lacks it.
+
+    Silently swapping a caller's chosen model would hide a misconfiguration and
+    bill a different model than the one that was asked for.
+    """
+    _live_claude_only(monkeypatch, ["system.ai.claude-opus-5"])
+
+    provider = creds.resolve_pi_native_provider(
+        config_loader=_databricks_config, model="databricks-claude-fable-5"
+    )
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5"
+
+
+def test_discovery_failure_keeps_curated_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No live catalog → keep the curated default; do not invent a model."""
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id="databricks-claude-fable-5"
+        ),
+    )
+    _live_claude_only(monkeypatch, [])
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5"

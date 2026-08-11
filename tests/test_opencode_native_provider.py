@@ -19,6 +19,7 @@ from omnigent.opencode_native_provider import (
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
     maybe_merge_user_provider_config,
+    preferred_opencode_model,
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
@@ -523,3 +524,62 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
 
     result = maybe_merge_user_provider_config({})
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+# ── preferred_opencode_model ────────────────────────────────────────────────
+
+
+def test_preferred_opencode_model_follows_claude_tier_order() -> None:
+    """The default tracks the shared tier order, newest generation per tier.
+
+    Without this, an unconfigured ``omni opencode`` launches on OpenCode's own
+    built-in default, which has nothing to do with the model the rest of
+    Omnigent routes to.
+    """
+    listed = [
+        "databricks-anthropic/system.ai.claude-sonnet-4-6",
+        "databricks-anthropic/system.ai.claude-haiku-4-5",
+        "databricks-anthropic/system.ai.claude-opus-4-8",
+        "databricks-anthropic/system.ai.claude-opus-5",
+        "opencode/big-pickle",
+    ]
+
+    assert preferred_opencode_model(listed) == ("databricks-anthropic/system.ai.claude-opus-5")
+
+
+def test_preferred_opencode_model_ignores_unqualified_ids() -> None:
+    """A bare model id has no provider prefix, so OpenCode could not route it."""
+    assert preferred_opencode_model(["system.ai.claude-opus-5"]) is None
+
+
+def test_preferred_opencode_model_none_without_a_claude_model() -> None:
+    """No Claude id listed → leave OpenCode on its own default, don't guess."""
+    assert preferred_opencode_model(["openai/gpt-5.5", "opencode/big-pickle"]) is None
+
+
+def test_preferred_opencode_model_prefers_a_reachable_provider() -> None:
+    """Between two providers serving the tier, pick one with credentials."""
+    listed = [
+        "unauthed-gateway/system.ai.claude-opus-5",
+        "databricks-anthropic/system.ai.claude-opus-4-8",
+    ]
+
+    assert (
+        preferred_opencode_model(listed, reachable_providers={"databricks-anthropic"})
+        == "databricks-anthropic/system.ai.claude-opus-4-8"
+    )
+
+
+def test_preferred_opencode_model_keeps_listing_when_no_provider_is_reachable() -> None:
+    """An empty reachability set must not veto ids OpenCode itself listed.
+
+    ``reachable_provider_ids`` only knows a curated set of provider env vars and
+    ``auth.json`` keys, so it can miss a provider configured purely in the
+    user's own ``opencode.json`` — dropping the filter avoids regressing those
+    setups to no default at all.
+    """
+    listed = ["custom-gateway/system.ai.claude-opus-5"]
+
+    assert preferred_opencode_model(listed, reachable_providers=frozenset()) == (
+        "custom-gateway/system.ai.claude-opus-5"
+    )

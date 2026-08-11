@@ -23,12 +23,13 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent import model_catalog
+from omnigent.databricks_model_discovery import claude_family_of, preferred_served_claude_model
 
 if TYPE_CHECKING:
     from omnigent.spec.types import MCPServerConfig
@@ -65,6 +66,46 @@ class OpenCodeGatewayResolution:
     def qualified_model(self) -> str:
         """:returns: The per-prompt ``provider/model`` id opencode expects."""
         return f"{self.provider_id}/{self.model_id}"
+
+
+def preferred_opencode_model(
+    available: Iterable[str],
+    *,
+    reachable_providers: Collection[str] | None = None,
+) -> str | None:
+    """Pick the default model from the ``provider/model`` ids OpenCode listed.
+
+    Without a configured default, OpenCode falls back to its own built-in pick
+    (``opencode/big-pickle``) or whatever the user's global config happens to
+    name, which is unrelated to the model the rest of Omnigent routes to. This
+    applies the shared Claude tier order
+    (:data:`~omnigent.databricks_model_discovery.CLAUDE_MODEL_FAMILIES`) to
+    OpenCode's own listing, so the default tracks discovery the way pi's does:
+    newest flagship-tier Claude id, and no hardcoded model id anywhere.
+
+    Selecting from the listing is what makes the result routable — every id
+    OpenCode lists is one its configured providers + credentials can serve.
+
+    :param available: ``provider/model`` ids, e.g. from
+        :func:`~omnigent.onboarding.opencode_auth.list_opencode_models`.
+        Unqualified ids are ignored: OpenCode resolves the provider from the
+        prefix, so a bare model id would not route.
+    :param reachable_providers: Optional provider ids with credentials. When it
+        excludes every listed Claude id the filter is dropped rather than
+        returning nothing, since the listing itself already implies reachability.
+    :returns: A ``provider/model`` id, or ``None`` when the listing names no
+        Claude model (the caller then leaves OpenCode on its own default).
+    """
+    qualified = [entry for entry in available if "/" in entry]
+    claude = [entry for entry in qualified if claude_family_of(entry.split("/", 1)[1]) is not None]
+    if reachable_providers is not None:
+        scoped = [entry for entry in claude if entry.split("/", 1)[0] in reachable_providers]
+        claude = scoped or claude
+    if not claude:
+        return None
+    by_model_id = {entry.split("/", 1)[1]: entry for entry in claude}
+    preferred = preferred_served_claude_model(by_model_id)
+    return by_model_id[preferred] if preferred is not None else None
 
 
 def build_opencode_model_default_config(model: str) -> dict[str, object]:

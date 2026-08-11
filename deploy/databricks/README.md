@@ -134,25 +134,59 @@ uv run python deploy/databricks/deploy.py \
     --volume-name main.omnigent.artifacts
 ```
 
-To enable the managed CoDA provider, pass all three deployment-specific values
-together (partial configuration fails fast):
+To enable a managed CoDA pool, repeat `--coda-app` as
+`IMMUTABLE_APP_ID,DATABRICKS_APP_NAME,APP_URL`. The ID is persisted in managed
+host identity: never reuse or change it while a host can reference it. Pool
+configuration is non-secret and URL-safe-base64 encoded only to cross the
+Databricks bundle variable parser. This deployment must use the tracer-off
+target (`--no-otel`):
 
 ```bash
 uv run python deploy/databricks/deploy.py \
+    --no-otel \
     --app-name omnigent \
     --profile <your-profile> \
     --lakebase-branch projects/omnigent/branches/production \
     --lakebase-database projects/omnigent/branches/production/databases/databricks-postgres \
     --volume-name main.omnigent.artifacts \
-    --coda-app-name coda-main \
-    --coda-app-url https://<coda-app>.databricksapps.com \
+    --coda-app stable-a,coda-one,https://<coda-one>.databricksapps.com \
+    --coda-app stable-b,coda-two,https://<coda-two>.databricksapps.com \
     --omnigent-public-server-url https://<omnigent-app>.databricksapps.com
 ```
 
-The Omnigent app service principal needs `CAN_USE` on the CoDA app, and the
-CoDA app service principal needs `CAN_USE` on Omnigent. Configure the CoDA app's
-wheel, server URL, and server-client-ID resources with its
-`grant_omnigent_host.sh` and `attach_omnigent_resources.sh` helpers.
+Legacy `--coda-app-name` plus `--coda-app-url` remains a one-App pool. It cannot
+be combined with `--coda-app`; partial configuration fails fast.
+
+With a multi-App pool, New Session keeps **CoDA Sandbox (Automatic)** as the
+default and also offers stable `CoDA-Sandbox-N` manual targets. Labels are based
+on configured order, not mutable App names. The authenticated picker exposes
+only sanitized ownership/capacity state. A manual create is fenced to the chosen
+immutable ID and never spills to another App; reconnect, workspace allocation,
+relaunch, and cleanup continue using the persisted granting ID.
+
+For rollback, first remove sessions using added Apps and verify their managed
+host rows/leases are gone. Then revert the UI (which simply returns users to the
+automatic row) and remove pool entries only after no `coda:<app_id>#...` fence
+references them. Restoring a removed entry is the safe recovery for cleanup;
+never rename/reuse an ID or point it at a different App.
+
+For **every** pool member, grant the Omnigent App service principal `CAN_USE` on
+the CoDA App, and grant that CoDA App's service principal `CAN_USE` on Omnigent.
+Configure each CoDA App's wheel, server URL, and server-client-ID resources with
+its `grant_omnigent_host.sh` and `attach_omnigent_resources.sh` helpers. Verify
+both directions before launch. A 409 from the lease endpoint is authoritative
+capacity and spills only a new acquisition; readiness/auth/malformed failures
+are not capacity. Sessions sharing an App may share its storage, while different
+Apps are strict storage and lease boundaries. Size each App's
+`max_sessions_per_lease` for that shared host's runner/browser limits.
+
+Rollback safely by first stopping new acquisitions, deleting sessions through
+their persisted App IDs, and proving every added App has zero active lease and
+runner state. Then redeploy the prior deployment ID/config using `--no-otel`.
+Never remove an App ID while a persisted host references it and never point an
+old ID at a different App. Diagnostics log sanitized App IDs and rejection
+categories; App URLs, credentials, and lease tokens must not be copied into
+incident reports.
 
 The script builds wheels, classifies them by size, copies wheels into
 `src/`, copies the built SPA into `src/web-ui/`, regenerates
@@ -251,8 +285,9 @@ Environment variables read by `src/app.py`:
 | `AP_ARTIFACT_VOLUME_PATH` | app resource `valueFrom: artifact_volume` | UC Volume path for artifacts |
 | `DATABRICKS_APP_PORT` | Databricks runtime | App port (default 8000) |
 | `AP_POOL_RECYCLE_SECONDS` | Optional | Connection pool recycle interval (default 300) |
-| `CODA_APP_NAME` | Bundle variable | Managed CoDA Databricks App name |
-| `CODA_APP_URL` | Bundle variable | Managed CoDA Databricks App URL |
+| `CODA_POOL_B64` | Bundle variable | URL-safe-base64 JSON pool bindings (non-secret) |
+| `CODA_APP_NAME` | Bundle variable | Legacy single managed CoDA App name |
+| `CODA_APP_URL` | Bundle variable | Legacy single managed CoDA App URL |
 | `OMNIGENT_PUBLIC_SERVER_URL` | Bundle variable | Public URL CoDA runners use to reach Omnigent |
 
 ## Multi-app safety — one bundle, many apps

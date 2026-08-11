@@ -124,6 +124,34 @@ interface HostsResponse {
   hosts: Host[];
 }
 
+/** Sanitized manual CoDA target returned by the authenticated server API. */
+export interface CodaSandboxOption {
+  app_id: string;
+  label: string;
+  ownership: "unclaimed" | "mine" | "other";
+  state: "available" | "full" | "unavailable";
+  capacity: { used: number | null; limit: number };
+}
+
+async function fetchCodaSandboxes(): Promise<CodaSandboxOption[]> {
+  const res = await authenticatedFetch("/v1/sandboxes/coda");
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const body = (await res.json()) as { sandboxes?: CodaSandboxOption[] };
+  return body.sandboxes ?? [];
+}
+
+/** Fresh advisory choices; authoritative capacity is enforced on create. */
+export function useCodaSandboxes(enabled: boolean) {
+  return useQuery({
+    queryKey: ["coda-sandboxes"],
+    queryFn: fetchCodaSandboxes,
+    enabled,
+    staleTime: 10_000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+}
+
 async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);

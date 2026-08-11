@@ -232,28 +232,17 @@ try:
         runner_secret = hashlib.sha256(f"omnigent-runner:{app_client_secret}".encode()).hexdigest()
         os.environ.setdefault("OMNIGENT_RUNNER_TOKEN_SECRET", runner_secret)
     auth_provider = create_auth_provider()
+    from coda_config import managed_coda_raw_config
+
     sandbox_config = None
-    coda_app_name = os.environ.get("CODA_APP_NAME", "").strip()
-    coda_app_url = os.environ.get("CODA_APP_URL", "").strip()
-    public_server_url = os.environ.get("OMNIGENT_PUBLIC_SERVER_URL", "").strip()
-    coda_values = {
-        "CODA_APP_NAME": coda_app_name,
-        "CODA_APP_URL": coda_app_url,
-        "OMNIGENT_PUBLIC_SERVER_URL": public_server_url,
-    }
-    if any(coda_values.values()) and not all(coda_values.values()):
-        missing = ", ".join(name for name, value in coda_values.items() if not value)
-        raise RuntimeError(f"partial managed CoDA configuration; missing: {missing}")
-    if all(coda_values.values()):
+    coda_raw = managed_coda_raw_config(os.environ)
+    if coda_raw is not None:
         from omnigent.server.managed_hosts import parse_sandbox_config
 
-        sandbox_config = parse_sandbox_config(
-            {
-                "provider": "coda",
-                "server_url": public_server_url,
-                "coda": {"app_name": coda_app_name, "app_url": coda_app_url},
-            }
-        )
+        sandbox_config = parse_sandbox_config(coda_raw)
+        provider = sandbox_config.launcher_factory()
+        app_ids = getattr(provider, "app_ids", ())
+        logger.info("Configured managed CoDA pool app_ids=%s", ",".join(app_ids))
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,

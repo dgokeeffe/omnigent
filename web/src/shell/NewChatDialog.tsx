@@ -143,6 +143,7 @@ import {
 import {
   hostCapacityLabel,
   isHostAtCapacity,
+  useCodaSandboxes,
   useHostModelOptions,
   useHosts,
   type Host,
@@ -1840,6 +1841,7 @@ interface LandingDraft {
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
+  selectedSandboxAppId: string | null;
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
@@ -1965,6 +1967,9 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const codaPickerEnabled =
+    managedSandboxesEnabled && info !== "loading" && info.sandbox_provider === "coda";
+  const { data: codaSandboxes = [] } = useCodaSandboxes(codaPickerEnabled);
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Which router can answer a pick. The external AI-Gateway router only covers
   // a family the host runs through the gateway; the built-in judge covers any
@@ -2017,6 +2022,11 @@ export function NewChatLandingScreen() {
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => landingDraft?.sandboxSelected ?? false,
+  );
+  // null preserves the automatic MVP pool behavior; a value is an immutable,
+  // explicitly selected App fence sent to the authenticated create API.
+  const [selectedSandboxAppId, setSelectedSandboxAppId] = useState<string | null>(
+    () => landingDraft?.selectedSandboxAppId ?? null,
   );
   const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
     selectedHostId,
@@ -2185,6 +2195,7 @@ export function NewChatLandingScreen() {
     pickedAgentId,
     selectedHostId,
     sandboxSelected,
+    selectedSandboxAppId,
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
@@ -3280,10 +3291,18 @@ export function NewChatLandingScreen() {
     textareaRef,
   });
 
+  const selectedCodaSandbox = codaSandboxes.find(
+    (option) => option.app_id === selectedSandboxAppId,
+  );
+  const sandboxTargetAvailable =
+    selectedSandboxAppId === null || selectedCodaSandbox?.state === "available";
+
   const canSubmit =
     message.trim().length > 0 &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
+    (sandboxSelected
+      ? sandboxRepoValid && sandboxTargetAvailable
+      : !!selectedHostId && workspaceValid) &&
     !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
@@ -3292,13 +3311,15 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : sandboxSelected && !sandboxRepoValid
-      ? "Please enter a valid repository URL"
-      : !sandboxSelected && (!selectedHostId || !workspaceValid)
-        ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+    : sandboxSelected && !sandboxTargetAvailable
+      ? "The selected CoDA sandbox is full or unavailable"
+      : sandboxSelected && !sandboxRepoValid
+        ? "Please enter a valid repository URL"
+        : !sandboxSelected && (!selectedHostId || !workspaceValid)
+          ? "Please choose a host and working directory"
+          : message.trim().length === 0
+            ? "Enter a message to get started"
+            : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
@@ -3310,7 +3331,7 @@ export function NewChatLandingScreen() {
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
-      ? sandboxLabel
+      ? (selectedCodaSandbox?.label ?? sandboxLabel)
       : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
@@ -3412,6 +3433,7 @@ export function NewChatLandingScreen() {
     // one they're most likely to click in the menu.
     if (hostId === selectedHostId) return;
     setSandboxSelected(false);
+    setSelectedSandboxAppId(null);
     setSelectedHostId(hostId);
     // Workspace is host-specific — clear it and let the seeding effect run for
     // the new host.
@@ -3419,12 +3441,13 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
   }
 
-  function selectSandbox() {
+  function selectSandbox(appId: string | null = null) {
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit.
     writeLastHostChoice(SANDBOX_HOST_CHOICE);
-    if (sandboxSelected) return;
+    if (sandboxSelected && selectedSandboxAppId === appId) return;
+    setSelectedSandboxAppId(appId);
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
     setSandboxSelected(true);
@@ -3615,6 +3638,7 @@ export function NewChatLandingScreen() {
             ...(sandboxSelected
               ? {
                   host_type: "managed",
+                  ...(selectedSandboxAppId ? { sandbox_app_id: selectedSandboxAppId } : {}),
                   workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
                 }
               : {
@@ -4299,17 +4323,57 @@ export function NewChatLandingScreen() {
                   {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
                     <>
                       {managedSandboxesEnabled ? (
-                        <DropdownMenuItem
-                          onSelect={selectSandbox}
-                          data-testid="new-chat-landing-sandbox-option"
-                          data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                        >
-                          <span className="flex items-center gap-2">
-                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxLabel}</span>
-                          </span>
-                        </DropdownMenuItem>
+                        <>
+                          <DropdownMenuItem
+                            onSelect={() => selectSandbox(null)}
+                            data-testid="new-chat-landing-sandbox-option"
+                            data-active={
+                              sandboxSelected && selectedSandboxAppId === null ? "true" : undefined
+                            }
+                            className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                          >
+                            <span className="flex items-center gap-2">
+                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                              <span className="text-sm">
+                                {codaPickerEnabled ? "CoDA Sandbox (Automatic)" : sandboxLabel}
+                              </span>
+                            </span>
+                          </DropdownMenuItem>
+                          {codaSandboxes.map((option) => {
+                            const used = option.capacity.used;
+                            const capacity =
+                              used === null
+                                ? `${option.capacity.limit} session capacity`
+                                : `${used}/${option.capacity.limit} sessions`;
+                            const ownership =
+                              option.ownership === "mine"
+                                ? "Yours"
+                                : option.ownership === "other"
+                                  ? "In use"
+                                  : "Unclaimed";
+                            return (
+                              <DropdownMenuItem
+                                key={option.app_id}
+                                onSelect={() => selectSandbox(option.app_id)}
+                                disabled={option.state !== "available"}
+                                data-testid={`new-chat-landing-coda-${option.app_id}`}
+                                data-active={
+                                  sandboxSelected && selectedSandboxAppId === option.app_id
+                                    ? "true"
+                                    : undefined
+                                }
+                                className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                              >
+                                <span className="flex w-full items-center justify-between gap-4">
+                                  <span>{option.label}</span>
+                                  <span className="text-xs text-muted-foreground">
+                                    {ownership} · {option.state} · {capacity}
+                                  </span>
+                                </span>
+                              </DropdownMenuItem>
+                            );
+                          })}
+                        </>
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"

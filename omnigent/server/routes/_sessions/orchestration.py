@@ -2579,6 +2579,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    coda_app_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
 ) -> None:
@@ -2662,6 +2663,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        coda_app_id=coda_app_id,
         agent_name=agent_name,
     )
     if managed is None:

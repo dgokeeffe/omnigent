@@ -4439,6 +4439,7 @@ async def _provision_managed_sandbox(
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    coda_app_id: str | None = None,
     agent_name: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
@@ -4492,6 +4493,7 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
+            coda_app_id=coda_app_id,
             agent_name=agent_name,
             on_stage=_on_stage,
         )

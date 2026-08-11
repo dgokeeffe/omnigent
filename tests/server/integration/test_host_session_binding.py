@@ -549,6 +549,24 @@ async def test_coda_two_sessions_adopt_one_host(
         max_sessions_per_lease=10,
     )
     agent = await create_test_agent(env.client, name="coda-adoption-agent")
+    before_removed = {
+        session.id for session in env.conv_store.list_conversations(limit=100, kind=None).data
+    }
+    removed = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_app_id": "removed-app",
+        },
+    )
+    assert removed.status_code == 409
+    assert "removed or unknown app_id" in removed.text
+    after_removed = {
+        session.id for session in env.conv_store.list_conversations(limit=100, kind=None).data
+    }
+    assert after_removed == before_removed
+
     first_resp = await env.client.post(
         "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
     )
@@ -582,7 +600,12 @@ async def test_coda_two_sessions_adopt_one_host(
 
     responder = asyncio.create_task(answer_next_launch())
     second_resp = await env.client.post(
-        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_app_id": "coda-main",
+        },
     )
     await responder
     second = env.conv_store.get_conversation(second_resp.json()["id"])

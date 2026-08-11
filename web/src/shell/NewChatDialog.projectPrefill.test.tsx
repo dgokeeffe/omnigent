@@ -42,6 +42,9 @@ vi.mock("@/store/chatStore", () => ({
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useCodaSandboxes: vi.fn(() => ({ data: [] })),
+  isHostAtCapacity: vi.fn(() => false),
+  hostCapacityLabel: vi.fn(() => "capacity unknown"),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),

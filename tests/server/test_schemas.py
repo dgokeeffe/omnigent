@@ -680,6 +680,22 @@ def test_session_create_host_type_defaults_external() -> None:
     assert req.host_type == "external"
 
 
+def test_manual_sandbox_app_id_requires_managed_host_type() -> None:
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="sandbox_app_id requires host_type 'managed'"):
+        SessionCreateRequest(agent_id="ag_x", sandbox_app_id="app-a")
+
+
+def test_manual_sandbox_app_id_is_preserved_for_managed_create() -> None:
+    from omnigent.server.schemas import SessionCreateRequest
+
+    request = SessionCreateRequest(
+        agent_id="ag_x", host_type="managed", sandbox_app_id="stable-app-a"
+    )
+    assert request.sandbox_app_id == "stable-app-a"
+
+
 def test_session_create_managed_rejects_host_id() -> None:
     """
     ``host_type="managed"`` + caller-supplied ``host_id`` is a

@@ -1371,6 +1371,7 @@ class SessionCreateRequest(BaseModel):
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
+    sandbox_app_id: str | None = Field(default=None, min_length=1, max_length=64)
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -1438,6 +1439,8 @@ class SessionCreateRequest(BaseModel):
                         "host_type 'managed' takes a git repository URL "
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
+        elif self.sandbox_app_id is not None:
+            raise ValueError("sandbox_app_id requires host_type 'managed'")
         elif self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "

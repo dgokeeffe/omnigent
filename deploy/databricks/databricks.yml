@@ -30,12 +30,15 @@ variables:
       UC schema (catalog.schema) holding the OTel destination tables.
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
+  coda_pool_b64:
+    description: "Optional URL-safe base64 JSON array of immutable-id CoDA bindings (non-secret)."
+    default: "__UNSET__"
   coda_app_name:
-    description: "Optional managed CoDA Databricks App name."
-    default: ""
+    description: "Legacy optional single managed CoDA Databricks App name."
+    default: "__UNSET__"
   coda_app_url:
     description: "Optional managed CoDA Databricks App URL."
-    default: ""
+    default: "__UNSET__"
   omnigent_public_server_url:
     description: "Public URL this Omnigent App exposes to managed CoDA hosts."
     default: ""
@@ -67,6 +70,8 @@ variables:
       # Managed CoDA wiring is part of the app's identity, not OTel plumbing,
       # so every app_env variant must carry it or managed hosts lose their
       # server/app URLs.
+      - name: CODA_POOL_B64
+        value: ${var.coda_pool_b64}
       - name: CODA_APP_NAME
         value: ${var.coda_app_name}
       - name: CODA_APP_URL
@@ -159,6 +164,8 @@ targets:
             value_from: artifact_volume
           # Same managed CoDA wiring as the tracer-on default: dropping it here
           # would silently unwire managed hosts on a --no-otel deploy.
+          - name: CODA_POOL_B64
+            value: ${var.coda_pool_b64}
           - name: CODA_APP_NAME
             value: ${var.coda_app_name}
           - name: CODA_APP_URL

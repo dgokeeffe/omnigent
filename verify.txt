@@ -1,0 +1,115 @@
+# omnigent-0hd.8 worktree evidence
+
+Recorded during the final feasibility pass; commands were run from the dedicated worktree unless an explicit `git -C` path is shown.
+
+- Dedicated implementation worktree path: `/Users/david.okeeffe/Repos/omnigent-multi-coda`
+- Branch: `feature/multi-coda-pool`
+- Exact fork/dev base SHA: `8558c8283f9b2aad2923d165398231bed1ef6a09`
+- Writable remote: `fork` → `https://github.com/dgokeeffe/omnigent.git`
+- Ancestry evidence: `git merge-base HEAD fork/dev` returned the exact base SHA; after the consolidated documentation commit, `git rev-list --left-right --count fork/dev...HEAD` returns `0 1` (0 behind, 1 ahead).
+- Handoff rule: push only to `fork`, never `origin`; do not implement from or modify the original workshop checkout.
+
+## Generated-state determination
+
+`.venv` was locally generated, not copied: its `pyvenv.cfg` identified uv 0.12.2 / CPython 3.12.9 while the original checkout's independently existing environment identified uv 0.11.17; the directories had different filesystem inode identities. The ignored dedicated-worktree `.venv` was removed.
+
+`.coverage` was not a copied worktree artifact: it is tracked in the fork/dev baseline (blob `876e657dcb634db525db993ef9263d6981519352`). A local test had rewritten its coverage SQLite contents/timestamp. The final pass restored it byte-for-byte from `fork/dev`; therefore `.coverage` does not appear in `git diff --name-status fork/dev..HEAD`. This preserves the repository baseline instead of including unrelated cleanup.
+
+No dedicated-worktree `.venv`, `node_modules`, Databricks state, cache, or deployment artifact remains.
+
+## Original checkout untouched evidence
+
+Original checkout: `/Users/david.okeeffe/Repos/omnigent`, branch `coda-managed-lease-increment1`, HEAD `f8f57a8b12effb3322511beebefaf07be8b8cc51`.
+
+Before and after this pass, `git -C /Users/david.okeeffe/Repos/omnigent status --porcelain=v1` was exactly:
+
+```
+ M uv.lock
+?? goal.md
+```
+
+Those are pre-existing changes. The original checkout is **not clean and is not claimed clean**. Its HEAD and status remained identical; no command in this pass wrote there.
+
+## Final dedicated-worktree clean-state gate
+
+After committing this evidence/design:
+
+- `git status --porcelain=v1` must print nothing.
+- `git diff --name-status fork/dev..HEAD` must list only `A designs/MULTI-CODA-POOL.md` and `A verify.txt`.
+- `.coverage` must match `fork/dev:.coverage` and must not appear in that diff.
+- `test ! -e .venv` must succeed.
+
+## Implementation source gate (2026-08-11)
+
+- Old feature HEAD: `63ffa93ce01ac70fdd9446712776a2932283699c`
+- Fetched `fork/dev`: `8558c8283f9b2aad2923d165398231bed1ef6a09`
+- `git merge --no-edit fork/dev`: exit 0, `Already up to date`; resulting HEAD remained the design commit.
+- Merge-base: exact `fork/dev` SHA; pre-implementation ancestry: 0 behind / 1 ahead.
+- The untracked task prompt was relocated to `/tmp/omnigent-multi-coda-goal.md` before editing so the source gate was clean.
+- Original workshop checkout was not touched and retained its previously recorded HEAD/status.
+
+## Deterministic MVP verification
+
+Final focused command:
+
+```
+uv run --extra dev pytest -q \
+  tests/onboarding/sandboxes/test_coda.py \
+  tests/server/test_managed_hosts.py \
+  tests/deploy/test_databricks_deploy.py \
+  tests/server/integration/test_host_session_binding.py
+```
+
+Result: exit 0, **290 passed**. Coverage includes registry validation/legacy normalization, process-shared concurrent round robin, unavailable/full/existing-owner spillover, same-App ambiguity retry/fail-closed behavior, App-fenced allocation/termination, removed IDs, strict CoDA release uncertainty, adoption, relaunch and cancellation paths, deployment CLI/bundle variables, legacy deploy flags, and `--no-otel` environment parity.
+
+Static gates:
+
+- Focused `ruff check`: exit 0 (`All checks passed`).
+- `python -m compileall` on changed Python production files: exit 0.
+- `git diff --check`: exit 0.
+- Changed-file budget: exactly 12 files total versus `fork/dev` (including this evidence, the pre-existing design, and the pure deployment bootstrap normalizer), at the maximum 12; zero migrations, API endpoints, UI files, durable scheduler state, or CoDA-repository changes.
+- `databricks bundle validate --strict --target prod-no-otel` reached auth resolution with no schema finding, then stopped because the checked-in bundle host is the intentional `https://example.databricks.com` placeholder and did not match profile `daveok`. No deployment was attempted. A real target/profile must be selected only through the live discovery gate.
+
+## Live discovery gate with authorized `daveok` profile: STOP (no deployment)
+
+After the owner explicitly authorized `daveok`, read-only discovery confirmed workspace `7405618534560628` (`https://adb-7405618534560628.8.azuredatabricks.net`) and exactly one Omnigent App named `omnigent`, plus two distinct ACTIVE CoDA Apps named `coda` and `coda-main`. Their immutable IDs are the Databricks App resource IDs `e42d6704-9009-4fa8-b824-3015cec7ed1d` and `61b68eca-7e12-43bf-b0dd-fc11988c63b9`; URLs are distinct. Omnigent has `CAN_USE` on both CoDA Apps and both CoDA service principals have `CAN_USE` on Omnigent. Active/rollback deployment IDs were recorded read-only as:
+
+- Omnigent: active `01f194c37af31534a40246df53be32f6`, rollback `01f194c0fb8613e09021e2a4f23365d1`.
+- `coda`: active `01f193f84d7a13d7a906f7c35a83727a`, rollback `01f193f7a06814ffbcb7e0f44cc5c9da`.
+- `coda-main`: active `01f194d703241ddf9805a4650e7f63d0`, rollback `01f194d0ace1182f84c351d943395bcd`.
+
+The mandatory authoritative-zero gate failed before build/sync/deployment: authenticated Omnigent APIs reported **3 non-archived idle sessions**, **2 host rows**, and **1 managed CoDA host** (offline). Direct user-token CoDA status calls returned 403 because that control endpoint accepts the configured Omnigent App service principal, so they cannot strengthen this nonzero result. Existing sessions were not deleted or repurposed. No source was staged, no App was modified, no deployment ran, and no model turn ran.
+
+## Guarded live E2E after cleanup
+
+The owner authorized cleanup. The failed first launch was diagnosed from the deployed CoDA capability: current `/api/omnigent-host/status` omits `ready`, so the implementation was corrected to treat only an explicit `ready: false` as a readiness veto. The focused CoDA tests passed 19/19, the fix was deployed with `--no-otel`, and the final active Omnigent deployment reported RUNNING/ACTIVE, `/health` 200, and exact `/api/version` `0.9.0.post1786404021`. The successful deployment ID was `01f195215c8f1f35acda6095b36738ed`; rollback remains `01f194c0fb8613e09021e2a4f23365d1`. The final full-UI artifact was version `0.9.0.post1786404021`; wheel SHA-256 values were `omnigent=bab8ba7311eb9c437f444ab5e52633f6c6c7e4b9556bc501e93fe40b05792265`, `omnigent_client=fd9b31c8be9d1f770c9c9e55e111feb2949aef3c4be927f103eecddaa9254d91`, and `omnigent_ui_sdk=36c54ac20c5500e4f193a100d3a015adbeb9f44387178aa0204a795e779bd493`. Staging had 489 files/30M and no hidden files or excluded generated directories.
+
+The deterministic live allocation then succeeded with 11 managed sessions and zero model messages: sessions 1–10 shared host `9f9a5335f07e4afe931e6ad4c6580cdf`; session 11 used host `517a5486b247437c89953c6974961844`. Sessions 2–10 received distinct `/app/python/source_code/coda-sessions/<session-id>` workspaces; the first session on each host used the host root. Omnigent logs explicitly recorded `app_id=e42d6704-9009-4fa8-b824-3015cec7ed1d` followed by `app_id=61b68eca-7e12-43bf-b0dd-fc11988c63b9`, proving App selection and spillover. Both CoDA `/health` endpoints were healthy with `active_sessions: 0` after cleanup.
+
+All 11 sessions were deleted through the Omnigent API (each HTTP 200). Final authoritative checks: Omnigent has 0 non-archived sessions, 1 unrelated external host, and 0 managed hosts; both CoDA health endpoints report healthy/0 active sessions; both CoDA `/api/sessions` endpoints return empty arrays. No CoDA source was changed. This proves deployment, selection, capacity spillover, App-local workspace paths, and cleanup.
+
+The live gate still cannot be marked fully complete: no reconnect/relaunch cycle, unique marker isolation check, or screenshot/video artifact was captured, and the public API intentionally does not project the persisted sandbox ID. `.6` therefore remains open; `.7` must not begin. The precise remaining evidence is recorded rather than inferred.
+
+## Manual CoDA selection verification
+
+The later manual-selection extension adds authenticated `GET /v1/sandboxes/coda`
+and optional managed-create `sandbox_app_id` while retaining omission as the
+original automatic round-robin path. Deterministic verification on 2026-08-11:
+
+- `pytest` over CoDA provider, managed hosts, schemas, host/session integration,
+  and host routes: **355 passed**. This includes stable labels, sanitized API
+  output, unavailable/full state, selected-App-only acquisition, removed IDs,
+  concurrent adoption, distinct session workspaces, cleanup, and relaunch
+  reacquisition on the persisted granting App.
+- Ruff on all changed Python and test modules: passed.
+- OpenAPI drift check: passed; `/v1/sandboxes/coda` is present.
+- TypeScript typecheck, oxlint, Prettier, and production Vite build: passed.
+- Focused rendered UI test for sanitized `CoDA-Sandbox-*` rows, disabled
+  full/unavailable choices, and `sandbox_app_id` create payload: passed. The
+  existing automatic managed-create test also proves the field remains omitted.
+- Secret-redaction assertions cover upstream token/authorization values and the
+  picker response excludes App names/URLs, raw owners, host/lease IDs, and tokens.
+
+No live deployment was performed for this extension. The documented rollback is
+UI-first (restores omission/automatic behavior), followed by pool-entry removal
+only after every persisted `coda:<app_id>#<lease_id>` fence is released.

@@ -355,6 +355,11 @@ class CodaProvider(SandboxHostLauncher):
             raise click.ClickException("Persisted CoDA sandbox is removed or unavailable")
         return binding, lease_id
 
+    def _cleanup_repository_workspace(self, sandbox_id: str, session_id: str) -> None:
+        """Best-effort cleanup after CoDA returned a failed repository result."""
+        with contextlib.suppress(click.ClickException):
+            self.release_workspace(sandbox_id, session_id)
+
     def start_host(
         self,
         sandbox_id: str,
@@ -409,6 +414,8 @@ class CodaProvider(SandboxHostLauncher):
         if workspace is None and repo_url is None:
             workspace = self._workspace_path
         if not isinstance(workspace, str) or not workspace.startswith("/"):
+            if repo_url is not None:
+                self._cleanup_repository_workspace(sandbox_id, session_id or "")
             raise click.ClickException(
                 "CoDA connect response did not contain an absolute workspace"
             )
@@ -416,6 +423,7 @@ class CodaProvider(SandboxHostLauncher):
             result.get("workspace_protocol_version") != CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION
             or result.get("repository_materialized") is not True
         ):
+            self._cleanup_repository_workspace(sandbox_id, session_id or "")
             raise click.ClickException(
                 "CoDA repository workspace protocol is unavailable; deploy CoDA support first"
             )
@@ -449,13 +457,14 @@ class CodaProvider(SandboxHostLauncher):
         )
         workspace = result.get("workspace")
         if not isinstance(workspace, str) or not workspace.startswith("/"):
+            if repo_url is not None:
+                self._cleanup_repository_workspace(sandbox_id, session_id)
             raise click.ClickException("CoDA did not return an absolute session workspace")
         if repo_url is not None and (
             result.get("workspace_protocol_version") != CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION
             or result.get("repository_materialized") is not True
         ):
-            with contextlib.suppress(click.ClickException):
-                self.release_workspace(sandbox_id, session_id)
+            self._cleanup_repository_workspace(sandbox_id, session_id)
             raise click.ClickException(
                 "CoDA repository workspace protocol is unavailable; deploy CoDA support first"
             )

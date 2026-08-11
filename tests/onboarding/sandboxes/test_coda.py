@@ -347,8 +347,40 @@ def test_repository_allocation_rejects_old_coda_and_recovers_same_app() -> None:
     assert [call[2].get("action") for call in controls["b"].calls] == [None, "release"]
 
 
+def test_repository_allocation_rejects_invalid_workspace_and_recovers_same_app() -> None:
+    class InvalidThenCleanup(FakeControl):
+        def __call__(self, method: str, path: str, body: object) -> dict[str, object]:
+            self.calls.append((method, path, body))
+            if isinstance(body, dict) and body.get("action") == "release":
+                return {"released": True}
+            return {
+                "workspace": "relative/session",
+                "workspace_protocol_version": 2,
+                "repository_materialized": True,
+            }
+
+    controls: dict[str, FakeControl] = {"a": FakeControl("a"), "b": InvalidThenCleanup("b")}
+    with pytest.raises(click.ClickException, match="absolute session workspace"):
+        pool_provider(controls).allocate_workspace(
+            "coda:b#lease-b",
+            "session",
+            repo_url="https://github.com/example/project.git",
+            repo_name="project",
+        )
+
+    assert controls["a"].calls == []
+    assert [call[2].get("action") for call in controls["b"].calls] == [None, "release"]
+
+
 def test_new_claim_repository_connect_requires_materialization_capability() -> None:
-    control = FakeControl()
+    class CleanupControl(FakeControl):
+        def __call__(self, method: str, path: str, body: object) -> dict[str, object]:
+            self.calls.append((method, path, body))
+            if isinstance(body, dict) and body.get("action") == "release":
+                return {"released": True}
+            return self.responses[path]
+
+    control = CleanupControl()
     control.responses["/api/omnigent-host/connect"] = {
         "workspace": "/workspace/legacy",
     }
@@ -364,10 +396,16 @@ def test_new_claim_repository_connect_requires_materialization_capability() -> N
             repo_url="https://github.com/example/project.git",
             repo_name="project",
         )
-    body = control.calls[-1][2]
+    body = next(body for _, path, body in control.calls if path.endswith("/connect"))
     assert body["session_id"] == "session"
     assert body["workspace_protocol_version"] == 2
     assert body["repo_url"] == "https://github.com/example/project.git"
+    assert control.calls[-1][1].endswith("/workspaces")
+    assert control.calls[-1][2] == {
+        "action": "release",
+        "lease_id": "lease-a",
+        "session_id": "session",
+    }
 
 
 def test_repository_connect_rejects_materialized_marker_without_workspace() -> None:

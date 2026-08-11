@@ -396,11 +396,16 @@ class CodaProvider(SandboxHostLauncher):
             "host_config": host_config,
             "lease_id": lease_id,
             "agent_name": agent_name,
+            # Sent even without a repository: it is what lets CoDA give the
+            # lease-OPENING session its own workspace. Without it the opener
+            # falls back to the App's home directory while every session that
+            # adopts the lease gets an isolated one, so the first session of a
+            # claim ran in a different (and shared) tree than its siblings.
+            "session_id": session_id,
         }
         if repo_url is not None:
             body.update(
                 {
-                    "session_id": session_id,
                     "repo_url": repo_url,
                     "repo_branch": repo_branch,
                     "repo_name": repo_name,

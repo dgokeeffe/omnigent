@@ -18,14 +18,9 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "omnigent_conversation_metadata",
-        sa.Column("detached_at", sa.Integer(), nullable=True),
-    )
-    op.add_column(
-        "omnigent_conversation_metadata",
-        sa.Column("detached_claim_host_id", Uuid16(), nullable=True),
-    )
+    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
+        batch_op.add_column(sa.Column("detached_at", sa.Integer(), nullable=True))
+        batch_op.add_column(sa.Column("detached_claim_host_id", Uuid16(), nullable=True))
     op.create_index(
         "ix_conversation_metadata_host_id",
         "omnigent_conversation_metadata",
@@ -49,5 +44,6 @@ def downgrade() -> None:
         "ix_conversation_metadata_host_id",
         table_name="omnigent_conversation_metadata",
     )
-    op.drop_column("omnigent_conversation_metadata", "detached_claim_host_id")
-    op.drop_column("omnigent_conversation_metadata", "detached_at")
+    with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
+        batch_op.drop_column("detached_claim_host_id")
+        batch_op.drop_column("detached_at")

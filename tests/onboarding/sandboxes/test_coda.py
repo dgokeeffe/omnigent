@@ -156,9 +156,7 @@ def test_manual_provision_targets_only_selected_app_without_advancing_automatic_
     automatic = provider.provision("automatic")
     assert selected.startswith("coda:b#")
     assert automatic.startswith("coda:a#")
-    assert [path for _, path, _ in controls["a"].calls].count(
-        "/api/omnigent-host/lease"
-    ) == 1
+    assert [path for _, path, _ in controls["a"].calls].count("/api/omnigent-host/lease") == 1
 
 
 def test_manual_full_or_unavailable_never_spills() -> None:
@@ -291,18 +289,127 @@ def test_lifecycle_routes_only_to_granting_app() -> None:
     provider = pool_provider(controls)
     provider.allocate_workspace("coda:b#lease-b", "session")
     provider.terminate("coda:a#lease-a")
-    assert [path for _, path, _ in controls["a"].calls] == [
-        "/api/omnigent-host/disconnect"
+    assert [path for _, path, _ in controls["a"].calls] == ["/api/omnigent-host/disconnect"]
+    assert [path for _, path, _ in controls["b"].calls] == ["/api/omnigent-host/workspaces"]
+
+
+def test_repository_allocation_forwards_validated_metadata_to_granting_app() -> None:
+    controls = {"a": FakeControl("a"), "b": FakeControl("b")}
+    controls["b"].responses["/api/omnigent-host/workspaces"] = {
+        "workspace": "/workspace/b/session/project",
+        "workspace_protocol_version": 2,
+        "repository_materialized": True,
+    }
+    workspace = pool_provider(controls).allocate_workspace(
+        "coda:b#lease-b",
+        "session",
+        repo_url="https://github.com/example/project.git",
+        repo_branch="release-1",
+        repo_name="project",
+    )
+
+    assert workspace == "/workspace/b/session/project"
+    assert controls["a"].calls == []
+    assert controls["b"].calls == [
+        (
+            "POST",
+            "/api/omnigent-host/workspaces",
+            {
+                "lease_id": "lease-b",
+                "session_id": "session",
+                "repo_url": "https://github.com/example/project.git",
+                "repo_branch": "release-1",
+                "repo_name": "project",
+                "workspace_protocol_version": 2,
+            },
+        )
     ]
-    assert [path for _, path, _ in controls["b"].calls] == [
-        "/api/omnigent-host/workspaces"
-    ]
+
+
+def test_repository_allocation_rejects_old_coda_and_recovers_same_app() -> None:
+    class OldThenCleanup(FakeControl):
+        def __call__(self, method: str, path: str, body: object) -> dict[str, object]:
+            self.calls.append((method, path, body))
+            if isinstance(body, dict) and body.get("action") == "release":
+                return {"released": True}
+            return {"workspace": "/workspace/b/session"}
+
+    controls: dict[str, FakeControl] = {"a": FakeControl("a"), "b": OldThenCleanup("b")}
+    with pytest.raises(click.ClickException, match="deploy CoDA support first"):
+        pool_provider(controls).allocate_workspace(
+            "coda:b#lease-b",
+            "session",
+            repo_url="https://github.com/example/project.git",
+            repo_name="project",
+        )
+
+    assert controls["a"].calls == []
+    assert [call[2].get("action") for call in controls["b"].calls] == [None, "release"]
+
+
+def test_new_claim_repository_connect_requires_materialization_capability() -> None:
+    control = FakeControl()
+    control.responses["/api/omnigent-host/connect"] = {
+        "workspace": "/workspace/legacy",
+    }
+    provider = launcher(control)
+    with pytest.raises(click.ClickException, match="deploy CoDA support first"):
+        provider.start_host(
+            "coda:coda-main#lease-a",
+            token="host-token",
+            host_id="host-id",
+            host_name="host-name",
+            server_url="https://server.example.com",
+            session_id="session",
+            repo_url="https://github.com/example/project.git",
+            repo_name="project",
+        )
+    body = control.calls[-1][2]
+    assert body["session_id"] == "session"
+    assert body["workspace_protocol_version"] == 2
+    assert body["repo_url"] == "https://github.com/example/project.git"
+
+
+def test_repository_connect_rejects_materialized_marker_without_workspace() -> None:
+    control = FakeControl()
+    control.responses["/api/omnigent-host/connect"] = {
+        "workspace_protocol_version": 2,
+        "repository_materialized": True,
+    }
+    with pytest.raises(click.ClickException, match="absolute workspace"):
+        launcher(control).start_host(
+            "coda:coda-main#lease-a",
+            token="host-token",
+            host_id="host-id",
+            host_name="host-name",
+            server_url="https://server.example.com",
+            session_id="session",
+            repo_url="https://github.com/example/project.git",
+            repo_name="project",
+        )
+
+
+def test_non_repository_connect_omits_repository_protocol_fields() -> None:
+    control = FakeControl()
+    provider = launcher(control)
+    provider.start_host(
+        "coda:coda-main#lease-a",
+        token="host-token",
+        host_id="host-id",
+        host_name="host-name",
+        server_url="https://server.example.com",
+        session_id="session",
+    )
+    body = control.calls[-1][2]
+    assert not any(key.startswith("repo_") for key in body)
+    assert "workspace_protocol_version" not in body
+    assert "session_id" not in body
 
 
 def test_manual_removed_app_id_fails_before_http() -> None:
     control = FakeControl("a")
     provider = pool_provider({"a": control})
-    with pytest.raises(click.ClickException, match="removed or unknown app_id"):
+    with pytest.raises(click.ClickException, match="removed or unavailable"):
         provider.provision("manual", "removed")
     assert control.calls == []
 
@@ -310,7 +417,7 @@ def test_manual_removed_app_id_fails_before_http() -> None:
 def test_removed_app_id_fails_before_http() -> None:
     control = FakeControl("a")
     provider = pool_provider({"a": control})
-    with pytest.raises(click.ClickException, match="removed or unknown app_id"):
+    with pytest.raises(click.ClickException, match="removed or unavailable"):
         provider.terminate("coda:removed#lease")
     assert control.calls == []
 

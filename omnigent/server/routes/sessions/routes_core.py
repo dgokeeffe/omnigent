@@ -299,7 +299,10 @@ def register_core_routes(
             # JSONResponse cannot serialize — every model_validator 422
             # on this route 500'd as internal_error. The human-readable
             # message survives in each entry's `msg`.
-            raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_context=False, include_input=False),
+            ) from exc
 
         # A manual CoDA target is authorized by the same authenticated creator
         # identity used for the lease owner. Validate the immutable registry id
@@ -472,7 +475,9 @@ def register_core_routes(
                             for host in hosts
                             if host.sandbox_provider == "coda"
                             and host.sandbox_id is not None
-                            and (target_prefix is None or host.sandbox_id.startswith(target_prefix))
+                            and (
+                                target_prefix is None or host.sandbox_id.startswith(target_prefix)
+                            )
                             and host_is_live(host)
                         ]
                         if candidates:
@@ -501,12 +506,24 @@ def register_core_routes(
                                     "coda sandbox config did not produce a CodaProvider",
                                     code=ErrorCode.INTERNAL_ERROR,
                                 )
+                            workspace_allocated = False
                             try:
-                                workspace = await asyncio.to_thread(
-                                    launcher.allocate_workspace,
-                                    adopted.sandbox_id,
-                                    resp.id,
-                                )
+                                if repo is None:
+                                    workspace = await asyncio.to_thread(
+                                        launcher.allocate_workspace,
+                                        adopted.sandbox_id,
+                                        resp.id,
+                                    )
+                                else:
+                                    workspace = await asyncio.to_thread(
+                                        launcher.allocate_workspace,
+                                        adopted.sandbox_id,
+                                        resp.id,
+                                        repo_url=repo.url,
+                                        repo_branch=repo.branch,
+                                        repo_name=repo.repo_name,
+                                    )
+                                workspace_allocated = True
                                 await asyncio.to_thread(
                                     conversation_store.set_host_id,
                                     resp.id,
@@ -515,8 +532,16 @@ def register_core_routes(
                                 )
                             except Exception:
                                 # Session creation is atomic from the caller's
-                                # perspective: a failed CoDA allocation must not
-                                # leave an unbound durable conversation behind.
+                                # perspective. Recover a successful allocation
+                                # if the durable bind fails; clone failures clean
+                                # their own partial contents inside CoDA.
+                                if workspace_allocated:
+                                    with contextlib.suppress(Exception):
+                                        await asyncio.to_thread(
+                                            launcher.release_workspace,
+                                            adopted.sandbox_id,
+                                            resp.id,
+                                        )
                                 await conversation_store.delete_conversation(resp.id)
                                 raise
                             resp.host_id = adopted.host_id

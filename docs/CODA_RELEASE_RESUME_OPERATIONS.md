@@ -13,6 +13,30 @@ CoDA target, reconstructs the retained repository URL/base branch into a fresh
 per-session workspace, and leaves the session detached if any step fails.
 Clients never submit host or lease IDs.
 
+## Repository reconstruction protocol
+
+Repository sessions use CoDA workspace protocol version 2. Omnigent parses the
+retained `<repository>[#<branch>]` value on the server and forwards only the
+validated credential-free URL, optional branch, and URL-derived repository
+name. The first claim carries the durable session ID on the connect request;
+adoption and Resume carry the same fields on workspace allocation. CoDA returns
+the absolute cloned repository directory, which becomes the session workspace.
+A repository response without `workspace_protocol_version: 2` and
+`repository_materialized: true` is rejected as an explicit compatibility error;
+an empty parent directory is never accepted as clone success.
+
+Private GitHub repositories require a least-privilege `GH_TOKEN` attached to the
+CoDA App through its Databricks secret resource. CoDA's credential helper reads
+that secret in-process. Never place a token in a repository URL, session label,
+request log, error, ticket, or evidence artifact.
+
+Deploy CoDA endpoint compatibility first and verify both CoDA Apps are healthy,
+then deploy Omnigent. Roll back in the reverse order: pause new repository
+creates/Resume, let in-flight allocations settle, roll back Omnigent, and leave
+CoDA v2 in place until no new Omnigent depends on it. A mixed pair must fail a
+repository request explicitly rather than silently allocating an empty
+workspace. Non-repository session creation remains backward compatible.
+
 ## Health and incident triage
 
 1. Confirm the conversation remains readable and reports `detached: true`.
@@ -27,7 +51,12 @@ Clients never submit host or lease IDs.
    owner-authorized, and below capacity. Manual Resume does not fall through to
    another App. Retry automatic acquisition or select a currently available
    target. The conversation must remain detached until binding succeeds.
-5. Never include App names/URLs, raw owner identities, host or lease IDs, tokens,
+5. If repository creation or Resume returns a clone/protocol error, verify CoDA
+   v2 is deployed first, the requested branch exists, and the App has an
+   authorized `GH_TOKEN`. CoDA removes clone-owned partial content; Omnigent
+   releases an allocation if the later durable bind fails. Do not manually
+   delete the shared claim or a sibling workspace to retry one failed session.
+6. Never include App names/URLs, raw owner identities, host or lease IDs, tokens,
    credentials, or upstream response bodies in tickets, screenshots, or logs.
 
 ## Safe rollback

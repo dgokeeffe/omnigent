@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -17,8 +18,15 @@ from omnigent.onboarding.sandboxes.base import SandboxHostLauncher
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 CODA_WORKSPACE_PATH = "/app/python/source_code"
+CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION = 2
 _SENSITIVE_ERROR_KEYS = (
-    "token", "secret", "authorization", "credential", "password", "api_key", "access_key"
+    "token",
+    "secret",
+    "authorization",
+    "credential",
+    "password",
+    "api_key",
+    "access_key",
 )
 _logger = logging.getLogger(__name__)
 
@@ -169,9 +177,7 @@ class CodaProvider(SandboxHostLauncher):
     def validate_app_id(self, app_id: str) -> None:
         """Fail closed when a manual claim names an unconfigured App."""
         if app_id not in self._registry:
-            raise click.ClickException(
-                f"CoDA sandbox targets removed or unknown app_id {app_id!r}"
-            )
+            raise click.ClickException("Selected CoDA sandbox is removed or unavailable")
 
     def app_id_for_sandbox(self, sandbox_id: str) -> str:
         """Resolve a persisted sandbox fence without exposing its lease id."""
@@ -216,7 +222,6 @@ class CodaProvider(SandboxHostLauncher):
                 payload = response.read()
         except error.HTTPError as exc:
             raw = exc.read().decode(errors="replace")
-            detail = _safe_control_error_detail(raw)
             if exc.code == 409 and path == "/api/omnigent-host/lease":
                 try:
                     response_body = json.loads(raw)
@@ -225,14 +230,14 @@ class CodaProvider(SandboxHostLauncher):
                 if response_body.get("error") != "app_name does not match this CoDA instance":
                     raise CodaCapacityError("CoDA app has no available lease capacity") from exc
             raise click.ClickException(
-                f"CoDA control request failed ({exc.code}): {detail}"
+                f"CoDA control request failed with HTTP {exc.code}"
             ) from exc
         except error.URLError as exc:
             if path == "/api/omnigent-host/lease":
                 raise CodaAmbiguousAcquireError(
-                    f"CoDA lease response was ambiguous: {exc.reason}"
+                    "CoDA lease response was ambiguous; retry on the same sandbox"
                 ) from exc
-            raise CodaUnavailableError(f"CoDA control request failed: {exc.reason}") from exc
+            raise CodaUnavailableError("CoDA control request was unavailable") from exc
         try:
             decoded = json.loads(payload or b"{}")
         except (json.JSONDecodeError, TypeError) as exc:
@@ -250,9 +255,7 @@ class CodaProvider(SandboxHostLauncher):
             ) from exc
         compute = getattr(getattr(app, "compute_status", None), "state", None)
         if str(compute).upper().split(".")[-1] != "ACTIVE":
-            raise CodaUnavailableError(
-                f"CoDA app {binding.app_id!r} compute is not ACTIVE"
-            )
+            raise CodaUnavailableError(f"CoDA app {binding.app_id!r} compute is not ACTIVE")
         status = self._request_for(binding, "GET", "/api/omnigent-host/status", None)
         # Current CoDA status payloads omit ``ready`` and report detailed
         # runtime state instead; only an explicit false is a readiness veto.
@@ -261,6 +264,7 @@ class CodaProvider(SandboxHostLauncher):
 
     def prepare(self, app_id: str | None = None) -> None:
         """Require the target, or at least one automatic candidate, to be ready."""
+        bindings: tuple[CodaAppBinding, ...]
         if app_id is not None:
             self.validate_app_id(app_id)
             bindings = (self._registry[app_id],)
@@ -286,8 +290,7 @@ class CodaProvider(SandboxHostLauncher):
         if app_id is None:
             start = self._pool_state.reserve_start(len(self._apps))
             candidates = tuple(
-                self._apps[(start + offset) % len(self._apps)]
-                for offset in range(len(self._apps))
+                self._apps[(start + offset) % len(self._apps)] for offset in range(len(self._apps))
             )
         else:
             self.validate_app_id(app_id)
@@ -349,9 +352,7 @@ class CodaProvider(SandboxHostLauncher):
         app_id, lease_id = _parse_sandbox_id(sandbox_id)
         binding = self._registry.get(app_id)
         if binding is None:
-            raise click.ClickException(
-                f"CoDA sandbox targets removed or unknown app_id {app_id!r}"
-            )
+            raise click.ClickException("Persisted CoDA sandbox is removed or unavailable")
         return binding, lease_id
 
     def start_host(
@@ -368,47 +369,109 @@ class CodaProvider(SandboxHostLauncher):
         host_config: dict[str, object] | None = None,
         agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
+        session_id: str | None = None,
     ) -> str:
         binding, lease_id = self._binding_for(sandbox_id)
+        if repo_url is not None and session_id is None:
+            raise click.ClickException(
+                "CoDA repository workspace requires protocol version 2 support"
+            )
         if on_stage is not None:
-            on_stage("cloning")
+            if repo_url is not None:
+                on_stage("cloning")
             on_stage("starting")
+        body: dict[str, object] = {
+            "server_url": server_url,
+            "host_token": token,
+            "host_id": host_id,
+            "host_name": host_name,
+            "host_config": host_config,
+            "lease_id": lease_id,
+            "agent_name": agent_name,
+        }
+        if repo_url is not None:
+            body.update(
+                {
+                    "session_id": session_id,
+                    "repo_url": repo_url,
+                    "repo_branch": repo_branch,
+                    "repo_name": repo_name,
+                    "workspace_protocol_version": CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION,
+                }
+            )
         result = self._request_for(
             binding,
             "POST",
             "/api/omnigent-host/connect",
-            {
-                "server_url": server_url,
-                "host_token": token,
-                "host_id": host_id,
-                "host_name": host_name,
-                "host_config": host_config,
-                "repo_url": repo_url,
-                "repo_branch": repo_branch,
-                "repo_name": repo_name,
-                "lease_id": lease_id,
-                "agent_name": agent_name,
-            },
+            body,
         )
-        workspace = result.get("workspace") or self._workspace_path
+        workspace = result.get("workspace")
+        if workspace is None and repo_url is None:
+            workspace = self._workspace_path
         if not isinstance(workspace, str) or not workspace.startswith("/"):
             raise click.ClickException(
                 "CoDA connect response did not contain an absolute workspace"
             )
+        if repo_url is not None and (
+            result.get("workspace_protocol_version") != CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION
+            or result.get("repository_materialized") is not True
+        ):
+            raise click.ClickException(
+                "CoDA repository workspace protocol is unavailable; deploy CoDA support first"
+            )
         return workspace
 
-    def allocate_workspace(self, sandbox_id: str, session_id: str) -> str:
+    def allocate_workspace(
+        self,
+        sandbox_id: str,
+        session_id: str,
+        *,
+        repo_url: str | None = None,
+        repo_branch: str | None = None,
+        repo_name: str | None = None,
+    ) -> str:
+        binding, lease_id = self._binding_for(sandbox_id)
+        body: dict[str, object] = {"lease_id": lease_id, "session_id": session_id}
+        if repo_url is not None:
+            body.update(
+                {
+                    "repo_url": repo_url,
+                    "repo_branch": repo_branch,
+                    "repo_name": repo_name,
+                    "workspace_protocol_version": CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION,
+                }
+            )
+        result = self._request_for(
+            binding,
+            "POST",
+            "/api/omnigent-host/workspaces",
+            body,
+        )
+        workspace = result.get("workspace")
+        if not isinstance(workspace, str) or not workspace.startswith("/"):
+            raise click.ClickException("CoDA did not return an absolute session workspace")
+        if repo_url is not None and (
+            result.get("workspace_protocol_version") != CODA_REPOSITORY_WORKSPACE_PROTOCOL_VERSION
+            or result.get("repository_materialized") is not True
+        ):
+            with contextlib.suppress(click.ClickException):
+                self.release_workspace(sandbox_id, session_id)
+            raise click.ClickException(
+                "CoDA repository workspace protocol is unavailable; deploy CoDA support first"
+            )
+        return workspace
+
+    def release_workspace(self, sandbox_id: str, session_id: str) -> None:
+        """Release one session allocation on the immutable granting App."""
         binding, lease_id = self._binding_for(sandbox_id)
         result = self._request_for(
             binding,
             "POST",
             "/api/omnigent-host/workspaces",
-            {"lease_id": lease_id, "session_id": session_id},
+            {"action": "release", "lease_id": lease_id, "session_id": session_id},
         )
-        workspace = result.get("workspace")
-        if not isinstance(workspace, str) or not workspace.startswith("/"):
-            raise click.ClickException("CoDA did not return an absolute session workspace")
-        return workspace
+        if result.get("released") is not True:
+            raise click.ClickException("CoDA session workspace cleanup was incomplete")
 
     def terminate(self, sandbox_id: str) -> None:
         """Release only the granting App's lease; uncertainty is surfaced to the caller."""

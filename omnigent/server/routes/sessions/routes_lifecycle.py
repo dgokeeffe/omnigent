@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
@@ -186,14 +187,37 @@ def register_lifecycle_routes(
             siblings = await asyncio.to_thread(
                 conversation_store.list_conversations_by_host_id, host.host_id
             )
+            has_siblings = any(item.id != session_id for item in siblings)
+            has_repository = MANAGED_REPO_LABEL_KEY in conv.labels
+            if has_siblings and has_repository:
+                # The shared claim remains live, so release this repository
+                # allocation before detaching it. Resume can then reconstruct a
+                # fresh checkout at the same durable session id without a
+                # partial-directory conflict. Non-repository Release retains
+                # its protocol-v1 behavior and needs no workspace cleanup.
+                from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+                config = getattr(request.app.state, "sandbox_config", None)
+                launcher = config.launcher_factory() if config is not None else None
+                if not isinstance(launcher, CodaProvider):
+                    raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
+                try:
+                    await asyncio.to_thread(
+                        launcher.release_workspace,
+                        host.sandbox_id,
+                        session_id,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Session workspace release failed; retry Release",
+                    ) from exc
             await asyncio.to_thread(
                 conversation_store.detach_conversation,
                 session_id,
                 expected_host_id=host.host_id,
             )
-            if any(item.id != session_id for item in siblings):
-                # This session is definitively detached while the shared lease
-                # remains fenced by live siblings; it owes no provider cleanup.
+            if has_siblings:
                 await asyncio.to_thread(
                     conversation_store.clear_detached_claim_host_id, host.host_id
                 )
@@ -394,19 +418,46 @@ def register_lifecycle_routes(
                     adopted = host
                     break
 
+            raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
+            try:
+                repo = parse_repo_workspace(raw_repo) if raw_repo else None
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The retained repository workspace is invalid; Resume was not started",
+                ) from exc
+
             tracker.begin(session_id)
             launch_state = tracker.get(session_id)
             new_host_id: str | None = adopted.host_id if adopted is not None else None
+            workspace_allocated = False
+            launcher: CodaProvider | None = None
             try:
                 if adopted is not None:
-                    launcher = config.launcher_factory()
-                    if not isinstance(launcher, CodaProvider):
-                        raise RuntimeError("CoDA provider is unavailable")
-                    workspace = await asyncio.to_thread(
-                        launcher.allocate_workspace,
-                        adopted.sandbox_id,
-                        session_id,
+                    candidate_launcher = config.launcher_factory()
+                    launcher = (
+                        candidate_launcher
+                        if isinstance(candidate_launcher, CodaProvider)
+                        else None
                     )
+                    if launcher is None:
+                        raise RuntimeError("CoDA provider is unavailable")
+                    if repo is None:
+                        workspace = await asyncio.to_thread(
+                            launcher.allocate_workspace,
+                            adopted.sandbox_id,
+                            session_id,
+                        )
+                    else:
+                        workspace = await asyncio.to_thread(
+                            launcher.allocate_workspace,
+                            adopted.sandbox_id,
+                            session_id,
+                            repo_url=repo.url,
+                            repo_branch=repo.branch,
+                            repo_name=repo.repo_name,
+                        )
+                    workspace_allocated = True
                     await _bind_and_launch_managed_runner(
                         session_id=session_id,
                         managed=ManagedHostLaunch(adopted.host_id, workspace),
@@ -418,8 +469,6 @@ def register_lifecycle_routes(
                         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                     )
                 else:
-                    raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
-                    repo = parse_repo_workspace(raw_repo) if raw_repo else None
                     before_ids = {host.host_id for host in hosts}
                     await _run_managed_launch(
                         session_id=session_id,
@@ -447,6 +496,13 @@ def register_lifecycle_routes(
                     raise RuntimeError("resume failed")
             except Exception as exc:
                 tracker.fail(session_id, "resume failed")
+                if adopted is not None and workspace_allocated and launcher is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(
+                            launcher.release_workspace,
+                            adopted.sandbox_id,
+                            session_id,
+                        )
                 rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if (
                     rebound is not None

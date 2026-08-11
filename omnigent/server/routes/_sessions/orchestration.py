@@ -3170,24 +3170,21 @@ def _kick_managed_relaunch(
         parse_repo_workspace,
     )
 
-    # Re-clone the repository the session was created with so the
-    # fresh generation's workspace matches the create-time state.
-    # The label holds the raw create-time value, already validated
-    # by the create's parse — a parse failure here means the label
-    # was tampered with, and the relaunch proceeds with an empty
-    # workspace rather than dying.
+    # Re-clone only repository metadata that passes the server parser.
+    # A corrupt internal reconstruction label fails closed rather than
+    # silently returning an empty workspace or forwarding raw metadata.
     repo = None
     raw_repo = conv.labels.get(MANAGED_REPO_LABEL_KEY)
     if raw_repo is not None:
         try:
             repo = parse_repo_workspace(raw_repo)
         except ValueError:
-            _logger.warning(
-                "Session %s has an unparseable %s label (%r); relaunching with an empty workspace",
-                session_id,
-                MANAGED_REPO_LABEL_KEY,
-                raw_repo,
-            )
+            reason = "retained repository workspace is invalid"
+            tracker.begin(session_id)
+            tracker.fail(session_id, reason)
+            _publish_sandbox_status(session_id, "failed", reason)
+            _logger.warning("Session %s has invalid managed repository metadata", session_id)
+            return
     _logger.info(
         "Managed sandbox for session %s (host %s) is gone; relaunching a new generation",
         session_id,

@@ -185,11 +185,19 @@ class CodaProvider(SandboxHostLauncher):
         return binding.app_id
 
     def app_is_available(self, app_id: str) -> bool:
-        """Freshly probe one configured App for the authenticated picker."""
+        """Freshly probe one configured App for the authenticated picker.
+
+        Any probe failure is reported as "not available" for that App only. A
+        control response is remote input: an App that is mid-deploy answers the
+        platform's ``502`` page, which reaches this method as a generic control
+        error rather than :class:`CodaUnavailableError`. Letting that escape made
+        one restarting pool member fail the whole picker with a ``500``, hiding
+        every healthy App in the pool.
+        """
         self.validate_app_id(app_id)
         try:
             self._probe(self._registry[app_id])
-        except CodaUnavailableError:
+        except click.ClickException:
             return False
         return True
 

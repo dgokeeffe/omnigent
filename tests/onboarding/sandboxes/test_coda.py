@@ -439,3 +439,23 @@ def test_shared_pool_state_is_concurrency_safe() -> None:
     for thread in threads:
         thread.join()
     assert {result.split("#", 1)[0] for result in results} == {"coda:a", "coda:b"}
+
+
+def test_picker_availability_isolates_a_mid_deploy_app() -> None:
+    """A restarting App reports unavailable without failing the whole picker.
+
+    Regression: the Apps platform answers a ``502`` HTML page while a member is
+    mid-deploy. That surfaced as a generic control error, escaped
+    ``app_is_available``, and turned the authenticated picker into a ``500`` —
+    so a single restarting sandbox hid the other twenty healthy ones.
+    """
+
+    class Restarting(FakeControl):
+        def __call__(self, method: str, path: str, body: object) -> dict[str, object]:
+            raise click.ClickException("CoDA control request failed with HTTP 502")
+
+    healthy = FakeControl("a")
+    provider = pool_provider({"a": healthy, "b": Restarting("b")})
+
+    assert provider.app_is_available("a") is True
+    assert provider.app_is_available("b") is False

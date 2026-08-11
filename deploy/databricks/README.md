@@ -157,6 +157,26 @@ uv run python deploy/databricks/deploy.py \
 Legacy `--coda-app-name` plus `--coda-app-url` remains a one-App pool. It cannot
 be combined with `--coda-app`; partial configuration fails fast.
 
+For a pool of more than a couple of Apps, use the wrapper instead of writing one
+flag per member:
+
+```bash
+./deploy/databricks/deploy_with_coda_pool.sh \
+    --coda-prefix coda- \
+    --compute-size XLARGE \
+    --lakebase-branch projects/omnigent/branches/production \
+    --lakebase-database projects/omnigent/branches/production/databases/databricks-postgres \
+    --volume-name main.omnigent.artifacts
+```
+
+It discovers every App matching `--coda-prefix` (or takes explicit `--coda-app
+<name>` flags), reads each App's URL and this app's public URL from the API,
+resolves the workspace host from the active credentials, patches the local
+`databricks.yml` target host, and always passes `--no-otel`. Add `--print-only`
+to see the resolved `deploy.py` command without deploying, and pass anything
+after `--` straight through (e.g. `-- --skip-build`). It hardcodes no workspace
+identity — `tests/deploy` asserts that.
+
 With a multi-App pool, New Session keeps **CoDA Sandbox (Automatic)** as the
 default and also offers stable `CoDA-Sandbox-N` manual targets. Labels are based
 on configured order, not mutable App names. The authenticated picker exposes

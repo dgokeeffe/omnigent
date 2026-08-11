@@ -635,6 +635,26 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_managed_hosts(self, provider: str) -> list[Host]:
+        """List provider-backed hosts across owners for capacity accounting.
+
+        This is an internal scheduling view.  API callers receive only a
+        sanitized ownership enum; ``user_id``, sandbox/lease ids, tokens, App
+        names, and URLs are never projected from these rows.
+        """
+        with self._session("list_managed_hosts") as session:
+            rows = (
+                session.query(SqlHost)
+                .filter(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sandbox_provider == provider,
+                    SqlHost.sandbox_id.is_not(None),
+                )
+                .order_by(SqlHost.updated_at.desc())
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.

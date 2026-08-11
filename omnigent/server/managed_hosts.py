@@ -2311,6 +2311,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    coda_app_id: str | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -2357,19 +2358,32 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
+    coda_launcher = None
     if launcher.provider == "coda":
         from omnigent.onboarding.sandboxes.coda import CodaProvider
 
         if isinstance(launcher, CodaProvider):
+            coda_launcher = launcher
             launcher.set_lease_owner(owner)
+    elif coda_app_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="sandbox_app_id is only valid for the CoDA sandbox provider",
+        )
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[:8]}"
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        if coda_launcher is not None and coda_app_id is not None:
+            await asyncio.to_thread(coda_launcher.prepare, coda_app_id)
+            sandbox_id = await asyncio.to_thread(
+                coda_launcher.provision, host_name, coda_app_id
+            )
+        else:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -2452,8 +2466,12 @@ async def relaunch_managed_host(
     # A CoDA disconnect is a lease fence, not disposable sandbox cleanup.
     # If its outcome is uncertain, preserve the old identity and never acquire
     # on another App. Other providers retain their historical best-effort path.
+    fenced_coda_app_id: str | None = None
     if launcher.provider == "coda" and host.sandbox_id is not None:
         try:
+            # Relaunch is App-fenced: resolve the immutable granting App before
+            # release and reacquire only there, never through pool spillover.
+            fenced_coda_app_id = launcher.app_id_for_sandbox(host.sandbox_id)
             await asyncio.to_thread(launcher.terminate, host.sandbox_id)
         except click.ClickException as exc:
             raise HTTPException(
@@ -2463,8 +2481,14 @@ async def relaunch_managed_host(
     else:
         await _terminate_sandbox_best_effort(launcher, host)
     try:
-        await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
+        if fenced_coda_app_id is not None:
+            await asyncio.to_thread(launcher.prepare, fenced_coda_app_id)
+            sandbox_id = await asyncio.to_thread(
+                launcher.provision, host.name, fenced_coda_app_id
+            )
+        else:
+            await asyncio.to_thread(launcher.prepare)
+            sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,

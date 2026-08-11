@@ -22,6 +22,7 @@ import os
 import secrets
 from typing import Any
 
+import click
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -58,7 +59,7 @@ from omnigent.server.routes._host_launch import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -620,6 +621,94 @@ def create_hosts_router(
                 }
             )
         return {"hosts": result}
+
+    @router.get("/sandboxes/coda")
+    async def list_coda_sandboxes(request: Request) -> dict[str, list[dict[str, Any]]]:
+        """Return the authenticated user's sanitized manual CoDA choices.
+
+        The response deliberately omits Databricks App names/URLs, raw owners,
+        host ids, lease ids, and upstream status payloads.  Capacity is
+        advisory; the lease acquire remains the concurrency authority.
+        """
+        user_id = require_user(request, auth_provider) or "local"
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        if sandbox_config is None or sandbox_config.provider != "coda":
+            raise HTTPException(status_code=404, detail="CoDA sandboxes are not configured")
+
+        from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+        launcher = sandbox_config.launcher_factory()
+        if not isinstance(launcher, CodaProvider):
+            raise HTTPException(status_code=500, detail="CoDA sandbox configuration is invalid")
+
+        def _count_sessions_per_host() -> dict[str, int]:
+            """Count every active session without a truncation-based capacity lie."""
+            counts: dict[str, int] = {}
+            after: str | None = None
+            while True:
+                page = conversation_store.list_conversations(
+                    limit=1000,
+                    after=after,
+                    kind=None,
+                )
+                for session in page.data:
+                    if session.host_id is not None:
+                        counts[session.host_id] = counts.get(session.host_id, 0) + 1
+                if not page.has_more or page.last_id is None:
+                    return counts
+                after = page.last_id
+
+        hosts, sessions_per_host = await asyncio.gather(
+            asyncio.to_thread(host_store.list_managed_hosts, "coda"),
+            asyncio.to_thread(_count_sessions_per_host),
+        )
+
+        hosts_per_app: dict[str, list[Host]] = {app_id: [] for app_id in launcher.app_ids}
+        for host in hosts:
+            if host.sandbox_id is None:
+                continue
+            try:
+                app_id = launcher.app_id_for_sandbox(host.sandbox_id)
+            except click.ClickException:  # removed Apps are absent from the picker
+                continue
+            hosts_per_app[app_id].append(host)
+
+        availability = await asyncio.gather(
+            *(
+                asyncio.to_thread(launcher.app_is_available, app_id)
+                for app_id in launcher.app_ids
+            )
+        )
+        limit = sandbox_config.max_sessions_per_lease or 10
+        result: list[dict[str, Any]] = []
+        for (app_id, label), app_available in zip(
+            launcher.app_options, availability, strict=True
+        ):
+            app_hosts = hosts_per_app[app_id]
+            own_hosts = [host for host in app_hosts if host.user_id == user_id]
+            ownership = "mine" if own_hosts else ("other" if app_hosts else "unclaimed")
+            used = (
+                sum(sessions_per_host.get(host.host_id, 0) for host in own_hosts)
+                if ownership == "mine"
+                else (0 if ownership == "unclaimed" else None)
+            )
+            own_host_live = any(host_is_live(host) for host in own_hosts)
+            if not app_available or (ownership == "mine" and not own_host_live):
+                state = "unavailable"
+            elif ownership == "other" or (isinstance(used, int) and used >= limit):
+                state = "full"
+            else:
+                state = "available"
+            result.append(
+                {
+                    "app_id": app_id,
+                    "label": label,
+                    "ownership": ownership,
+                    "state": state,
+                    "capacity": {"used": used, "limit": limit},
+                }
+            )
+        return {"sandboxes": result}
 
     @router.get("/hosts/{host_id}")
     async def get_host(request: Request, host_id: str) -> dict[str, Any]:

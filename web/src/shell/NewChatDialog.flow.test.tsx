@@ -76,6 +76,9 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useCodaSandboxes: vi.fn(() => ({ data: [] })),
+  isHostAtCapacity: vi.fn(() => false),
+  hostCapacityLabel: vi.fn(() => "capacity unknown"),
   useHostModelOptions: vi.fn(() => ({
     data: [
       { id: "opus", displayName: "Opus" },

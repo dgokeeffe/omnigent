@@ -26,10 +26,13 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
+import type * as UseHostsModule from "@/hooks/useHosts";
+
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  useCodaSandboxes,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -53,8 +56,10 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
 }));
-vi.mock("@/hooks/useHosts", () => ({
+vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: vi.fn(),
+  useCodaSandboxes: vi.fn(),
   useHostModelOptions: vi.fn(),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
@@ -147,6 +152,7 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
+const useCodaSandboxesMock = vi.mocked(useCodaSandboxes);
 /** Stable per-harness model-catalog results (identity matters: effects key on them). */
 const CLAUDE_MODEL_OPTIONS_RESULT = {
   data: [
@@ -678,6 +684,8 @@ function mockAgents(agents: AvailableAgent[]) {
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
+  useCodaSandboxesMock.mockReset();
+  useCodaSandboxesMock.mockReturnValue({ data: [] } as ReturnType<typeof useCodaSandboxes>);
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
@@ -2110,6 +2118,60 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("shows sanitized CoDA choices and sends the immutable manual app target", async () => {
+    useCodaSandboxesMock.mockReturnValue({
+      data: [
+        {
+          app_id: "app-a",
+          label: "CoDA-Sandbox-1",
+          ownership: "other",
+          state: "full",
+          capacity: { used: null, limit: 10 },
+        },
+        {
+          app_id: "app-b",
+          label: "CoDA-Sandbox-2",
+          ownership: "mine",
+          state: "available",
+          capacity: { used: 3, limit: 10 },
+        },
+        {
+          app_id: "app-c",
+          label: "CoDA-Sandbox-3",
+          ownership: "unclaimed",
+          state: "unavailable",
+          capacity: { used: 0, limit: 10 },
+        },
+      ],
+    } as ReturnType<typeof useCodaSandboxes>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_coda" }),
+    } as Response);
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "coda" });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-sandbox-option")).toHaveTextContent(
+      "CoDA Sandbox (Automatic)",
+    );
+    expect(screen.getByTestId("new-chat-landing-coda-app-a")).toHaveTextContent(
+      "CoDA-Sandbox-1In use · full · 10 session capacity",
+    );
+    expect(screen.getByTestId("new-chat-landing-coda-app-a")).toHaveAttribute("data-disabled");
+    expect(screen.getByTestId("new-chat-landing-coda-app-c")).toHaveAttribute("data-disabled");
+    fireEvent.click(screen.getByTestId("new-chat-landing-coda-app-b"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("CoDA-Sandbox-2"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "use this sandbox" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    const { body } = await readCreateBody();
+    expect(body.host_type).toBe("managed");
+    expect(body.sandbox_app_id).toBe("app-b");
+    expect(JSON.stringify(body)).not.toContain("private");
+  });
+
   it("defaults to New Sandbox when no hosts are connected and sandboxes are enabled", async () => {
     // The screenshot regression: zero hosts used to leave the chip stuck
     // on "No hosts" even though the sandbox option was one click away.
@@ -2193,6 +2255,7 @@ describe("NewChatLandingScreen", () => {
     expect(body.host_type).toBe("managed");
     expect(body.agent_id).toBe("a1");
     expect("host_id" in body).toBe(false);
+    expect("sandbox_app_id" in body).toBe(false);
     expect("workspace" in body).toBe(false);
     expect("git" in body).toBe(false);
     resolveCreate({

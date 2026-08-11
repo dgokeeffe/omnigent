@@ -157,6 +157,19 @@ uv run python deploy/databricks/deploy.py \
 Legacy `--coda-app-name` plus `--coda-app-url` remains a one-App pool. It cannot
 be combined with `--coda-app`; partial configuration fails fast.
 
+With a multi-App pool, New Session keeps **CoDA Sandbox (Automatic)** as the
+default and also offers stable `CoDA-Sandbox-N` manual targets. Labels are based
+on configured order, not mutable App names. The authenticated picker exposes
+only sanitized ownership/capacity state. A manual create is fenced to the chosen
+immutable ID and never spills to another App; reconnect, workspace allocation,
+relaunch, and cleanup continue using the persisted granting ID.
+
+For rollback, first remove sessions using added Apps and verify their managed
+host rows/leases are gone. Then revert the UI (which simply returns users to the
+automatic row) and remove pool entries only after no `coda:<app_id>#...` fence
+references them. Restoring a removed entry is the safe recovery for cleanup;
+never rename/reuse an ID or point it at a different App.
+
 For **every** pool member, grant the Omnigent App service principal `CAN_USE` on
 the CoDA App, and grant that CoDA App's service principal `CAN_USE` on Omnigent.
 Configure each CoDA App's wheel, server URL, and server-client-ID resources with

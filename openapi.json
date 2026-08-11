@@ -8547,6 +8547,36 @@
         ]
       }
     },
+    "/v1/sandboxes/coda": {
+      "get": {
+        "description": "Return the authenticated user's sanitized manual CoDA choices.\n\nThe response deliberately omits Databricks App names/URLs, raw owners,\nhost ids, lease ids, and upstream status payloads.  Capacity is\nadvisory; the lease acquire remains the concurrency authority.",
+        "operationId": "list_coda_sandboxes_v1_sandboxes_coda_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response List Coda Sandboxes V1 Sandboxes Coda Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Coda Sandboxes",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",

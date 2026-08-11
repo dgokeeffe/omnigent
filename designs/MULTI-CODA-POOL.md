@@ -47,7 +47,7 @@ After acquisition, registry lookup uses only persisted `app_id`. Connect, alloca
 - Persisted cursor/fairness across restart.
 - Health TTL, quarantine/backoff, durable health or capacity history.
 - Alias/migration tables for arbitrary App-ID renames.
-- UI health/pool views or API projections.
+- Administrative health history, durable pool dashboards, or raw App metadata projections.
 - CoDA authoritative `GET /api/omnigent-host/leases/by-idempotency-key/<key>` (or equivalent).
 
 The last item is an explicit dependency on repository `coding-agents-databricks-apps`, requiring endpoint implementation, authorization, tests and version coordination before Omnigent may rely on it. It is not in the Omnigent MVP plan.
@@ -71,14 +71,18 @@ The last item is an explicit dependency on repository `coding-agents-databricks-
 
 The current deployment path demonstrably uses singleton `CODA_APP_NAME`/`CODA_APP_URL` in those three named deployment files. MVP changes that input to one serialized pool value (plus the existing public server URL); authentication remains the existing Databricks App authentication, so no new secret resource is required.
 
-**Budget:** repository `omnigent` only, **7 required files and up to 12 total files**, **0 database migrations, 0 new Omnigent API endpoints, 0 CoDA endpoints, 0 UI files, 0 durable scheduler/health tables**. If implementation requires a second repository or exceeds 12 files, return to design review.
+**Initial automatic-MVP budget:** repository `omnigent` only, 0 database migrations,
+0 CoDA endpoints, and 0 durable scheduler/health tables. The later manual-selection
+extension intentionally adds one authenticated Omnigent projection and Web UI changes;
+it does not change CoDA or add durable scheduling state.
 
 ### Surface disposition
 
 - Store/schema: reuse `hosts.sandbox_id`; no schema change.
 - Launch/relaunch/allocation/termination/cleanup: existing paths above, resolve persisted App ID.
-- API projections: no change required; sandbox ID remains opaque/internal.
-- UI: no change required; existing host/session status remains sufficient.
+- API projections: the authenticated manual-picker endpoint exposes only stable labels,
+  immutable App IDs, sanitized ownership, and advisory capacity; lease IDs remain opaque.
+- UI: New Session retains the automatic row and adds disabled/available per-App rows for CoDA.
 - Observability: structured logs per attempted `app_id`, outcome class, selected App, exhaustion and wrong/removed fence; no durable state or high-cardinality URL/lease metrics.
 - CoDA repository: no REQUIRED change. Optional query endpoint is explicitly separate.
 
@@ -97,7 +101,7 @@ Use fixed UUIDs, fake App getter/HTTP functions, fixed config order and controll
 5. Fencing: interleaved A/B connect, workspace/adoption, relaunch, terminate and cleanup call only persisted `app_id`; renamed display name still resolves by ID; removed ID fails before HTTP.
 6. Storage invariant: sessions on A may receive directories under A's shared `coda-sessions`; no B operation or lookup occurs.
 7. Persistence/migration/rollback: existing legacy ID works in normalized singleton; one-entry→pool retains ID; removing live ID fails closed; rollback requires terminating added-App leases.
-8. Impact gates: assert no DB migration, endpoint, API schema, UI, durable health or scheduler file enters the MVP diff; enforce the 12-file maximum at review.
+8. Impact gates: assert no DB migration, CoDA endpoint, durable health, or scheduler table enters the diff; API/UI changes stay limited to manual selection.
 
 ## Acceptance-criteria audit
 
@@ -111,4 +115,49 @@ Use fixed UUIDs, fake App getter/HTTP functions, fixed config order and controll
 - Migration/rollback: operational identity-preserving strategy and test 7.
 - Observability: bounded structured logs only.
 
-**Final recommendation: GO for the bounded REQUIRED MVP; NO-GO for OPTIONAL persistence, UI/API, or cross-repository endpoint work without separate approval.**
+**Final recommendation: GO for the bounded REQUIRED MVP; NO-GO for OPTIONAL durable scheduler state or cross-repository endpoint work without separate approval.**
+
+## Manual New Session selection extension
+
+The automatic MVP remains the default and is still represented by an omitted
+`sandbox_app_id`. For CoDA deployments, the authenticated New Session picker may
+also call `GET /v1/sandboxes/coda` and submit one returned immutable `app_id` as
+`sandbox_app_id` on `POST /v1/sessions` with `host_type: managed`.
+
+The list endpoint returns only stable configured-order labels
+`CoDA-Sandbox-1`, `CoDA-Sandbox-2`, …, immutable IDs, sanitized ownership
+(`unclaimed`, `mine`, `other`), advisory state (`available`, `full`,
+`unavailable`), and session capacity. It never returns Databricks App names or
+URLs, user identifiers, host/lease IDs, tokens, or raw upstream payloads. App
+readiness is freshly probed; capacity remains advisory because CoDA lease CAS is
+authoritative at claim time.
+
+A manual claim is authorized with the session creator identity and validated
+against the configured immutable registry before a conversation is created. It
+attempts exactly the selected App, does not advance the automatic round-robin
+cursor, and never spills to another App on unavailable/full/ambiguous/error.
+The existing same-owner adoption lock, owner single-flight, CoDA owner-CAS, and
+same-lease-id ambiguity replay provide concurrency safety and idempotence.
+After acquisition, `hosts.sandbox_id = coda:<app_id>#<lease_id>` remains the
+durable fence. Workspace allocation, reconnect, relaunch, disconnect, cleanup,
+and removed-ID handling resolve only that persisted App. In particular,
+relaunch releases and reacquires on the granting `app_id`; it never invokes
+pool fallback. Session workspaces remain distinct under that App's
+`coda-sessions` root, while no lifecycle call can cross into another App's
+storage.
+
+### Failure, rollout, and rollback
+
+Unavailable and full options are visible but disabled in the UI; an
+authoritative race at create time fails on the selected App rather than silently
+rerouting. Removed IDs are rejected before session creation, and existing hosts
+with a removed ID fail closed until the operator restores the registry entry for
+cleanup. The automatic row remains usable and unchanged throughout rollout.
+
+Roll out server/API support before the matching Web bundle. Keep every existing
+immutable `app_id` configured while a host may reference it. To roll back the UI,
+serve the prior bundle: omitted `sandbox_app_id` immediately restores automatic
+behavior. To roll back the pool/server, first delete sessions and release hosts
+on added Apps, verify no persisted `coda:<added-id>#…` fences remain, then remove
+those entries or restore the legacy singleton. Never rename/reuse an ID or
+rewrite a persisted fence to another App.

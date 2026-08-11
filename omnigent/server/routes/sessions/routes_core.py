@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import click
 import httpx
 from fastapi import (
     APIRouter,
@@ -300,6 +301,30 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        # A manual CoDA target is authorized by the same authenticated creator
+        # identity used for the lease owner. Validate the immutable registry id
+        # before creating a durable conversation so removed/forged ids fail
+        # atomically and can never be silently routed by automatic fallback.
+        if body.sandbox_app_id is not None:
+            sandbox_config_for_claim = getattr(request.app.state, "sandbox_config", None)
+            if sandbox_config_for_claim is None or sandbox_config_for_claim.provider != "coda":
+                raise HTTPException(
+                    status_code=422,
+                    detail="sandbox_app_id is only valid for a configured CoDA pool",
+                )
+            from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+            claim_launcher = sandbox_config_for_claim.launcher_factory()
+            if not isinstance(claim_launcher, CodaProvider):
+                raise OmnigentError(
+                    "coda sandbox config did not produce a CodaProvider",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            try:
+                claim_launcher.validate_app_id(body.sandbox_app_id)
+            except click.ClickException as exc:
+                raise HTTPException(status_code=409, detail=exc.message) from exc
+
         resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -437,11 +462,17 @@ def register_core_routes(
                     wait_for_owner_launch = None
                     async with adoption_lock:
                         hosts = await asyncio.to_thread(host_store_for_managed.list_hosts, owner)
+                        target_prefix = (
+                            f"coda:{body.sandbox_app_id}#"
+                            if body.sandbox_app_id is not None
+                            else None
+                        )
                         candidates = [
                             host
                             for host in hosts
                             if host.sandbox_provider == "coda"
                             and host.sandbox_id is not None
+                            and (target_prefix is None or host.sandbox_id.startswith(target_prefix))
                             and host_is_live(host)
                         ]
                         if candidates:
@@ -501,6 +532,7 @@ def register_core_routes(
                                         session_id=resp.id,
                                         owner=owner,
                                         sandbox_config=sandbox_config,
+                                        coda_app_id=body.sandbox_app_id,
                                         repo=repo,
                                         tracker=managed_launches,
                                         conversation_store=conversation_store,
@@ -548,6 +580,7 @@ def register_core_routes(
                         session_id=resp.id,
                         owner=owner,
                         sandbox_config=sandbox_config,
+                        coda_app_id=body.sandbox_app_id,
                         repo=repo,
                         tracker=managed_launches,
                         conversation_store=conversation_store,

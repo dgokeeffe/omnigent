@@ -132,6 +132,49 @@ def test_prepare_rejects_when_no_app_is_ready() -> None:
         provider.prepare()
 
 
+def test_manual_options_are_stable_and_do_not_expose_app_metadata() -> None:
+    provider = CodaProvider(
+        apps=(
+            CodaAppBinding("immutable-a", "secret-name-a", "https://private-a.example.com"),
+            CodaAppBinding("immutable-b", "secret-name-b", "https://private-b.example.com"),
+        ),
+        request_fns={"immutable-a": FakeControl("a"), "immutable-b": FakeControl("b")},
+        app_getter=active,
+    )
+    assert provider.app_options == (
+        ("immutable-a", "CoDA-Sandbox-1"),
+        ("immutable-b", "CoDA-Sandbox-2"),
+    )
+    assert "secret-name" not in repr(provider.app_options)
+    assert "private-" not in repr(provider.app_options)
+
+
+def test_manual_provision_targets_only_selected_app_without_advancing_automatic_cursor() -> None:
+    controls = {"a": FakeControl("a"), "b": FakeControl("b")}
+    provider = pool_provider(controls)
+    selected = provider.provision("manual", "b")
+    automatic = provider.provision("automatic")
+    assert selected.startswith("coda:b#")
+    assert automatic.startswith("coda:a#")
+    assert [path for _, path, _ in controls["a"].calls].count(
+        "/api/omnigent-host/lease"
+    ) == 1
+
+
+def test_manual_full_or_unavailable_never_spills() -> None:
+    class Full(FakeControl):
+        def __call__(self, method: str, path: str, body: object) -> dict[str, object]:
+            self.calls.append((method, path, body))
+            if path.endswith("/lease"):
+                raise CodaCapacityError("full")
+            return self.responses[path]
+
+    controls: dict[str, FakeControl] = {"a": Full("a"), "b": FakeControl("b")}
+    with pytest.raises(click.ClickException, match="no available lease capacity"):
+        pool_provider(controls).provision("manual", "a")
+    assert controls["b"].calls == []
+
+
 def test_round_robin_provision_and_persisted_app_id() -> None:
     controls = {"a": FakeControl("a"), "b": FakeControl("b")}
     provider = pool_provider(controls)
@@ -254,6 +297,14 @@ def test_lifecycle_routes_only_to_granting_app() -> None:
     assert [path for _, path, _ in controls["b"].calls] == [
         "/api/omnigent-host/workspaces"
     ]
+
+
+def test_manual_removed_app_id_fails_before_http() -> None:
+    control = FakeControl("a")
+    provider = pool_provider({"a": control})
+    with pytest.raises(click.ClickException, match="removed or unknown app_id"):
+        provider.provision("manual", "removed")
+    assert control.calls == []
 
 
 def test_removed_app_id_fails_before_http() -> None:

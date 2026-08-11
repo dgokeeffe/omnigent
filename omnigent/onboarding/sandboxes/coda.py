@@ -154,6 +154,39 @@ class CodaProvider(SandboxHostLauncher):
         """Configured immutable App identities in deterministic pool order."""
         return tuple(item.app_id for item in self._apps)
 
+    @property
+    def app_options(self) -> tuple[tuple[str, str], ...]:
+        """Return stable, non-sensitive manual-picker identities.
+
+        Labels are derived only from immutable configured order.  App names,
+        URLs, lease ids, and owners intentionally never cross this seam.
+        """
+        return tuple(
+            (binding.app_id, f"CoDA-Sandbox-{index}")
+            for index, binding in enumerate(self._apps, start=1)
+        )
+
+    def validate_app_id(self, app_id: str) -> None:
+        """Fail closed when a manual claim names an unconfigured App."""
+        if app_id not in self._registry:
+            raise click.ClickException(
+                f"CoDA sandbox targets removed or unknown app_id {app_id!r}"
+            )
+
+    def app_id_for_sandbox(self, sandbox_id: str) -> str:
+        """Resolve a persisted sandbox fence without exposing its lease id."""
+        binding, _lease_id = self._binding_for(sandbox_id)
+        return binding.app_id
+
+    def app_is_available(self, app_id: str) -> bool:
+        """Freshly probe one configured App for the authenticated picker."""
+        self.validate_app_id(app_id)
+        try:
+            self._probe(self._registry[app_id])
+        except CodaUnavailableError:
+            return False
+        return True
+
     def set_lease_owner(self, owner: str) -> None:
         self._lease_owner = owner
 
@@ -226,10 +259,15 @@ class CodaProvider(SandboxHostLauncher):
         if status.get("ready") is False:
             raise CodaUnavailableError(f"CoDA app {binding.app_id!r} is not ready")
 
-    def prepare(self) -> None:
-        """Require at least one currently ready App without mutating the pool."""
+    def prepare(self, app_id: str | None = None) -> None:
+        """Require the target, or at least one automatic candidate, to be ready."""
+        if app_id is not None:
+            self.validate_app_id(app_id)
+            bindings = (self._registry[app_id],)
+        else:
+            bindings = self._apps
         failures: list[str] = []
-        for binding in self._apps:
+        for binding in bindings:
             try:
                 self._probe(binding)
                 return
@@ -237,13 +275,25 @@ class CodaProvider(SandboxHostLauncher):
                 failures.append(f"{binding.app_id}: {exc.message}")
         raise click.ClickException("no ready CoDA Apps: " + "; ".join(failures))
 
-    def provision(self, name: str) -> str:
-        """Acquire a NEW lease with bounded fresh-probe and capacity spillover."""
+    def provision(self, name: str, app_id: str | None = None) -> str:
+        """Acquire a NEW lease automatically or on exactly one manual target.
+
+        Automatic acquisition retains bounded round-robin spillover.  A manual
+        claim never advances the automatic cursor and never falls through to a
+        different App, including after full, unavailable, or ambiguous results.
+        """
         lease_id = uuid.uuid4().hex
-        start = self._pool_state.reserve_start(len(self._apps))
+        if app_id is None:
+            start = self._pool_state.reserve_start(len(self._apps))
+            candidates = tuple(
+                self._apps[(start + offset) % len(self._apps)]
+                for offset in range(len(self._apps))
+            )
+        else:
+            self.validate_app_id(app_id)
+            candidates = (self._registry[app_id],)
         rejected: list[str] = []
-        for offset in range(len(self._apps)):
-            binding = self._apps[(start + offset) % len(self._apps)]
+        for binding in candidates:
             try:
                 self._probe(binding)
             except CodaUnavailableError:

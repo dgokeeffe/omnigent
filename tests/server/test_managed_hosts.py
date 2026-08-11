@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1638,6 +1638,7 @@ def _capability_probe_app(
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
         sandbox_config=sandbox_config,
     )
 
@@ -1711,6 +1712,104 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_coda_picker_api_is_sanitized_stable_and_capacity_aware(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaAppBinding
+
+    def request_fn(
+        _method: str, path: str, _body: Mapping[str, object] | None
+    ) -> Mapping[str, object]:
+        assert path == "/api/omnigent-host/status"
+        return {"ready": True, "owner": "must-not-leak@example.com", "token": "secret"}
+
+    def app_getter(name: str) -> object:
+        state = "STOPPED" if name == "private-c" else "ACTIVE"
+        return SimpleNamespace(compute_status=SimpleNamespace(state=state))
+
+    launcher = CodaProvider(
+        apps=(
+            CodaAppBinding("app-a", "private-a", "https://a.private.example.com"),
+            CodaAppBinding("app-b", "private-b", "https://b.private.example.com"),
+            CodaAppBinding("app-c", "private-c", "https://c.private.example.com"),
+        ),
+        request_fns={"app-a": request_fn, "app-b": request_fn, "app-c": request_fn},
+        app_getter=app_getter,
+    )
+    config = ManagedSandboxConfig(
+        server_url="https://s.example.com",
+        launcher_factory=lambda: launcher,
+        token_ttl_s=3600,
+        provider="coda",
+        max_sessions_per_lease=10,
+    )
+    store = HostStore(db_uri)
+    store.register_managed_host(
+        host_id="c0da0000000000000000000000000001",
+        name="mine",
+        user_id="local",
+        token="mine-token",
+        provider="coda",
+        sandbox_id="coda:app-a#lease-secret-a",
+        token_expires_at=now_epoch() + 3600,
+    )
+    store.upsert_on_connect(
+        host_id="c0da0000000000000000000000000001",
+        name="mine",
+        user_id="local",
+    )
+    store.register_managed_host(
+        host_id="c0da0000000000000000000000000002",
+        name="theirs",
+        user_id="other@example.com",
+        token="other-token",
+        provider="coda",
+        sandbox_id="coda:app-b#lease-secret-b",
+        token_expires_at=now_epoch() + 3600,
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/sandboxes/coda")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "sandboxes": [
+            {
+                "app_id": "app-a",
+                "label": "CoDA-Sandbox-1",
+                "ownership": "mine",
+                "state": "available",
+                "capacity": {"used": 0, "limit": 10},
+            },
+            {
+                "app_id": "app-b",
+                "label": "CoDA-Sandbox-2",
+                "ownership": "other",
+                "state": "full",
+                "capacity": {"used": None, "limit": 10},
+            },
+            {
+                "app_id": "app-c",
+                "label": "CoDA-Sandbox-3",
+                "ownership": "unclaimed",
+                "state": "unavailable",
+                "capacity": {"used": 0, "limit": 10},
+            },
+        ]
+    }
+    serialized = response.text
+    for forbidden in (
+        "private-a",
+        "private.example.com",
+        "lease-secret",
+        "other@example.com",
+        "must-not-leak",
+        "mine-token",
+    ):
+        assert forbidden not in serialized
 
 
 # ── launch_managed_host ─────────────────────────────────────
@@ -2382,6 +2481,57 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
+async def test_manual_coda_launch_claims_only_requested_app(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.onboarding.sandboxes.coda import CodaAppBinding
+
+    calls: dict[str, list[str]] = {"a": [], "b": []}
+
+    def control(
+        app_id: str,
+    ) -> Callable[[str, str, Mapping[str, object] | None], Mapping[str, object]]:
+        def request_fn(
+            method: str, path: str, body: Mapping[str, object] | None
+        ) -> Mapping[str, object]:
+            calls[app_id].append(path)
+            if method == "POST" and path.endswith("/lease"):
+                assert body is not None
+                return {"lease_id": body["lease_id"]}
+            return {"ready": True}
+
+        return request_fn
+
+    launcher = CodaProvider(
+        apps=(
+            CodaAppBinding("a", "name-a", "https://a.example.com"),
+            CodaAppBinding("b", "name-b", "https://b.example.com"),
+        ),
+        request_fns={"a": control("a"), "b": control("b")},
+        app_getter=lambda _name: SimpleNamespace(compute_status=SimpleNamespace(state="ACTIVE")),
+    )
+
+    async def _arm(**kwargs: Any) -> str:
+        assert kwargs["sandbox_id"].startswith("coda:b#")
+        return "/app/python/source_code"
+
+    monkeypatch.setattr("omnigent.server.managed_hosts._arm_and_start_host", _arm)
+    result = await launch_managed_host(
+        config=ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+            provider="coda",
+        ),
+        owner=_OWNER,
+        host_store=HostStore(db_uri),
+        coda_app_id="b",
+    )
+    assert result.workspace == "/app/python/source_code"
+    assert calls["a"] == []
+    assert calls["b"].count("/api/omnigent-host/lease") == 1
+
+
 async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2409,7 +2559,14 @@ async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
             return {"lease_id": body["lease_id"]}
         return {"ready": True}
 
-    launcher = CodaProvider(
+    provision_targets: list[str | None] = []
+
+    class RecordingCodaProvider(CodaProvider):
+        def provision(self, name: str, app_id: str | None = None) -> str:
+            provision_targets.append(app_id)
+            return super().provision(name, app_id)
+
+    launcher = RecordingCodaProvider(
         app_name="omnigent",
         app_url="https://coda.example.com",
         request_fn=request_fn,
@@ -2446,6 +2603,7 @@ async def test_relaunch_sets_coda_lease_owner_and_keeps_host_identity(
     assert post_calls[1] is not None
     assert post_calls[1]["owner"] == _OWNER
     assert len(post_calls) == 2
+    assert provision_targets == ["omnigent"]
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:

@@ -685,7 +685,9 @@ function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useCodaSandboxesMock.mockReset();
-  useCodaSandboxesMock.mockReturnValue({ data: [] } as ReturnType<typeof useCodaSandboxes>);
+  useCodaSandboxesMock.mockReturnValue({
+    data: [],
+  } as unknown as ReturnType<typeof useCodaSandboxes>);
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();

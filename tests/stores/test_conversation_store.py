@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing
+from typing import Any
+
 import pytest
 from sqlalchemy import text
 
@@ -26,6 +29,26 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 
 # ── CRUD ──────────────────────────────────────────────
+
+
+def _detach_in_process(
+    db_uri: str,
+    conversation_id: str,
+    host_id: str,
+    start: Any,
+    results: Any,
+) -> None:
+    """Spawn-safe worker for the database-backed detach race test."""
+    try:
+        store = SqlAlchemyConversationStore(db_uri)
+        start.wait(timeout=10)
+        detached = store.detach_conversation(
+            conversation_id,
+            expected_host_id=host_id,
+        )
+        results.put(("ok", detached.detached_at))
+    except Exception as exc:  # pragma: no cover - reported in the parent
+        results.put(("error", type(exc).__name__))
 
 
 def test_fork_drops_import_provenance_labels(
@@ -2699,6 +2722,129 @@ def test_clear_host_binding_nulls_all_binding_fields(
     assert refetched.runner_id is None
     # And the session can be re-bound (the CAS sees runner_id IS NULL).
     assert conversation_store.set_runner_id(conv.id, "runner_token_retry") is True
+
+
+def test_detach_preserves_history_metadata_and_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Release clears only operational affinity and survives a repeated request."""
+    host_id = "913f058a4a48002a654a80be0ee09bfb"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation(title="retained title")
+    conversation_store.set_labels(conv.id, {"retained": "yes"})
+    conversation_store.set_session_state(conv.id, {"counter": 3})
+    conversation_store.set_host_id(
+        conv.id,
+        host_id,
+        workspace="/tmp/ephemeral-workspace",
+        git_branch="feature/uncommitted",
+    )
+    assert conversation_store.set_runner_id(conv.id, "runner_release") is True
+
+    detached = conversation_store.detach_conversation(conv.id, expected_host_id=host_id)
+    assert detached.detached_at is not None
+    first_detached_at = detached.detached_at
+    assert detached.host_id is None
+    assert detached.runner_id is None
+    assert detached.workspace is None
+    assert detached.git_branch is None
+    assert detached.title == "retained title"
+    assert detached.labels == {"retained": "yes"}
+    assert detached.session_state == {"counter": 3}
+
+    repeated = conversation_store.detach_conversation(conv.id, expected_host_id=host_id)
+    assert repeated.detached_at == first_detached_at
+    assert repeated.title == "retained title"
+    assert repeated.labels == {"retained": "yes"}
+
+    rebound = conversation_store.set_host_id(conv.id, host_id, workspace="/tmp/fresh-workspace")
+    assert rebound.detached_at is None
+    assert rebound.workspace == "/tmp/fresh-workspace"
+
+
+def test_host_inventory_and_bulk_detach_are_host_scoped(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Indexed claim detach affects every sibling and no unrelated session."""
+    host_a = "a13f058a4a48002a654a80be0ee09bfb"
+    host_b = "b13f058a4a48002a654a80be0ee09bfb"
+    _register_host(db_uri, host_a)
+    _register_host(db_uri, host_b)
+    sessions = [conversation_store.create_conversation(title=f"session-{i}") for i in range(3)]
+    conversation_store.set_host_id(sessions[0].id, host_a, workspace="/tmp/a0")
+    conversation_store.set_host_id(sessions[1].id, host_a, workspace="/tmp/a1")
+    conversation_store.set_host_id(sessions[2].id, host_b, workspace="/tmp/b0")
+
+    assert {item.id for item in conversation_store.list_conversations_by_host_id(host_a)} == {
+        sessions[0].id,
+        sessions[1].id,
+    }
+    assert set(conversation_store.detach_conversations_by_host_id(host_a)) == {
+        sessions[0].id,
+        sessions[1].id,
+    }
+    assert conversation_store.list_conversations_by_host_id(host_a) == []
+    untouched = conversation_store.get_conversation(sessions[2].id)
+    assert untouched is not None
+    assert untouched.host_id == host_b
+    assert untouched.detached_at is None
+
+
+def test_detach_compare_fence_rejects_concurrent_rebind(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    host_id = "c13f058a4a48002a654a80be0ee09bfb"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation()
+    conversation_store.set_host_id(conv.id, host_id, workspace="/tmp/current")
+    with pytest.raises(ValueError, match="binding changed"):
+        conversation_store.detach_conversation(
+            conv.id,
+            expected_host_id="d13f058a4a48002a654a80be0ee09bfb",
+        )
+    assert conversation_store.get_conversation(conv.id).host_id == host_id  # type: ignore[union-attr]
+
+
+def test_process_separated_repeated_detach_is_database_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Two independent processes cannot corrupt or cross-route one detach."""
+    host_id = "f13f058a4a48002a654a80be0ee09bfb"
+    _register_host(db_uri, host_id)
+    conv = conversation_store.create_conversation(title="process-retained")
+    conversation_store.set_labels(conv.id, {"private": "retained"})
+    conversation_store.set_host_id(conv.id, host_id, workspace="/tmp/process-race")
+
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_detach_in_process,
+            args=(db_uri, conv.id, host_id, start, results),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    outcomes = [results.get(timeout=20) for _ in processes]
+    for process in processes:
+        process.join(timeout=20)
+        assert process.exitcode == 0
+    assert [outcome[0] for outcome in outcomes] == ["ok", "ok"]
+    assert outcomes[0][1] == outcomes[1][1]
+
+    detached = conversation_store.get_conversation(conv.id)
+    assert detached is not None
+    assert detached.host_id is None and detached.workspace is None
+    assert detached.detached_claim_host_id == host_id
+    assert detached.title == "process-retained"
+    assert detached.labels == {"private": "retained"}
 
 
 def test_clear_host_binding_missing_conversation_raises(

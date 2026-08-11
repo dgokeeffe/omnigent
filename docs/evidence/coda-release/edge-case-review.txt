@@ -1,0 +1,126 @@
+Perfect! Now I have enough information. Let me provide my complete review:
+
+---
+
+## Code Review: Working Tree Diff Against fork/dev
+
+**Status: FINDINGS IDENTIFIED** | Read-only review completed | Evidence-backed
+
+### Summary
+This diff introduces history-preserving CoDA sandbox release and resume functionality with proper locking and fence preservation semantics. The implementation is generally sound with comprehensive test coverage, but contains one **notable exception handling issue** that can mask root causes and two **observability gaps**.
+
+---
+
+### FINDING 1: Exception Masking in Resume Error Handler
+
+**Severity:** MEDIUM | **File:** `omnigent/server/routes/sessions/routes_lifecycle.py:443-464`
+
+**Location:** Lines 449-453 (detach_conversation call inside error handler with no exception wrapping)
+
+**Issue:**
+When resume launch fails and the error handler attempts cleanup via `detach_conversation`, if that cleanup call throws an exception (e.g., `ValueError: "session binding changed during release"`), the new exception **propagates and replaces** the original launch error. This masks the root cause.
+
+**Deterministic Reproduction:**
+1. Call `POST /v1/sessions/{session_id}/resume`
+2. During launch execution, trigger failure (e.g., provider timeout)
+3. Simultaneously (concurrent request), rebind the session to a different host
+4. The error handler calls `detach_conversation(session_id, expected_host_id=failed_host_id)`
+5. Because the session was rebound, `expected_host_id` check fails with `ValueError`
+6. Client receives 409 "Selected sandbox is unavailable" instead of original error
+7. Root cause (launch failure reason) is lost
+
+**Impact:**
+- Operators cannot diagnose why resume failed
+- Debugging and support complexity increases
+- Misleading error messages sent to client
+
+**Code Path:**
+```python
+# Line 443: Catch launch failure
+except Exception as exc:
+    # Line 449-453: Cleanup without inner exception handling
+    await asyncio.to_thread(
+        conversation_store.detach_conversation,
+        session_id,
+        expected_host_id=failed_host_id,  # If this throws, exc is lost
+    )
+    # Line 460-463: Wrong exception raised
+    raise HTTPException(...) from exc  # exc may not be original error
+```
+
+---
+
+### FINDING 2: Tracker State Not Explicitly Cleaned Up on Exception
+
+**Severity:** LOW (Observability Gap) | **File:** `omnigent/server/routes/sessions/routes_lifecycle.py:390-436`
+
+**Location:** Lines 390 `tracker.begin()` with no matching `tracker.fail()` or `tracker.finish()` on exception path
+
+**Issue:**
+When an exception occurs during resume launch, `tracker.begin(session_id)` is called at line 390 but the error handler (lines 443-464) does not explicitly call `tracker.fail()`. The entry remains in the tracker until it's replaced by the next `begin()` call.
+
+**Impact:**
+- Observability gap: failed launch state is not recorded in tracker
+- `tracker.get(session_id)` may return stale state between failure and next attempt
+- Mitigated by design: `begin()` replaces prior entries per documentation
+
+**Affected Code:**
+```python
+# Line 390
+tracker.begin(session_id)
+launch_state = tracker.get(session_id)
+try:
+    # ... launch work ...
+except Exception as exc:
+    # No tracker.fail(session_id, str(exc)) here
+    raise HTTPException(...) from exc
+```
+
+---
+
+### FINDING 3: Silently Confusing State If Host Becomes Inaccessible After Fence Preservation
+
+**Severity:** LOW (Operational Edge Case) | **File:** `omnigent/server/routes/sessions/routes_lifecycle.py:180-182`
+
+**Location:** retry path after failed terminate
+
+**Issue:**
+When `terminate_managed_host` fails (lines 207-209, 287-289), the cleanup fence `detached_claim_host_id` is intentionally preserved for retry. However, if the host is later manually deleted or becomes inaccessible before retry, the retry fails with generic "Sandbox claim is unavailable" without clarifying that the host is dead.
+
+**Impact:**
+- Confusing error message on retry after external host deletion
+- Not a functional bug—fence preservation is intentional and tested
+- Operational edge case (admin manually deletes host)
+
+**Example Sequence:**
+1. Release fails: `terminate_managed_host` throws, fence preserved
+2. Admin manually deletes host from database
+3. User retries release
+4. Line 180: `get_host(host.host_id)` returns None
+5. Line 181-182: raises 409 "Sandbox claim is unavailable"
+6. User unaware: host is actually dead, not just unavailable
+
+---
+
+### Clean/Verified Areas ✅
+
+- **Locking:** Mutual exclusion via `_claim_lock` prevents concurrent release/resume races; properly tested with `test_concurrent_releases_serialize_and_disconnect_once`
+- **Idempotency:** Double-check pattern before lock, verified in `test_session_release_preserves_history_and_shared_claim_then_is_idempotent`
+- **Fence Preservation:** Failed terminate leaves fence for retry; explicitly tested in `test_ambiguous_disconnect_preserves_fence_and_redacts_error` with working retry path
+- **Authorization:** Cross-user access concealed; tested in `test_cross_user_release_is_concealed_and_non_mutating`
+- **Schema:** Two new nullable columns + two indexes with workspace_id prefix; no migrations issues
+- **Input Validation:** `ResumeSessionRequest` with `additionalProperties: false` prevents lease/host injection; tested in `test_clients_cannot_supply_lease_or_host_to_resume`
+- **Error Redaction:** Provider URLs, credentials, tokens redacted in error responses; tested in `test_ambiguous_disconnect_preserves_fence_and_redacts_error`
+- **Web Client:** Proper URL encoding, backward-compatible error parsing (supports both `error.message` and `detail` fields)
+
+---
+
+### Recommendations
+
+1. **Wrap cleanup in error handler with try/except or context manager** to prevent masking original exception
+2. **Explicit tracker.fail() call** on exception path for observability
+3. **Optional: Auto-clear stale fence** if host becomes unreachable on retry (operational improvement only)
+
+---
+
+**No critical security or data loss issues identified. No malformed input, duplicate request, or concurrent process failures found.**

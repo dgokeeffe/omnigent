@@ -971,9 +971,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         if pool_raw is None:
             if not legacy_name or not legacy_url:
                 raise ValueError("sandbox.coda requires both app_name and app_url, or pool")
-            pool_raw = [
-                {"app_id": legacy_name, "app_name": legacy_name, "app_url": legacy_url}
-            ]
+            pool_raw = [{"app_id": legacy_name, "app_name": legacy_name, "app_url": legacy_url}]
         if not isinstance(pool_raw, list) or not pool_raw:
             raise ValueError("sandbox.coda.pool must be a non-empty list")
         bindings: list[tuple[str, str, str]] = []
@@ -984,18 +982,23 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             label = f"sandbox.coda.pool[{index}]"
             if not isinstance(item, dict):
                 raise ValueError(f"{label} must be a mapping")
-            _reject_unknown_keys(item, {"app_id", "app_name", "app_url"}, label)
-            app_id = item.get("app_id")
-            app_name = item.get("app_name")
-            app_url = item.get("app_url")
-            if not all(
-                isinstance(value, str) and value.strip()
-                for value in (app_id, app_name, app_url)
+            item_map = cast(dict[str, object], item)
+            _reject_unknown_keys(item_map, {"app_id", "app_name", "app_url"}, label)
+            raw_app_id = item_map.get("app_id")
+            raw_app_name = item_map.get("app_name")
+            raw_app_url = item_map.get("app_url")
+            if (
+                not isinstance(raw_app_id, str)
+                or not raw_app_id.strip()
+                or not isinstance(raw_app_name, str)
+                or not raw_app_name.strip()
+                or not isinstance(raw_app_url, str)
+                or not raw_app_url.strip()
             ):
                 raise ValueError(f"{label} requires non-empty app_id, app_name, and app_url")
-            app_id = app_id.strip()
-            app_name = app_name.strip()
-            app_url = app_url.strip().rstrip("/")
+            app_id = raw_app_id.strip()
+            app_name = raw_app_name.strip()
+            app_url = raw_app_url.strip().rstrip("/")
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", app_id) is None:
                 raise ValueError(f"{label}.app_id must be 1-64 URL-safe characters")
             parsed_url = urlparse(app_url)
@@ -2378,9 +2381,7 @@ async def launch_managed_host(
     try:
         if coda_launcher is not None and coda_app_id is not None:
             await asyncio.to_thread(coda_launcher.prepare, coda_app_id)
-            sandbox_id = await asyncio.to_thread(
-                coda_launcher.provision, host_name, coda_app_id
-            )
+            sandbox_id = await asyncio.to_thread(coda_launcher.provision, host_name, coda_app_id)
         else:
             await asyncio.to_thread(launcher.prepare)
             sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
@@ -2458,42 +2459,47 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    coda_launcher = None
     if launcher.provider == "coda":
         from omnigent.onboarding.sandboxes.coda import CodaProvider
 
-        if isinstance(launcher, CodaProvider):
-            launcher.set_lease_owner(host.user_id)
+        if not isinstance(launcher, CodaProvider):
+            raise HTTPException(status_code=400, detail="configured CoDA provider is invalid")
+        coda_launcher = launcher
+        coda_launcher.set_lease_owner(host.user_id)
     # A CoDA disconnect is a lease fence, not disposable sandbox cleanup.
     # If its outcome is uncertain, preserve the old identity and never acquire
     # on another App. Other providers retain their historical best-effort path.
     fenced_coda_app_id: str | None = None
-    if launcher.provider == "coda" and host.sandbox_id is not None:
+    if coda_launcher is not None and host.sandbox_id is not None:
         try:
             # Relaunch is App-fenced: resolve the immutable granting App before
             # release and reacquire only there, never through pool spillover.
-            fenced_coda_app_id = launcher.app_id_for_sandbox(host.sandbox_id)
-            await asyncio.to_thread(launcher.terminate, host.sandbox_id)
+            fenced_coda_app_id = coda_launcher.app_id_for_sandbox(host.sandbox_id)
+            await asyncio.to_thread(coda_launcher.terminate, host.sandbox_id)
         except click.ClickException as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"managed CoDA relaunch could not release its fenced lease: {exc.message}",
+                detail="managed CoDA relaunch could not release its fenced lease",
             ) from exc
     else:
         await _terminate_sandbox_best_effort(launcher, host)
     try:
-        if fenced_coda_app_id is not None:
-            await asyncio.to_thread(launcher.prepare, fenced_coda_app_id)
+        if fenced_coda_app_id is not None and coda_launcher is not None:
+            await asyncio.to_thread(coda_launcher.prepare, fenced_coda_app_id)
             sandbox_id = await asyncio.to_thread(
-                launcher.provision, host.name, fenced_coda_app_id
+                coda_launcher.provision, host.name, fenced_coda_app_id
             )
         else:
             await asyncio.to_thread(launcher.prepare)
             sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"managed sandbox relaunch failed: {exc.message}",
-        ) from exc
+        detail = (
+            "managed CoDA relaunch failed on its fenced App"
+            if coda_launcher is not None
+            else f"managed sandbox relaunch failed: {exc.message}"
+        )
+        raise HTTPException(status_code=502, detail=detail) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
         config=config,
@@ -2969,10 +2975,12 @@ async def terminate_managed_host(
         try:
             await asyncio.to_thread(launcher.terminate, host.sandbox_id)
         except Exception as exc:
-            message = exc.message if isinstance(exc, click.ClickException) else str(exc)
+            # Provider payloads can contain App URLs, names, owners or tokens.
+            # Keep the public error and logs deliberately content-free.
+            _logger.warning("Managed CoDA release outcome is uncertain; durable fence preserved")
             raise HTTPException(
                 status_code=502,
-                detail=f"managed CoDA lease release is uncertain; host preserved: {message}",
+                detail="managed sandbox release is uncertain; host preserved for retry",
             ) from exc
     else:
         await _terminate_sandbox_best_effort(launcher, host)

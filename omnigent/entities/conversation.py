@@ -236,6 +236,10 @@ class Conversation:
     # outstanding approval-prompt count (None = never written).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
+    # Explicit Release state. Ordinary never-bound sessions keep this unset.
+    detached_at: int | None = None
+    # Internal cleanup fence reference; never serialized to clients.
+    detached_claim_host_id: str | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.

@@ -220,6 +220,8 @@ def _to_conversation(
             else None
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
+        detached_at=meta.detached_at if meta else None,
+        detached_claim_host_id=meta.detached_claim_host_id if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -3005,6 +3007,150 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def list_conversations_by_host_id(self, host_id: str) -> list[Conversation]:
+        """Return sessions bound to a host via the host-leading metadata index."""
+        with self._session("list_conversations_by_host_id") as session:
+            meta_rows = (
+                session.execute(
+                    select(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if not meta_rows:
+            return []
+        meta_by_id = {row.id: row for row in meta_rows}
+        ids = list(meta_by_id)
+        with self._conv_session("list_conversations_by_host_id") as session:
+            rows = (
+                session.execute(
+                    select(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(ids),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            labels = _fetch_labels_bulk(session, ids)
+        return [_to_conversation(row, meta_by_id[row.id], labels.get(row.id, {})) for row in rows]
+
+    def list_conversations_by_detached_claim_host_id(self, host_id: str) -> list[Conversation]:
+        """Return detached sessions retaining a cleanup-only host fence."""
+        with self._session("list_conversations_by_detached_claim_host_id") as session:
+            meta_rows = (
+                session.execute(
+                    select(SqlConversationMetadata).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.detached_claim_host_id == host_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        if not meta_rows:
+            return []
+        meta_by_id = {row.id: row for row in meta_rows}
+        ids = list(meta_by_id)
+        with self._conv_session("list_detached_claim_conversations") as session:
+            rows = (
+                session.execute(
+                    select(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(ids),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            labels = _fetch_labels_bulk(session, ids)
+        return [_to_conversation(row, meta_by_id[row.id], labels.get(row.id, {})) for row in rows]
+
+    def clear_detached_claim_host_id(self, host_id: str) -> None:
+        """Clear cleanup references only after definitive provider disconnect."""
+        with self._session("clear_detached_claim_host_id") as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.detached_claim_host_id == host_id,
+                )
+                .values(detached_claim_host_id=None)
+            )
+
+    def detach_conversation(
+        self, conversation_id: str, *, expected_host_id: str | None = None
+    ) -> Conversation:
+        """Atomically clear one session's operational affinity and mark it detached."""
+        with self._session_immediate("detach_conversation") as session:
+            stmt = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                stmt = stmt.with_for_update()
+            meta = session.execute(stmt).scalar_one_or_none()
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            if expected_host_id is not None and meta.host_id not in (None, expected_host_id):
+                raise ValueError("session binding changed during release")
+            if meta.detached_at is None or meta.host_id is not None:
+                meta.detached_at = now_epoch()
+            if meta.host_id is not None:
+                meta.detached_claim_host_id = meta.host_id
+            meta.host_id = None
+            meta.workspace = None
+            meta.git_branch = None
+            meta.runner_id = None
+            meta.runner_last_seen = None
+            meta.live_status = None
+            meta.pending_elicitation_count = None
+        with self._conv_session("detach_conversation_hydrate") as session:
+            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            labels = _fetch_labels(session, conversation_id)
+        return _to_conversation(row, meta, labels)
+
+    def detach_conversations_by_host_id(self, host_id: str) -> list[str]:
+        """Atomically detach all sessions still bound to ``host_id``."""
+        with self._session_immediate("detach_conversations_by_host_id") as session:
+            stmt = select(SqlConversationMetadata.id).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.host_id == host_id,
+            )
+            if self._meta_supports_for_update:
+                stmt = stmt.with_for_update()
+            ids = list(session.execute(stmt).scalars().all())
+            if ids:
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(ids),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                    .values(
+                        host_id=None,
+                        workspace=None,
+                        git_branch=None,
+                        runner_id=None,
+                        runner_last_seen=None,
+                        live_status=None,
+                        pending_elicitation_count=None,
+                        detached_at=now_epoch(),
+                        detached_claim_host_id=host_id,
+                    )
+                )
+            return ids
+
     def list_conversations_by_runner_id(
         self,
         runner_id: str,
@@ -3101,6 +3247,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             meta.host_id = host_id
+            # A successful fresh bind is the only transition out of detached.
+            meta.detached_at = None
+            meta.detached_claim_host_id = None
             if workspace is not None:
                 meta.workspace = workspace
             if git_branch is not None:

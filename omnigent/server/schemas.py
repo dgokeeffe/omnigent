@@ -1903,6 +1903,9 @@ class SessionResponse(BaseModel):
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    # Explicit history-preserving Release state; distinct from never-bound.
+    detached: bool = False
+    detached_at: int | None = None
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)

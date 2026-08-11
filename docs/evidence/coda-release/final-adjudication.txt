@@ -1,0 +1,158 @@
+---
+
+## FINAL VERIFICATION ADJUDICATION
+
+**Scope:** History-Preserving CoDA Release & Resume Implementation (Tranches 9.1–9.6)
+**Authority:** Read-only verification adjudicator
+**Mode:** Evidence-backed synthesis of prior reviews + deterministic verification
+
+---
+
+### **DECISION: ACCEPT ✅**
+
+---
+
+## DEDUPLICATION & BLOCKER ASSESSMENT
+
+I have reviewed all evidence reports and deduplicated findings across 6 prior reviews:
+
+#### **Finding 1: Resume Error Code (MEDIUM) → FIXED ✅**
+- **Original (requirements-review.txt:46):** Code returned `409` for acquisition/reconstruction/bind failures; spec required `503 RESUME_FAILED`
+- **Current (omnigent/server/routes/sessions/routes_lifecycle.py:470):** Returns `503` with message "Resume failed; the session remains detached and can be retried"
+- **Verification:** Test `test_resume_failure_leaves_session_detached_and_redacts_provider_error` PASSES with `assert response.status_code == 503`
+- **Blocker:** ✅ **NO** — Correct implementation verified
+
+#### **Finding 2: Error Message Accuracy (LOW) → FIXED ✅**
+- **Original (requirements-review.txt:409):** Message masked root cause (git clone vs. unavailable target)
+- **Current (line 471):** "Resume failed; the session remains detached and can be retried" (accurate, actionable, non-disclosing)
+- **Blocker:** ✅ **NO**
+
+#### **Finding 3: Exception Masking in Handler (MEDIUM) → FIXED ✅**
+- **Original (edge-case-review.txt:443-464):** If `detach_conversation()` threw in error handler, original launch error masked
+- **Current (lines 456-471):**
+  - Line 457: `contextlib.suppress(ValueError)` prevents detach binding-check from masking
+  - Line 464: `contextlib.suppress(Exception)` on already-failed cleanup
+  - Line 470: `from exc` preserves exception chain
+- **Blocker:** ✅ **NO** — Proper exception handling verified
+
+#### **Finding 4: Tracker State Not Cleaned (LOW) → FIXED ✅**
+- **Original (edge-case-review.txt:390):** No `tracker.fail()` on exception path
+- **Current (line 450):** `tracker.fail(session_id, "resume failed")` explicitly recorded
+- **Blocker:** ✅ **NO** — Observability gap closed
+
+#### **Finding 5: Host Becomes Inaccessible After Fence (LOW) → NOT A BLOCKER ✓**
+- **Status:** Intentional per spec (design:25): "Never clear a fence merely to make a retry disappear"
+- **Assessment:** Fence preservation is correct; error redaction takes security priority over rare admin-deletion UX clarity
+- **Blocker:** ✅ **NO** — Acceptable operational trade-off
+
+#### **New Blockers from Re-Reviews → NONE ✓**
+- requirements-rereview.txt: "ALL FINDINGS RESOLVED | NO NEW BLOCKERS"
+- edge-case-rereview.txt: "ALL PRIOR FINDINGS FIXED OR APPROPRIATELY SCOPED"
+- regression-review.txt: "NO FINDINGS"
+- security-data-review.txt: "NO FINDINGS"
+
+**Surviving Blockers:** **NONE**
+
+---
+
+## COMPLIANCE VERIFICATION AGAINST TRANCHES 9.1–9.6
+
+### **Tranche 9.1–9.2: State Transitions** ✅
+- ✅ Release single session, sibling remains: atomically detaches; host not disconnected
+- ✅ Release single session, last on claim: detaches + disconnects + scrubs fence
+- ✅ Release sandbox: all sessions detach; single disconnect
+- ✅ Idempotency: pre-detached sessions return 204 with no mutation
+- ✅ Sub-agent rejection: returns `409`
+- ✅ Running session rejection: returns `409`
+- **Evidence:** test_session_release_preserves_history_and_shared_claim_then_is_idempotent PASSES
+
+### **Tranche 9.3–9.4: Atomicity & Fencing** ✅
+- ✅ Detach uses `SELECT...FOR UPDATE` + `_session_immediate()` commit
+- ✅ In-process lock (`_claim_lock`) serializes all 3 mutation endpoints
+- ✅ Double-check pattern (pre-lock + re-lock) guards race conditions
+- ✅ Concurrent serialization verified: test_concurrent_releases_serialize_and_disconnect_once PASSES
+- ✅ Process-separated race tested: test_process_separated_repeated_detach_is_database_idempotent PASSES
+- ✅ Fence preservation on ambiguous disconnect; indexed queries use `workspace_id` prefix
+
+### **Tranche 9.5: Authentication, Authorization & Disclosure** ✅
+- ✅ All endpoints require authentication: `require_user()` on all 4 routes
+- ✅ Owner-level permission: `_owned_session()` enforces `LEVEL_OWNER` (4)
+- ✅ Cross-user access returns 404 (not 403): test_cross_user_release_is_concealed_and_non_mutating PASSES
+- ✅ Claim inventory sanitized: no APP_ID, LEASE_ID, HOST_ID, owner identity, tokens in API response
+- ✅ Error redaction verified: test_ambiguous_disconnect_preserves_fence_and_redacts_error PASSES
+- ✅ Clients cannot supply lease/host: `ResumeSessionRequest` uses `extra="forbid"`
+
+### **Tranche 9.6: API & UI** ✅
+- ✅ `GET /v1/coda/claims` returns sanitized caller-owned inventory
+- ✅ `POST /v1/sessions/{id}/release` returns 204 when detached/released
+- ✅ `POST /v1/coda/claims/{id}/release` atomically detaches all sessions on claim
+- ✅ `POST /v1/sessions/{id}/resume` accepts optional `{"sandbox_app_id": "..."}` only
+- ✅ History preserved: title, labels, session_state retained across detach/resume
+- ✅ Operational binding cleared: host_id, runner_id, workspace, git_branch, live_status set to NULL
+
+---
+
+## TEST EVIDENCE (17/17 PASSING)
+
+**Route Tests (14 PASSED):**
+- test_lifecycle_requires_authentication
+- test_cross_user_release_is_concealed_and_non_mutating
+- test_session_release_preserves_history_and_shared_claim_then_is_idempotent
+- test_concurrent_releases_serialize_and_disconnect_once
+- test_sandbox_release_detaches_all_and_scrubs_once
+- test_ambiguous_disconnect_preserves_fence_and_redacts_error
+- test_inventory_is_owner_scoped_and_sanitized
+- test_resume_automatic_or_manual_binds_fresh_workspace_idempotently (2 variants)
+- test_resume_failure_leaves_session_detached_and_redacts_provider_error
+- test_removed_or_forged_manual_target_fails_before_mutation
+- test_cross_user_resume_is_concealed
+- test_concurrent_resume_acquires_once
+- test_clients_cannot_supply_lease_or_host_to_resume
+
+**Store Tests (3 PASSED):**
+- test_detach_preserves_history_metadata_and_is_idempotent
+- test_host_inventory_and_bulk_detach_are_host_scoped
+- test_process_separated_repeated_detach_is_database_idempotent
+
+---
+
+## SCHEMA & ATOMICITY VERIFIED
+
+| Component | Status |
+|-----------|--------|
+| New columns (detached_at, detached_claim_host_id) | ✅ Nullable, safe |
+| Indexes (host_id, detached_claim_host_id scoped by workspace_id) | ✅ Proper |
+| Migration chains off fork/dev base | ✅ Correct |
+| Store methods atomicity | ✅ `_session_immediate()` with FOR UPDATE |
+| Exception chains | ✅ All HTTPException use `from exc` |
+| Tracker state | ✅ Explicit fail() on exception |
+
+---
+
+## RISK ASSESSMENT
+
+| Category | Level | Confidence |
+|----------|-------|-----------|
+| Authorization | Low | High (404 concealment, LEVEL_OWNER enforced, sanitized inventory) |
+| Data integrity | Low | High (atomic transactions, history preserved, tested) |
+| Concurrency | Low | High (double-check + lock, fencing tested, race tests pass) |
+| Error handling | Low | High (exception chains, no masking, tracker explicit) |
+| Rollback safety | Low | High (additive feature, nullable fields, nullable-safe) |
+
+---
+
+## FINAL ADJUDICATION
+
+### **✅ ACCEPT — Ready for merge to `fork/dev`**
+
+**Conditions met:**
+1. All prior MEDIUM findings (2) → FIXED
+2. All prior LOW findings (3) → FIXED or appropriately scoped
+3. Zero new blockers from re-reviews
+4. All compliance tranches (9.1–9.6) → VERIFIED
+5. Test coverage → 17/17 passing (deterministic)
+6. Security/Regression reviews → NO FINDINGS
+7. Exception handling → Safe (no masking, chains preserved)
+8. Authorization → Enforced (404 concealment, LEVEL_OWNER, sanitized)
+
+**No surviving blockers by severity/file:line.** Implementation is evidence-backed, test-verified, and ready for production.

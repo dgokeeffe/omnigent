@@ -256,6 +256,9 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /** Explicit history-preserving Release state. */
+  detached?: boolean;
+  detachedAt?: number | null;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status

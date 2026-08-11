@@ -1814,6 +1814,69 @@ async def test_coda_picker_api_is_sanitized_stable_and_capacity_aware(
         assert forbidden not in serialized
 
 
+async def test_coda_picker_offers_an_app_whose_own_host_died(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A dead own host must not fence its owner out of that App.
+
+    Regression: the row for a recycled container stayed "mine" but not live, so
+    the picker rendered the App ``unavailable`` — permanently greyed for the one
+    person whose claim routes there, with a manual Release as the only exit.
+    Session create already ignores non-live hosts and re-acquires (the CoDA side
+    adopts the same owner-scoped lease), so the App is offered again and a dead
+    row consumes no capacity.
+    """
+    from omnigent.onboarding.sandboxes.coda import CodaAppBinding
+
+    def request_fn(
+        _method: str, path: str, _body: Mapping[str, object] | None
+    ) -> Mapping[str, object]:
+        assert path == "/api/omnigent-host/status"
+        return {"ready": True}
+
+    launcher = CodaProvider(
+        apps=(CodaAppBinding("app-a", "private-a", "https://a.private.example.com"),),
+        request_fns={"app-a": request_fn},
+        app_getter=lambda _name: SimpleNamespace(compute_status=SimpleNamespace(state="ACTIVE")),
+    )
+    config = ManagedSandboxConfig(
+        server_url="https://s.example.com",
+        launcher_factory=lambda: launcher,
+        token_ttl_s=3600,
+        provider="coda",
+        max_sessions_per_lease=10,
+    )
+    store = HostStore(db_uri)
+    # Registered but never connected: the launch that owned this row died, so
+    # host_is_live() is False while the sandbox fence still names app-a.
+    store.register_managed_host(
+        host_id="c0da0000000000000000000000000003",
+        name="mine-dead",
+        user_id="local",
+        token="mine-token",
+        provider="coda",
+        sandbox_id="coda:app-a#lease-secret-a",
+        token_expires_at=now_epoch() + 3600,
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/sandboxes/coda")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "sandboxes": [
+            {
+                "app_id": "app-a",
+                "label": "CoDA-Sandbox-1",
+                "ownership": "mine",
+                "state": "available",
+                "capacity": {"used": 0, "limit": 10},
+            },
+        ]
+    }
+
+
 # ── launch_managed_host ─────────────────────────────────────
 
 

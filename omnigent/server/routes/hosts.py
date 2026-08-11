@@ -687,13 +687,21 @@ def create_hosts_router(
             app_hosts = hosts_per_app[app_id]
             own_hosts = [host for host in app_hosts if host.user_id == user_id]
             ownership = "mine" if own_hosts else ("other" if app_hosts else "unclaimed")
+            # Only a LIVE own host consumes this App's capacity. A dead row (its
+            # container was recycled or the first launch never registered) is
+            # re-acquirable: session create ignores non-live hosts and starts a
+            # fresh acquisition, which the CoDA side adopts onto the same
+            # owner-scoped lease. Counting a dead row's sessions — or rendering
+            # the App unavailable because of it — fenced the owner out of the
+            # one App their claim routes to, with manual Release as the only
+            # exit. Ownership still reports "mine" so the claim stays visible.
+            live_own_hosts = [host for host in own_hosts if host_is_live(host)]
             used = (
-                sum(sessions_per_host.get(host.host_id, 0) for host in own_hosts)
+                sum(sessions_per_host.get(host.host_id, 0) for host in live_own_hosts)
                 if ownership == "mine"
                 else (0 if ownership == "unclaimed" else None)
             )
-            own_host_live = any(host_is_live(host) for host in own_hosts)
-            if not app_available or (ownership == "mine" and not own_host_live):
+            if not app_available:
                 state = "unavailable"
             elif ownership == "other" or (isinstance(used, int) and used >= limit):
                 state = "full"

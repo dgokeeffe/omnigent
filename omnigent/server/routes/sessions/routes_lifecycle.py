@@ -431,10 +431,16 @@ def register_lifecycle_routes(
             launch_state = tracker.get(session_id)
             new_host_id: str | None = adopted.host_id if adopted is not None else None
             workspace_allocated = False
+            launcher: CodaProvider | None = None
             try:
                 if adopted is not None:
-                    launcher = config.launcher_factory()
-                    if not isinstance(launcher, CodaProvider):
+                    candidate_launcher = config.launcher_factory()
+                    launcher = (
+                        candidate_launcher
+                        if isinstance(candidate_launcher, CodaProvider)
+                        else None
+                    )
+                    if launcher is None:
                         raise RuntimeError("CoDA provider is unavailable")
                     if repo is None:
                         workspace = await asyncio.to_thread(
@@ -490,7 +496,7 @@ def register_lifecycle_routes(
                     raise RuntimeError("resume failed")
             except Exception as exc:
                 tracker.fail(session_id, "resume failed")
-                if adopted is not None and workspace_allocated:
+                if adopted is not None and workspace_allocated and launcher is not None:
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(
                             launcher.release_workspace,

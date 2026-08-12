@@ -18,10 +18,46 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_cli_installed
+
+# ``opencode models`` shells out to the CLI; it answers in ~2s locally, so the
+# launch path can afford it, but a wedged CLI must not hold a launch open.
+_MODELS_LISTING_TIMEOUT_S = 30.0
+
+
+def list_opencode_models() -> list[str]:
+    """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
+
+    This is OpenCode's own view of what its configured providers + credentials
+    can reach, so it is the authoritative routability check for a model id we
+    intend to pin.
+
+    Best-effort: an absent CLI or a failed/empty invocation yields ``[]``, which
+    callers read as "OpenCode listed nothing" rather than "no models exist".
+
+    :returns: One ``provider/model`` id per line of output, blanks dropped.
+    """
+    from omnigent.onboarding.harness_install import harness_install_spec
+
+    spec = harness_install_spec(OPENCODE_KEY)
+    if spec is None:
+        return []
+    try:
+        result = subprocess.run(
+            [spec.binary, "models"],
+            capture_output=True,
+            text=True,
+            timeout=_MODELS_LISTING_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
 
 # Common OpenCode providers → (provider id, display label, env var). The
 # provider id matches OpenCode's own id (the ``auth.json`` key and the

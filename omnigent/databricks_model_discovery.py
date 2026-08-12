@@ -12,7 +12,10 @@ import httpx
 
 _logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL_FAMILIES: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
+#: Claude tiers in default-preference order. Matches the tier precedence ucode
+#: applies (:mod:`omnigent.claude_native`): the flagship tier wins, and the
+#: opt-in Fable tier is last so it is never picked as a default.
+CLAUDE_MODEL_FAMILIES: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
 
 _MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
 _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"

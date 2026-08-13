@@ -11,6 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.coda_owner_locks import (
+    BlockingCallCompletedAfterCancellation,
+    CodaOwnerLockRegistry,
+    complete_cancellation_cleanup,
+    get_coda_owner_locks,
+    run_awaitable_cancellation_safe,
+    run_blocking_cancellation_safe,
+)
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.agent_store import AgentStore
@@ -63,17 +71,18 @@ def _owned_session(
     return conv
 
 
-def _claim_lock(request: Request) -> asyncio.Lock:
-    """Use the create/adopt lock so acquired lifecycle operations cannot cross-route."""
-    lock = getattr(request.app.state, "coda_adoption_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        request.app.state.coda_adoption_lock = lock
-    return lock
+def _claim_lock(request: Request, owner: str) -> CodaOwnerLockRegistry:
+    """Use the owner's create/adopt lock across claim lifecycle operations."""
+    return get_coda_owner_locks(request.app.state)
 
 
 def _host_is_owned(host: Any, owner: str) -> bool:
     return host is not None and host.user_id == owner and host.sandbox_provider == "coda"
+
+
+def _raise_release_cancellation(cancellation_pending: bool) -> None:
+    if cancellation_pending:
+        raise asyncio.CancelledError
 
 
 def register_lifecycle_routes(
@@ -147,19 +156,11 @@ def register_lifecycle_routes(
         )
         if conv.kind == "sub_agent":
             raise HTTPException(status_code=409, detail="Release the root session or sandbox")
-        if (
-            conv.detached_at is not None
-            and conv.host_id is None
-            and conv.detached_claim_host_id is None
-        ):
-            return Response(status_code=204)
         if conv.live_status in ("running", "waiting"):
             raise HTTPException(status_code=409, detail="Session is busy; stop it and retry")
-        if conv.host_id is None and conv.detached_claim_host_id is None:
-            await asyncio.to_thread(conversation_store.detach_conversation, session_id)
-            return Response(status_code=204)
 
-        async with _claim_lock(request):
+        cancellation_pending = False
+        async with _claim_lock(request, owner).hold(owner):
             conv = await asyncio.to_thread(
                 _owned_session,
                 session_id,
@@ -167,12 +168,56 @@ def register_lifecycle_routes(
                 conversation_store,
                 permission_store,
             )
+            if conv.live_status in ("running", "waiting"):
+                raise HTTPException(status_code=409, detail="Session is busy; stop it and retry")
             if (
                 conv.detached_at is not None
                 and conv.host_id is None
                 and conv.detached_claim_host_id is None
             ):
                 return Response(status_code=204)
+
+            # A first CoDA create returns while this owner's launch task is
+            # provisioning. Release must wait for that matching task while it
+            # still owns the same owner lock; otherwise detaching the unbound
+            # row races set_host_id(), which would silently reattach it later.
+            if conv.host_id is None and conv.detached_claim_host_id is None:
+                owner_launches = getattr(request.app.state, "coda_owner_launches", {})
+                launch_sessions = getattr(request.app.state, "coda_owner_launch_sessions", {})
+                launch_task = owner_launches.get(owner)
+                if launch_task is not None and launch_sessions.get(owner) == session_id:
+                    try:
+                        await run_awaitable_cancellation_safe(launch_task)
+                    except BlockingCallCompletedAfterCancellation:
+                        cancellation_pending = True
+                    except asyncio.CancelledError:
+                        # The background task itself was cancelled (for example,
+                        # during shutdown); this request still owns the row and
+                        # can safely detach it after re-reading below.
+                        pass
+                    except Exception:
+                        # Launch failures are already recorded by the tracker.
+                        # Release remains a cleanup operation and exposes none
+                        # of the provider exception.
+                        pass
+                    conv = await asyncio.to_thread(
+                        _owned_session,
+                        session_id,
+                        user_id,
+                        conversation_store,
+                        permission_store,
+                    )
+
+            if conv.host_id is None and conv.detached_claim_host_id is None:
+                try:
+                    await run_blocking_cancellation_safe(
+                        conversation_store.detach_conversation, session_id
+                    )
+                except BlockingCallCompletedAfterCancellation:
+                    cancellation_pending = True
+                _raise_release_cancellation(cancellation_pending)
+                return Response(status_code=204)
+
             claim_host_id = conv.host_id or conv.detached_claim_host_id
             host_store = getattr(request.app.state, "host_store", None)
             if host_store is None:
@@ -202,42 +247,59 @@ def register_lifecycle_routes(
                 if not isinstance(launcher, CodaProvider):
                     raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
                 try:
-                    await asyncio.to_thread(
+                    await run_blocking_cancellation_safe(
                         launcher.release_workspace,
                         host.sandbox_id,
                         session_id,
                     )
+                except BlockingCallCompletedAfterCancellation:
+                    cancellation_pending = True
                 except Exception as exc:
                     raise HTTPException(
                         status_code=503,
                         detail="Session workspace release failed; retry Release",
                     ) from exc
-            await asyncio.to_thread(
-                conversation_store.detach_conversation,
-                session_id,
-                expected_host_id=host.host_id,
-            )
-            if has_siblings:
-                await asyncio.to_thread(
-                    conversation_store.clear_detached_claim_host_id, host.host_id
+            try:
+                await run_blocking_cancellation_safe(
+                    conversation_store.detach_conversation,
+                    session_id,
+                    expected_host_id=host.host_id,
                 )
+            except BlockingCallCompletedAfterCancellation:
+                cancellation_pending = True
+            if has_siblings:
+                try:
+                    await run_blocking_cancellation_safe(
+                        conversation_store.clear_detached_claim_host_id, host.host_id
+                    )
+                except BlockingCallCompletedAfterCancellation:
+                    cancellation_pending = True
+                _raise_release_cancellation(cancellation_pending)
                 return Response(status_code=204)
             from omnigent.server.managed_hosts import terminate_managed_host
 
             try:
-                await terminate_managed_host(
-                    host,
-                    host_store,
-                    getattr(request.app.state, "sandbox_config", None),
+                await run_awaitable_cancellation_safe(
+                    terminate_managed_host(
+                        host,
+                        host_store,
+                        getattr(request.app.state, "sandbox_config", None),
+                    )
                 )
-                await asyncio.to_thread(
-                    conversation_store.clear_detached_claim_host_id, host.host_id
-                )
+            except BlockingCallCompletedAfterCancellation:
+                cancellation_pending = True
             except Exception as exc:
                 raise HTTPException(
                     status_code=503,
                     detail="Sandbox release is uncertain; retry this release",
                 ) from exc
+            try:
+                await run_blocking_cancellation_safe(
+                    conversation_store.clear_detached_claim_host_id, host.host_id
+                )
+            except BlockingCallCompletedAfterCancellation:
+                cancellation_pending = True
+            _raise_release_cancellation(cancellation_pending)
         return Response(status_code=204)
 
     @router.post("/coda/claims/{session_id}/release", status_code=204, response_model=None)
@@ -260,7 +322,8 @@ def register_lifecycle_routes(
         if anchor.host_id is None and anchor.detached_claim_host_id is None:
             raise HTTPException(status_code=409, detail="Sandbox claim is unavailable")
 
-        async with _claim_lock(request):
+        cancellation_pending = False
+        async with _claim_lock(request, owner).hold(owner):
             anchor = await asyncio.to_thread(
                 _owned_session,
                 session_id,
@@ -307,19 +370,27 @@ def register_lifecycle_routes(
             from omnigent.server.managed_hosts import terminate_managed_host
 
             try:
-                await terminate_managed_host(
-                    host,
-                    host_store,
-                    getattr(request.app.state, "sandbox_config", None),
+                await run_awaitable_cancellation_safe(
+                    terminate_managed_host(
+                        host,
+                        host_store,
+                        getattr(request.app.state, "sandbox_config", None),
+                    )
                 )
-                await asyncio.to_thread(
-                    conversation_store.clear_detached_claim_host_id, host.host_id
-                )
+            except BlockingCallCompletedAfterCancellation:
+                cancellation_pending = True
             except Exception as exc:
                 raise HTTPException(
                     status_code=503,
                     detail="Sandbox release is uncertain; retry this release",
                 ) from exc
+            try:
+                await run_blocking_cancellation_safe(
+                    conversation_store.clear_detached_claim_host_id, host.host_id
+                )
+            except BlockingCallCompletedAfterCancellation:
+                cancellation_pending = True
+            _raise_release_cancellation(cancellation_pending)
         return Response(status_code=204)
 
     @router.post("/sessions/{session_id}/resume", status_code=204, response_model=None)
@@ -356,7 +427,7 @@ def register_lifecycle_routes(
             raise HTTPException(status_code=409, detail="CoDA sandbox resume is unavailable")
         app_id = body.sandbox_app_id if body is not None else None
 
-        async with _claim_lock(request):
+        async with _claim_lock(request, owner).hold(owner):
             conv = await asyncio.to_thread(
                 _owned_session,
                 session_id,
@@ -432,6 +503,36 @@ def register_lifecycle_routes(
             new_host_id: str | None = adopted.host_id if adopted is not None else None
             workspace_allocated = False
             launcher: CodaProvider | None = None
+
+            async def _cleanup_failed_resume() -> None:
+                tracker.fail(session_id, "resume failed")
+                if adopted is not None and workspace_allocated and launcher is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(
+                            launcher.release_workspace,
+                            adopted.sandbox_id,
+                            session_id,
+                        )
+                rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if (
+                    rebound is not None
+                    and new_host_id is not None
+                    and rebound.host_id == new_host_id
+                ):
+                    with contextlib.suppress(ValueError):
+                        await asyncio.to_thread(
+                            conversation_store.detach_conversation,
+                            session_id,
+                            expected_host_id=new_host_id,
+                        )
+                    # A newly acquired claim is ours to clean up. An adopted
+                    # shared claim must remain for its sibling sessions.
+                    if adopted is None:
+                        failed_host = await asyncio.to_thread(host_store.get_host, new_host_id)
+                        if failed_host is not None:
+                            with contextlib.suppress(Exception):
+                                await terminate_managed_host(failed_host, host_store, config)
+
             try:
                 if adopted is not None:
                     candidate_launcher = config.launcher_factory()
@@ -443,13 +544,13 @@ def register_lifecycle_routes(
                     if launcher is None:
                         raise RuntimeError("CoDA provider is unavailable")
                     if repo is None:
-                        workspace = await asyncio.to_thread(
+                        workspace = await run_blocking_cancellation_safe(
                             launcher.allocate_workspace,
                             adopted.sandbox_id,
                             session_id,
                         )
                     else:
-                        workspace = await asyncio.to_thread(
+                        workspace = await run_blocking_cancellation_safe(
                             launcher.allocate_workspace,
                             adopted.sandbox_id,
                             session_id,
@@ -494,34 +595,15 @@ def register_lifecycle_routes(
                 rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if rebound is None or rebound.host_id is None or rebound.detached_at is not None:
                     raise RuntimeError("resume failed")
+            except BlockingCallCompletedAfterCancellation as exc:
+                workspace_allocated = True
+                await complete_cancellation_cleanup(_cleanup_failed_resume())
+                raise asyncio.CancelledError from exc
+            except asyncio.CancelledError:
+                await complete_cancellation_cleanup(_cleanup_failed_resume())
+                raise
             except Exception as exc:
-                tracker.fail(session_id, "resume failed")
-                if adopted is not None and workspace_allocated and launcher is not None:
-                    with contextlib.suppress(Exception):
-                        await asyncio.to_thread(
-                            launcher.release_workspace,
-                            adopted.sandbox_id,
-                            session_id,
-                        )
-                rebound = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-                if (
-                    rebound is not None
-                    and new_host_id is not None
-                    and rebound.host_id == new_host_id
-                ):
-                    with contextlib.suppress(ValueError):
-                        await asyncio.to_thread(
-                            conversation_store.detach_conversation,
-                            session_id,
-                            expected_host_id=new_host_id,
-                        )
-                    # A newly acquired claim is ours to clean up. An adopted
-                    # shared claim must remain for its sibling sessions.
-                    if adopted is None:
-                        failed_host = await asyncio.to_thread(host_store.get_host, new_host_id)
-                        if failed_host is not None:
-                            with contextlib.suppress(Exception):
-                                await terminate_managed_host(failed_host, host_store, config)
+                await _cleanup_failed_resume()
                 raise HTTPException(
                     status_code=503,
                     detail="Resume failed; the session remains detached and can be retried",

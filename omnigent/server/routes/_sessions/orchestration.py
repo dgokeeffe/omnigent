@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import secrets
 import time
@@ -333,6 +334,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    CallbackPendingInputEffects,
     ConversationNotFoundError,
     pinned_label_key,
 )
@@ -2004,6 +2006,7 @@ async def _persist_external_conversation_item(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     created_by: str | None = None,
+    callback_actor_scope: str = "",
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> str:
     """
@@ -2026,62 +2029,145 @@ async def _persist_external_conversation_item(
         no label is stamped in that case.
     :returns: Store-assigned conversation item id.
     """
-    item = _parse_external_conversation_item(body)
-    # A native user message round-tripping back from the transcript:
-    # drain its optimistic pending-input entry (FIFO) and fold the
-    # entry's file blocks (image / file) into the item BEFORE persisting.
-    # The transcript is text-only, so without this the image is dropped
-    # from durable history and disappears on every reload / navigation.
-    # The vendor CLI's own interrupt record is exempt: it is synthesized by
-    # Claude (not a queued web message) and has no pending entry, so
-    # draining for it would hand the queued message's uploads to the marker.
+    base_item = _parse_external_conversation_item(body)
+    keyed = body.idempotency_key is not None
     cleared_pending_id: str | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
-    if (
-        item.type == "message"
-        and isinstance(item.data, MessageData)
-        and item.data.role == "user"
-        and not item.data.is_meta
-        and not _is_native_interrupt_record(item.data)
-    ):
-        if _is_kiro_native_session(conv):
-            text = _message_text(item.data.content) or ""
-            matched = pending_inputs.resolve_matching_text(session_id, text)
-            drained = matched.matched
-            skipped_kiro_pending = matched.skipped
-        else:
-            drained = pending_inputs.resolve_oldest(session_id)
-        if drained is not None:
-            cleared_pending_id = drained.pending_id
-            item = _merge_pending_file_blocks(item, drained.content)
-            # Apply the original sender's identity recorded at POST time.
-            # The transcript forwarder is the single writer here and has no
-            # auth context, so the persisted item would otherwise have
-            # created_by=None, causing session.input.consumed to broadcast
-            # without an author — the label would flash in from the optimistic
-            # bubble then disappear once the committed item arrived.
-            if drained.created_by is not None and item.created_by is None:
-                item = item.model_copy(update={"created_by": drained.created_by})
-        elif item.created_by is None and created_by is not None:
-            # No pending entry — direct terminal input. Fall back to the
-            # identity authenticated on the forwarder's own request.
-            item = item.model_copy(update={"created_by": created_by})
+    drained: pending_inputs.DrainedInput | None = None
+
+    def prepare_item() -> NewConversationItem:
+        """Build the item only after the store has ruled out a replay."""
+        nonlocal drained, skipped_kiro_pending, cleared_pending_id
+        item = base_item
+        if (
+            item.type == "message"
+            and isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and not item.data.is_meta
+            and not _is_native_interrupt_record(item.data)
+        ):
+            if _is_kiro_native_session(conv):
+                text = _message_text(item.data.content) or ""
+                matched = (
+                    pending_inputs.peek_matching_text(session_id, text)
+                    if keyed
+                    else pending_inputs.resolve_matching_text(session_id, text)
+                )
+                drained = matched.matched
+                skipped_kiro_pending = matched.skipped
+            else:
+                drained = (
+                    pending_inputs.peek_oldest(session_id)
+                    if keyed
+                    else pending_inputs.resolve_oldest(session_id)
+                )
+            if drained is not None:
+                item = _merge_pending_file_blocks(item, drained.content)
+                if drained.created_by is not None and item.created_by is None:
+                    item = item.model_copy(update={"created_by": drained.created_by})
+                if not keyed:
+                    cleared_pending_id = drained.pending_id
+            elif item.created_by is None and created_by is not None:
+                item = item.model_copy(update={"created_by": created_by})
+        return item
+
+    def prepare_idempotent_item() -> tuple[NewConversationItem, CallbackPendingInputEffects]:
+        item = prepare_item()
+        return item, CallbackPendingInputEffects(
+            cleared_pending_id=drained.pending_id if drained is not None else None,
+            skipped_pending_ids=tuple(entry.pending_id for entry in skipped_kiro_pending),
+        )
+
+    created = True
+    if keyed:
+        from omnigent.stores.conversation_store.sqlalchemy_store import (
+            CallbackIdempotencyConflictError,
+        )
+
+        payload_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "type": body.type,
+                    "data": body.data,
+                    "created_by": body.created_by,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).digest()
+        idempotency_key = body.idempotency_key
+        assert idempotency_key is not None
+        try:
+            result = await asyncio.to_thread(
+                conversation_store.append_idempotent_callback,
+                session_id,
+                prepare_idempotent_item,
+                event_type=body.type,
+                idempotency_key=idempotency_key,
+                actor_scope=callback_actor_scope,
+                payload_digest=payload_digest,
+                retention_seconds=7 * 24 * 60 * 60,
+            )
+        except CallbackIdempotencyConflictError as exc:
+            raise OmnigentError(
+                "Idempotency key is already bound to another callback.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if result is None:
+            raise OmnigentError(
+                "This conversation store does not support durable callback idempotency.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        persisted, created, pending_effects = result
+
+        # Commit-before-side-effect recovery: the winner persists the exact ids
+        # with the item, so a replay after cancellation resolves the original
+        # inputs rather than peeking at and consuming a later queue entry.
+        pending_ids = list(pending_effects.skipped_pending_ids)
+        if pending_effects.cleared_pending_id is not None:
+            pending_ids.append(pending_effects.cleared_pending_id)
+        resolved = pending_inputs.resolve_ids(session_id, pending_ids)
+        resolved_by_id = {entry.pending_id: entry for entry in resolved}
+        skipped_kiro_pending = [
+            resolved_by_id[pending_id]
+            for pending_id in pending_effects.skipped_pending_ids
+            if pending_id in resolved_by_id
+        ]
+        if (
+            pending_effects.cleared_pending_id is not None
+            and pending_effects.cleared_pending_id in resolved_by_id
+        ):
+            cleared_pending_id = pending_effects.cleared_pending_id
+    else:
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [prepare_item()],
+        )
+        persisted = persisted_items[0]
+
     for skipped in skipped_kiro_pending:
         await _persist_skipped_kiro_pending_input(
             session_id,
             skipped,
             conversation_store,
         )
+
+    # Replays deliberately repeat publish/title/elicitation reconciliation with
+    # the original persisted item. Prepare semantic title generation before the
+    # synchronous fallback seed mutates the conversation title.
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
-        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        event=SessionEventInput(type=persisted.type, data=persisted.data.model_dump()),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
-    await _seed_missing_title_from_user_message(conv, item, conversation_store)
+    await _seed_missing_title_from_user_message(
+        conv, cast(NewConversationItem, persisted), conversation_store
+    )
     if pending_background_title is not None:
         pending_background_title.schedule()
-    persisted = persisted_items[0]
+    if keyed and not created:
+        _logger.info("Native callback replay deduplicated; event_type=%s", body.type)
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )

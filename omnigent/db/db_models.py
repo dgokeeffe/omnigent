@@ -864,6 +864,33 @@ class SqlConversation(ConversationBase):
     )
 
 
+class SqlCallbackIdempotency(ConversationBase):
+    """Bounded durable first-write record for authenticated native callbacks."""
+
+    __tablename__ = "callback_idempotency"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    key_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    payload_digest: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    pending_input_effects: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    item_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Global lifecycle cleanup orders across workspaces by expiry age.
+    __table_args__ = (Index("ix_callback_idempotency_created_at", "created_at"),)
+
+
 class SqlConversationItem(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_items`` table.

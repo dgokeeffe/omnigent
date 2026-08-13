@@ -1163,6 +1163,11 @@ class SessionEventInput(BaseModel):
         ``{"role": "user", "content": [{"type": "input_text",
         "text": "Hello"}]}``. For ``"interrupt"`` this is
         typically ``{}``.
+    :param idempotency_key: Optional stable logical-operation key for a
+        retryable durable native callback. The same key must be retained across
+        authentication refreshes and ambiguous retries. Keys are 1–128 ASCII
+        letters, digits, dots, underscores, colons, or hyphens. Legacy clients
+        may omit it.
     :param tools: Optional OpenAI function-tool dicts registered
         when this event creates a new task. Mirrors
         :attr:`CreateResponseRequest.tools`, e.g. ``[{"type":
@@ -1179,6 +1184,12 @@ class SessionEventInput(BaseModel):
     # Defaults to {} for payload-less control events (interrupt,
     # stop_session); item-typed events still fail loud per-type.
     data: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None

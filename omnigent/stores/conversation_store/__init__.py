@@ -3,6 +3,7 @@
 import hashlib
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -187,6 +188,14 @@ class CreatedSession:
 
     conversation: Conversation
     agent: Agent
+
+
+@dataclass(frozen=True)
+class CallbackPendingInputEffects:
+    """Pending-input side effects selected by an idempotent callback winner."""
+
+    cleared_pending_id: str | None = None
+    skipped_pending_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -571,6 +580,43 @@ class ConversationStore(ABC):
             Input ids with no matching messages map to an empty list.
         """
         ...
+
+    def append_idempotent_callback(
+        self,
+        conversation_id: str,
+        item_factory: Callable[[], tuple[NewConversationItem, CallbackPendingInputEffects]],
+        *,
+        event_type: str,
+        idempotency_key: str,
+        actor_scope: str,
+        payload_digest: bytes,
+        retention_seconds: int,
+    ) -> tuple[ConversationItem, bool, CallbackPendingInputEffects] | None:
+        """Atomically append a durable callback, or report no store capability.
+
+        Stores without durable cross-process first-write support return
+        ``None``. The route then rejects keyed callbacks before any transient
+        side effect instead of failing with an attribute error or pretending an
+        in-memory fallback is durable.
+        """
+        del conversation_id
+        del item_factory
+        del event_type
+        del idempotency_key
+        del actor_scope
+        del payload_digest
+        del retention_seconds
+        return None
+
+    def purge_expired_callback_idempotency(
+        self,
+        *,
+        retention_seconds: int,
+        limit: int,
+    ) -> int:
+        """Delete a bounded batch of expired callback keys, if supported."""
+        del retention_seconds, limit
+        return 0
 
     @abstractmethod
     def append(

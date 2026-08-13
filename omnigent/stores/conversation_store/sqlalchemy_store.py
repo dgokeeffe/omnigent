@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from collections.abc import Callable
 from typing import Any, Protocol, cast
 
 from sqlalchemy import (
@@ -18,8 +20,10 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    tuple_,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.sql.selectable import Subquery
 
@@ -28,6 +32,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
+    SqlCallbackIdempotency,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -86,6 +91,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
+    CallbackPendingInputEffects,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -95,6 +101,46 @@ from omnigent.stores.conversation_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class CallbackIdempotencyConflictError(ValueError):
+    """A callback key was reused outside its original scope or with another payload."""
+
+
+def _encode_callback_pending_effects(effects: CallbackPendingInputEffects) -> str:
+    return json.dumps(
+        {
+            "cleared_pending_id": effects.cleared_pending_id,
+            "skipped_pending_ids": list(effects.skipped_pending_ids),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _decode_callback_pending_effects(value: str) -> CallbackPendingInputEffects:
+    try:
+        decoded = json.loads(value)
+        cleared = decoded.get("cleared_pending_id")
+        skipped = decoded.get("skipped_pending_ids", [])
+        if cleared is not None and not isinstance(cleared, str):
+            raise ValueError
+        if not isinstance(skipped, list) or not all(isinstance(item, str) for item in skipped):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("invalid callback pending-input effects record") from exc
+    return CallbackPendingInputEffects(cleared, tuple(skipped))
+
+
+def _callback_idempotency_delete_statement(
+    keys: list[tuple[int, bytes]],
+) -> Any:
+    """Build a MySQL-safe delete from already-selected literal keys."""
+    return delete(SqlCallbackIdempotency).where(
+        tuple_(
+            SqlCallbackIdempotency.workspace_id,
+            SqlCallbackIdempotency.key_digest,
+        ).in_(keys)
+    )
 
 
 class _RowCountResult(Protocol):
@@ -1949,6 +1995,158 @@ class SqlAlchemyConversationStore(ConversationStore):
         column and its FTS row entirely.
         """
         return strip_nul_bytes(extract_search_text(item))
+
+    def append_idempotent_callback(
+        self,
+        conversation_id: str,
+        item_factory: Callable[[], tuple[NewConversationItem, CallbackPendingInputEffects]],
+        *,
+        event_type: str,
+        idempotency_key: str,
+        actor_scope: str,
+        payload_digest: bytes,
+        retention_seconds: int,
+    ) -> tuple[ConversationItem, bool, CallbackPendingInputEffects]:
+        """Atomically append one callback item or return its persisted replay."""
+        del retention_seconds
+        now = now_epoch()
+        workspace_id = current_workspace_id()
+        key_digest = hashlib.sha256(idempotency_key.encode()).digest()
+        actor_digest = hashlib.sha256(actor_scope.encode()).digest()
+
+        def validate(
+            session: Session,
+            record: SqlCallbackIdempotency,
+        ) -> tuple[ConversationItem, bool, CallbackPendingInputEffects]:
+            if (
+                record.conversation_id != conversation_id
+                or record.event_type != event_type
+                or record.actor_digest != actor_digest
+                or record.payload_digest != payload_digest
+            ):
+                raise CallbackIdempotencyConflictError(
+                    "idempotency key is already bound to a different callback"
+                )
+            persisted_row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == record.item_id,
+                )
+            ).scalar_one_or_none()
+            if persisted_row is None:
+                raise RuntimeError("callback idempotency record references a missing item")
+            decoded = self._decode_item_data_batch([persisted_row.data])[0]
+            return (
+                _to_item(persisted_row, decoded),
+                False,
+                _decode_callback_pending_effects(record.pending_input_effects),
+            )
+
+        try:
+            with self._conv_session("append_idempotent_callback") as session:
+                self._lock_conversation(session, conversation_id)
+                existing = session.get(SqlCallbackIdempotency, (workspace_id, key_digest))
+                if existing is not None:
+                    return validate(session, existing)
+                conv_row = session.get(SqlConversation, (workspace_id, conversation_id))
+                if conv_row is None:
+                    raise ConversationNotFoundError(conversation_id)
+                item, pending_effects = item_factory()
+                if conv_row.next_position is not None:
+                    position = conv_row.next_position
+                else:
+                    position = (
+                        session.execute(
+                            select(
+                                func.coalesce(func.max(SqlConversationItem.position), -1)
+                            ).where(
+                                SqlConversationItem.workspace_id == workspace_id,
+                                SqlConversationItem.conversation_id == conversation_id,
+                            )
+                        ).scalar_one()
+                        + 1
+                    )
+                data = self._encode_item_data(
+                    strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))
+                )
+                search = self._item_search_text(item)
+                item_id = generate_item_id(item.type)
+                row = SqlConversationItem(
+                    id=item_id,
+                    conversation_id=conversation_id,
+                    response_id=item.response_id,
+                    created_at=now,
+                    status=encode_item_status("completed"),
+                    position=position,
+                    type=encode_item_type(item.type),
+                    data=data,
+                    created_by=item.created_by,
+                )
+                if search is not None:
+                    row.search_text = search
+                    insert_fts_bulk(session, [(item_id, conversation_id, search)])
+                session.add(row)
+                session.add(
+                    SqlCallbackIdempotency(
+                        key_digest=key_digest,
+                        conversation_id=conversation_id,
+                        event_type=event_type,
+                        actor_digest=actor_digest,
+                        payload_digest=payload_digest,
+                        pending_input_effects=_encode_callback_pending_effects(pending_effects),
+                        item_id=item_id,
+                        created_at=now,
+                    )
+                )
+                conv_row.updated_at = now
+                conv_row.next_position = position + 1
+            return (
+                ConversationItem(
+                    id=item_id,
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=now,
+                    data=item.data,
+                    created_by=item.created_by,
+                ),
+                True,
+                pending_effects,
+            )
+        except IntegrityError:
+            with self._conv_session("read_idempotent_callback_after_race") as session:
+                existing = session.get(SqlCallbackIdempotency, (workspace_id, key_digest))
+                if existing is None:
+                    raise
+                return validate(session, existing)
+
+    def purge_expired_callback_idempotency(
+        self,
+        *,
+        retention_seconds: int,
+        limit: int,
+    ) -> int:
+        """Delete at most ``limit`` expired keys across all workspaces."""
+        cutoff = now_epoch() - retention_seconds
+        with self._conv_session("purge_expired_callback_idempotency") as session:
+            expired = (
+                session.execute(
+                    select(
+                        SqlCallbackIdempotency.workspace_id,
+                        SqlCallbackIdempotency.key_digest,
+                    )
+                    .where(SqlCallbackIdempotency.created_at < cutoff)
+                    .order_by(SqlCallbackIdempotency.created_at)
+                    .limit(limit)
+                )
+                .tuples()
+                .all()
+            )
+            if not expired:
+                return 0
+            result = session.execute(_callback_idempotency_delete_statement(list(expired)))
+            return int(getattr(result, "rowcount", 0) or 0)
 
     def append(
         self,
@@ -4044,6 +4242,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             bound_agent_ids = candidate_agent_ids - surviving_refs
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
+            ap_sess.execute(
+                delete(SqlCallbackIdempotency).where(
+                    SqlCallbackIdempotency.workspace_id == current_workspace_id(),
+                    SqlCallbackIdempotency.conversation_id.in_(subtree_ids),
+                )
+            )
             ap_sess.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),

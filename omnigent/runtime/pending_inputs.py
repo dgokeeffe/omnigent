@@ -243,6 +243,37 @@ def resolve(conversation_id: str, pending_id: str) -> None:
             _pending.pop(conversation_id, None)
 
 
+def peek_oldest(conversation_id: str) -> DrainedInput | None:
+    """Return the oldest pending entry without consuming it.
+
+    Idempotent callback handlers use this before their database first-write
+    decision, then consume the exact id only when that write wins. This keeps a
+    concurrent replay from draining the next logical input.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if not entries:
+            return None
+        return _drained_input(next(iter(entries.values())))
+
+
+def resolve_ids(conversation_id: str, pending_ids: list[str]) -> list[DrainedInput]:
+    """Consume exactly the named pending entries, preserving caller order."""
+    with _lock:
+        entries = _pending.get(conversation_id)
+        if not entries:
+            return []
+        resolved: list[DrainedInput] = []
+        for pending_id in pending_ids:
+            entry = entries.pop(pending_id, None)
+            if entry is not None:
+                resolved.append(_drained_input(entry))
+        if not entries:
+            _pending.pop(conversation_id, None)
+        return resolved
+
+
 def resolve_oldest(conversation_id: str) -> DrainedInput | None:
     """
     Drain the oldest pending entry (FIFO) and return it.
@@ -282,6 +313,27 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
             content=copy.deepcopy(entry.content),
             created_by=entry.created_by,
         )
+
+
+def peek_matching_text(conversation_id: str, text: str) -> MatchedDrain:
+    """Return the pending text match and skipped prefix without consuming either."""
+    needle = _normalize_text(text)
+    if not needle:
+        return MatchedDrain(matched=None, skipped=[])
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if not entries:
+            return MatchedDrain(matched=None, skipped=[])
+        ordered = list(entries.items())
+        for index, (_pending_id, entry) in enumerate(ordered):
+            entry_text = _normalize_text(_content_text(entry.content))
+            if entry_text and (needle == entry_text or needle.endswith(entry_text)):
+                return MatchedDrain(
+                    matched=_drained_input(entry),
+                    skipped=[_drained_input(value) for _key, value in ordered[:index]],
+                )
+        return MatchedDrain(matched=None, skipped=[])
 
 
 def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:

@@ -708,7 +708,72 @@ function headers(config) {
   };
 }
 
-async function postEvent(config, body) {
+function stableCanonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableCanonicalJson(entry)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableCanonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function callbackKeySecret(config) {
+  const latest = readConfig();
+  const token =
+    latest && typeof latest.relayToken === "string"
+      ? latest.relayToken
+      : config && typeof config.relayToken === "string"
+        ? config.relayToken
+        : "";
+  return token.length >= 32 ? token : "";
+}
+
+async function ensureDurableCallbackKey(config, body, sourceIdentity = "") {
+  if (
+    !body ||
+    body.type !== "external_conversation_item" ||
+    body.idempotency_key
+  )
+    return;
+  const secret = callbackKeySecret(config);
+  const cryptoApi = globalThis.crypto;
+  if (
+    !secret ||
+    !cryptoApi ||
+    !cryptoApi.subtle ||
+    typeof TextEncoder !== "function"
+  )
+    return;
+  const encoder = new TextEncoder();
+  const key = await cryptoApi.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = new Uint8Array(
+    await cryptoApi.subtle.sign(
+      "HMAC",
+      key,
+      encoder.encode(
+        stableCanonicalJson({ callback: body, sourceIdentity: String(sourceIdentity || "") }),
+      ),
+    ),
+  );
+  const digest = Buffer.from(signature).toString("base64url");
+  body.idempotency_key = `pi:v1:${digest}`;
+}
+
+async function postEvent(config, body, sourceIdentity = "") {
+  // Mutating the callback envelope keeps the logical key stable if auth is
+  // refreshed and the same operation is retried or persisted by a future outbox.
+  // Stable Pi message/event identity distinguishes identical-content events.
+  await ensureDurableCallbackKey(config, body, sourceIdentity);
   if (
     !config ||
     !config.serverUrl ||
@@ -1927,6 +1992,10 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
+    const sourceIdentity =
+      event && (event.id || event.messageId || event.timestamp)
+        ? `input:${String(event.id || event.messageId || event.timestamp)}`
+        : "";
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -1937,7 +2006,7 @@ module.exports = function (pi) {
           content: [{ type: "input_text", text }],
         },
       },
-    });
+    }, sourceIdentity);
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -1948,6 +2017,10 @@ module.exports = function (pi) {
     const role = messageRole(message);
     if (role !== "assistant") return;
     const responseId = currentResponseId();
+    const sourceIdentity =
+      message && (message.id || message.responseId || message.timestamp)
+        ? `message:${String(message.id || message.responseId || message.timestamp)}`
+        : "";
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
     // streams under a fresh, distinct id and never reuses this one's. The
@@ -1980,7 +2053,7 @@ module.exports = function (pi) {
             message: `Pi model error: ${errorMessage}`,
           },
         },
-      });
+      }, `${sourceIdentity}:error`);
       return;
     }
     const text = textFromMessage(message);
@@ -1999,7 +2072,7 @@ module.exports = function (pi) {
           content: [{ type: "output_text", text }],
         },
       },
-    });
+    }, sourceIdentity);
   });
 
   pi.on("turn_end", async (event, ctx) => {
@@ -2018,4 +2091,9 @@ module.exports = function (pi) {
       await postToolResult(result, responseId);
     }
   });
+};
+
+module.exports._test = {
+  ensureDurableCallbackKey,
+  postEvent,
 };

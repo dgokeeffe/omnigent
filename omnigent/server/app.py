@@ -1055,6 +1055,34 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+
+        async def _purge_callback_idempotency_periodically() -> None:
+            """Reclaim bounded indexed batches, including idle keyspaces.
+
+            Ten 1,000-row batches every ten seconds cap one sweep at 10,000
+            deletes while providing 60,000 expired-row removals per minute,
+            above this server's accepted callback throughput.
+            """
+            batch_size = 1_000
+            max_batches = 10
+            while True:
+                try:
+                    for _batch in range(max_batches):
+                        removed = await asyncio.to_thread(
+                            conversation_store.purge_expired_callback_idempotency,
+                            retention_seconds=7 * 24 * 60 * 60,
+                            limit=batch_size,
+                        )
+                        if removed < batch_size:
+                            break
+                        await asyncio.sleep(0)
+                except Exception:
+                    _logger.exception("callback idempotency cleanup failed")
+                await asyncio.sleep(10)
+
+        callback_idempotency_cleanup_task = asyncio.create_task(
+            _purge_callback_idempotency_periodically()
+        )
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1122,8 +1150,11 @@ def create_app(
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
+            callback_idempotency_cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            with suppress(asyncio.CancelledError):
+                await callback_idempotency_cleanup_task
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
             # sandbox itself, if already provisioned, is reaped by the

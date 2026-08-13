@@ -263,7 +263,14 @@ def register_events_routes(
           without starting or steering a task.
         - ``"external_conversation_item"`` appends and streams a
           completed item observed outside the Omnigent task runtime,
-          without starting or steering a task.
+          without starting or steering a task. It is the only durable native
+          callback covered by ``idempotency_key``: the key is scoped to the
+          authenticated caller, session, and event type; an identical replay
+          returns the original ``item_id`` and republishes the already-persisted
+          item to reconcile commit-before-response/process loss. Key reuse
+          with another payload or scope is rejected with the same generic
+          response. Records expire after seven days; clients that omit the key
+          retain legacy append-on-every-request behavior.
         - ``"external_output_text_delta"`` publishes a transient
           ``response.output_text.delta`` event observed outside the
           Omnigent task runtime, without persisting an item or starting /
@@ -367,6 +374,11 @@ def register_events_routes(
             raise OmnigentError(
                 f"Unknown event type: {body.type!r}. "
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if body.idempotency_key is not None and body.type != _EXTERNAL_CONVERSATION_ITEM_TYPE:
+            raise OmnigentError(
+                "idempotency_key is supported only for external_conversation_item",
                 code=ErrorCode.INVALID_INPUT,
             )
         # For item types, validate the data payload shape against
@@ -790,6 +802,7 @@ def register_events_routes(
                 body,
                 conversation_store,
                 created_by=created_by,
+                callback_actor_scope=user_id or "",
                 background_title_coordinator=background_title_coordinator,
             )
             return {"queued": False, "item_id": item_id}
@@ -900,6 +913,9 @@ def register_events_routes(
                 blocked_on=blocked_on,
             )
             forward_body = body.model_dump()
+            # Idempotency is accepted only for durable external items; do not
+            # widen the legacy runner-control wire shape with a null field.
+            forward_body.pop("idempotency_key", None)
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store
             )

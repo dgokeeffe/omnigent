@@ -473,8 +473,83 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+async function testDurableCallbackKeySurvivesReloadAndAuthRefresh() {
+  const bodies = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, opts) => {
+    bodies.push(JSON.parse(opts.body));
+    return { ok: true, status: 202, json: async () => ({ queued: false }) };
+  };
+  try {
+    const config = {
+      serverUrl: "http://mock",
+      sessionId: "conv_test",
+      relayToken: "session-secret-0123456789abcdef0123456789abcdef",
+      authHeaders: { authorization: "Bearer first" },
+    };
+    const callback = (responseId) => ({
+      type: "external_conversation_item",
+      data: {
+        response_id: responseId,
+        item_type: "message",
+        item_data: { role: "assistant", content: [{ type: "output_text", text: "same" }] },
+      },
+    });
+
+    delete require.cache[EXT_PATH];
+    await require(EXT_PATH)._test.postEvent(
+      config,
+      callback("resp-stable"),
+      "message:source-1",
+    );
+    config.authHeaders = { authorization: "Bearer refreshed" };
+    delete require.cache[EXT_PATH];
+    const reloaded = require(EXT_PATH);
+    await reloaded._test.postEvent(
+      config,
+      callback("resp-stable"),
+      "message:source-1",
+    );
+    await reloaded._test.postEvent(
+      config,
+      callback("resp-stable"),
+      "message:source-2",
+    );
+
+    assert(
+      "reconstructed callback retains one bounded key across reload and auth refresh",
+      bodies.length === 3 &&
+        bodies[0].idempotency_key === bodies[1].idempotency_key &&
+        /^pi:v1:[A-Za-z0-9_-]{43}$/.test(bodies[0].idempotency_key) &&
+        bodies[0].idempotency_key.length <= 128,
+      JSON.stringify(bodies.map((body) => body.idempotency_key)),
+    );
+    assert(
+      "distinct source identities with identical payload receive distinct keys",
+      bodies[1].idempotency_key !== bodies[2].idempotency_key,
+      JSON.stringify(bodies.map((body) => body.idempotency_key)),
+    );
+
+    const noSecret = { ...config };
+    delete noSecret.relayToken;
+    await reloaded._test.postEvent(
+      noSecret,
+      callback("resp-no-secret"),
+      "message:source-no-secret",
+    );
+    assert(
+      "missing persisted session secret preserves legacy no-key behavior",
+      !("idempotency_key" in bodies[3]),
+      JSON.stringify(bodies[3]),
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 (async () => {
   try {
+    await testDurableCallbackKeySurvivesReloadAndAuthRefresh();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();

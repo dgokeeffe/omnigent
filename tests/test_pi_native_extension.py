@@ -871,6 +871,8 @@ global.fetch = async (url, request) => {
   // Mimic the Omnigent /mcp proxy success envelope.
   return {
     ok: true,
+    status: 200,
+    headers: { get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null },
     async json() {
       return {
         jsonrpc: "2.0",
@@ -1144,6 +1146,17 @@ global.fetch = async (url, request) => {
     },
   };
 };
+const untypedFetch = global.fetch;
+global.fetch = async (...args) => {
+  const response = await untypedFetch(...args);
+  return {
+    ...response,
+    status: response.status === undefined ? 200 : response.status,
+    headers: response.headers || {
+      get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null,
+    },
+  };
+};
 global.setInterval = () => ({ fakeInterval: true });
 
 const registered = {};
@@ -1255,12 +1268,12 @@ require(extensionPath)(pi);
 (async () => {
   const thrown = await registered.sys_os_shell.execute("call-1", {});
   assert.equal(thrown.isError, true, JSON.stringify(thrown));
-  assert.ok(thrown.content[0].text.indexOf("ECONNREFUSED") !== -1, thrown.content[0].text);
+  assert.equal(thrown.content[0].text, "Omnigent tool call failed: transport");
 
   mode = "http";
   const http = await registered.sys_os_shell.execute("call-2", {});
   assert.equal(http.isError, true, JSON.stringify(http));
-  assert.ok(http.content[0].text.indexOf("503") !== -1, http.content[0].text);
+  assert.equal(http.content[0].text, "Omnigent tool call failed: server");
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -1361,6 +1374,17 @@ global.fetch = async (url, request) => {
         id: 2,
         error: { code: -32000, message: "Tool call denied by user" },
       };
+    },
+  };
+};
+const untypedFetch = global.fetch;
+global.fetch = async (...args) => {
+  const response = await untypedFetch(...args);
+  return {
+    ...response,
+    status: response.status === undefined ? 200 : response.status,
+    headers: response.headers || {
+      get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null,
     },
   };
 };
@@ -2066,6 +2090,7 @@ function makeJsonResponse(obj, status) {
   return {
     ok: status === undefined || (status >= 200 && status < 300),
     status: status === undefined ? 200 : status,
+    headers: { get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null },
     json: async () => obj,
   };
 }
@@ -2102,7 +2127,7 @@ global.fetch = async (url, request) => {
     // Default: allow.
     return makeJsonResponse({ result: "POLICY_ACTION_ALLOW" });
   }
-  return { ok: true, status: 200, json: async () => ({}) };
+  return makeJsonResponse({});
 };
 
 // Fake clock + timers. A short delay (sleep/backoff) advances a virtual clock
@@ -2448,7 +2473,14 @@ def test_policy_malformed_body_fails_closed(tmp_path: Path) -> None:
     body = r"""
 (async () => {
   responders = [
-    (_b) => ({ ok: true, status: 200, json: async () => { throw new Error("bad json"); } }),
+    (_b) => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null,
+      },
+      json: async () => { throw new Error("bad json"); },
+    }),
   ];
   const verdict = await runToolCall();
   assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));

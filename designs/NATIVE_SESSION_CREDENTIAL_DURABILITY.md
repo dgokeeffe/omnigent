@@ -3,8 +3,8 @@
 > **For the implementer:** This is an epic split into workstreams and
 > independently shippable tasks. It unifies three separately-reported bugs that
 > share one root cause. Each task states its files, acceptance criteria, and a
-> verification recipe. Findings were measured on a live CoDA box
-> (`coda-daveok`, 2026-08-13) — see the Evidence appendix.
+> verification recipe. The original incident was measured on a live CoDA host;
+> identifiers and credential-derived metadata are intentionally omitted.
 
 ## The one-line problem
 
@@ -65,6 +65,12 @@ No native session can be silently degraded by credential expiry. Concretely:
 
 **Non-goals:** changing the Apps edge behaviour (we don't own it); lengthening
 OAuth lifetimes (treats the symptom); reworking the tunnel (already correct).
+
+The implementation graph is authoritative in Beads: `omnigent-qfw.1` detects
+edge responses; `omnigent-qfw.2` removes Pi's avoidable edge transport;
+`omnigent-qfw.3` refreshes OpenCode inference; `omnigent-qfw.4` refreshes CoDA
+CLI configuration; `omnigent-qfw.6` adds replay; and `omnigent-qfw.7` owns the
+shared harness contracts. Audit follow-ups are recorded in B2 below.
 
 ---
 
@@ -127,18 +133,114 @@ targets `relayUrl` when relay credentials exist, and only falls back to
 **Risk to check:** confirm the relay accepts (or can be extended to accept) the
 events route, and that the relay's own lifetime covers the whole session.
 
-### B2. Audit every native harness for the same substitution
+### B2. Native credential-transport audit
 
-**Files:** `omnigent/inner/*_native_executor.py`, the per-harness bridge/config
-writers, `omnigent/native_server_transport.py`.
+Audit snapshot: Omnigent `dev` at `8da320a16da619e2de7ed75e5b83ab399a4b9746`;
+CoDA private `dev` at `efaf919f6e2c36286bc34419bbea5c8c7bd5e9e1`.
+This table is the authority for the current code, not a claim about an earlier
+incident image. “Terminal-visible” means readable by the harness process and its
+same-user descendants; all native CLIs necessarily see their own inference
+credential. A vendor/user-owned credential required by its own CLI is safe
+within this epic when the vendor owns refresh; an Omnigent-minted or copied
+expiring credential is unsafe when a narrower loopback or live-helper path is
+available.
 
-Produce a table (credential → transport → expiring? → loopback alternative?)
-covering pi, opencode, claude, codex, cursor, goose, hermes, kimi, kiro,
-antigravity, qwen, copilot. This epic was found via two harnesses; the same
-pattern is likely in others.
+| Harness | Credential consumer and location | Purpose | Transport | Source and lifetime | Terminal visibility | Refresh owner and trigger | Sign-in HTML detection | Retry / idempotency | Deterministic evidence | Disposition |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pi | Pi provider in per-session `models.json`; extension `config.json` `authHeaders`; relay token in the same bridge config | Inference; Omnigent events/policy/MCP | Inference and fallback callbacks cross the edge; relay is loopback | Provider `apiKey` is an auth command evaluated per request; `authHeaders` is an Apps bearer (about 1 h); relay token is session-lived | Provider helper and bridge config are readable by the Pi process; no SP client secret | Pi re-runs the provider helper per request; `PiNativeExecutor._refresh_auth_headers()` re-mints only on a web turn; relay is runner-owned | Extension did not validate HTML at this snapshot | Event POST was best-effort/no durable replay; relay calls are request/response | `tests/test_pi_native_credentials.py`, `tests/inner/test_pi_native_executor.py`, `omnigent/resources/pi_native/omnigent_pi_native_extension.test.js` | **Unsafe, owned:** `omnigent-qfw.2` owns removal of the avoidable edge credential; detection, replay, and shared tests are dependency-layer work rather than additional owners for this transport row |
+| OpenCode | Per-session `xdg-config/opencode/opencode.json` and `xdg-data/opencode/auth.json`; `opencode serve` loopback password | Inference; native-server control and event forwarding | Inference crosses provider/Databricks edge; runner-to-OpenCode control is loopback basic auth | User `auth.json` is copied at spawn; managed gateway bearer is snapshotted at launch; server password is process/session-lived | Inference credential is visible to the OpenCode process in its isolated data home; Omnigent server bearer is not required for loopback control | OpenCode owns refresh for its native login; Omnigent does not refresh the copied/managed bearer after spawn | Provider failure becomes an OpenCode auth error, not direct validation of Databricks `200 text/html` | SSE reconnects and stable event keys dedupe in-process, but inference auth failure is fatal | `tests/test_opencode_native_bridge.py::test_seed_opencode_auth_copies_user_auth`, `tests/test_opencode_native_forwarder.py`, `tests/test_opencode_native_app_server.py` | **Unsafe, owned:** `omnigent-qfw.3` owns the snapshotted inference credential; shared contract coverage is dependency-layer work rather than another owner for this transport row |
+| Claude | Claude Code `apiKeyHelper` in per-session settings; optional Bedrock token in `AWS_BEARER_TOKEN_BEDROCK`; loopback relay config | Inference; policy/MCP/events | Inference crosses the configured provider edge; relay is loopback | Gateway helper is invoked on Claude Code’s TTL and can mint fresh tokens; Bedrock `auth_command` is resolved once at launch | Helper command or Bedrock token is visible only to the Claude process/session tree; raw `ANTHROPIC_API_KEY` is explicitly removed on helper path | Claude Code re-invokes `apiKeyHelper` on `CLAUDE_CODE_API_KEY_HELPER_TTL_MS`; Bedrock env has no refresh hook | Omnigent hook reauth handles 401/403 and login redirects, but provider HTML is provider-dependent | Hook retry is bounded once; relay is request/response; provider turn retry belongs to Claude | `tests/test_claude_native.py` helper/TTL and Bedrock cases; `tests/test_native_policy_hook.py`; `tests/test_claude_native_bridge.py` | **Unsafe, owned:** `omnigent-qfw.10` covers the expiring Bedrock `auth_command` launch snapshot |
+| Codex | Per-session `CODEX_HOME/config.toml` `model_provider.auth.command`, or native `auth.json`; loopback app-server and relay secrets | Inference; app-server control; policy/MCP/events | Inference crosses provider edge; app-server/relay are loopback | Databricks/provider auth command is executed by Codex when needed; subscription auth lifetime is Codex-owned | Codex process can invoke its helper/read its own auth; raw ambient `OPENAI_API_KEY` is stripped from managed launch | Codex owns `auth.command` invocation and subscription refresh | Omnigent policy hook recognizes edge auth failures; inference handling is Codex-owned | App-server control uses stable local session/thread IDs; hook retry is bounded | `tests/inner/test_databricks_executor.py::test_codex_executor_uses_cli_auth_command_not_env_token`, `tests/test_codex_native_app_server.py`, `tests/test_native_policy_hook.py` | **Safe:** refresh-capable helper plus loopback control; include in `omnigent-qfw.7` |
+| Cursor | Cursor agent/SDK using real `$HOME/.cursor` login or `CURSOR_API_KEY`; loopback bridge/relay | Vendor inference; Omnigent events/policy/MCP | Vendor edge for inference; loopback for Omnigent bridge | Cursor-owned login or explicit/stored API key; no Omnigent Apps bearer is used for inference | Cursor necessarily sees its own login/key; runner spawn env sends only a Cursor credential selected by the user/spec | Cursor owns login refresh; API-key lifetime is operator-owned | Not applicable to Omnigent Apps edge on inference; forwarder failures are surfaced separately | Forwarder supervision reconnects; native IDs scope mirrored items | `tests/runtime/test_cursor_spawn_env.py`, `tests/test_cursor_native_forwarder.py`, `tests/test_cursor_native_bridge.py` | **Safe within this epic:** own-auth vendor edge plus loopback Omnigent control; include in `omnigent-qfw.7` |
+| Goose | Goose’s real config (normally `~/.config/goose/config.yaml`); loopback bridge/relay | Vendor/provider inference; Omnigent events/policy/MCP | Provider edge chosen by Goose; loopback for Omnigent control | Goose-owned provider config; Omnigent deliberately injects no gateway credential | Goose reads its own config as the terminal user; no Omnigent Apps bearer is added | Goose/provider owns refresh | Not applicable to an Omnigent Apps bearer unless the user independently configured that provider | Forwarder reconnect supervision; provider retry belongs to Goose | `tests/onboarding/test_goose_auth.py`, `tests/runtime/test_provider_spawn_env.py` (no Goose gateway env), `tests/test_goose_native_forwarder.py` | **Safe within this epic:** own-auth CLI and no avoidable Omnigent edge bearer; include in `omnigent-qfw.7` |
+| Hermes | User `~/.hermes/config.yaml` and `auth.json`, copied to per-session `HERMES_HOME`; loopback bridge/relay | Provider inference; Omnigent events/policy/MCP | Provider edge chosen by Hermes; loopback for Omnigent control | Auth/config snapshot is copied at launch and contains Hermes-owned credential material | Hermes process reads its isolated copy; no Omnigent Apps bearer is injected for inference | Hermes owns refresh within the copied home; a later external re-login is picked up only on respawn | Not applicable to an Omnigent Apps bearer unless user-configured | Forwarder reconnect supervision; provider retry belongs to Hermes | `tests/test_hermes_native_bridge.py`, `tests/inner/test_hermes_native_executor.py`, `tests/test_hermes_native_forwarder.py` | **Safe within this epic:** copy includes the CLI’s own refresh state, not an Omnigent launch bearer; include in `omnigent-qfw.7` |
+| Kimi | Session `KIMI_CODE_HOME`; symlinks user `oauth/` and `credentials/`; hook config contains Omnigent callback coordinates | Vendor inference; policy/events/MCP | Kimi vendor edge; hook/relay path is loopback or authenticated server callback | Kimi login state remains linked to the user home, so rotations written there remain visible; relay token is session-lived | Kimi sees its own login; hook command line contains no secret | Kimi owns OAuth refresh; symlinks make refreshed files visible without respawn | Not applicable to Omnigent Apps inference; callback contract joins `omnigent-qfw.7` | Forwarder retries a failed line without advancing its cursor; supervisor uses bounded backoff | `tests/test_kimi_native_credentials.py`, `tests/test_kimi_native_forwarder.py`, `tests/test_kimi_native_bridge_hook_config.py` | **Safe within this epic:** live-linked own-auth state and cursor-preserving retry; the CLI can write through to its real credential store as required for vendor refresh, so operator-owned backup/recovery remains outside this transport epic; include in `omnigent-qfw.7` |
+| Kiro | Kiro CLI’s own login under its real user state; per-session MCP bridge config | Vendor inference; Omnigent policy/events/MCP | Kiro vendor edge; Omnigent relay is loopback | Kiro-owned login; ambient provider/cloud credentials are stripped from child env; relay token is session-lived | Kiro sees only its own login and explicitly allowed environment; Omnigent relay token stays in hardened bridge state | Kiro owns login refresh; runner owns relay lifetime | Not applicable to Omnigent Apps inference | Session forwarder and permission mirror have bounded retries/timeouts | `tests/test_kiro_native_bridge.py`, `tests/test_kiro_native_session_forwarder.py`, `tests/inner/test_kiro_native_executor.py` | **Safe within this epic:** own-auth vendor edge and explicit child allowlist (`inherit_env=False`) plus loopback relay; include in `omnigent-qfw.7` |
+| Antigravity | Agy OAuth in OS keyring/real HOME; file credential markers copied into isolated `--gemini_dir`; per-session relay config | Vendor inference; Omnigent events/policy/MCP | Vendor edge for inference; loopback relay; CLI remote attach may use the Omnigent edge | OAuth/keyring is agy-owned; isolated marker copy is session-scoped; relay token is session-lived; CLI reader bearer is an attach-time snapshot | Agy sees its own OAuth; ambient unrelated credentials are not required; the reader receives only the Omnigent bearer, never its minting secret | Agy owns OAuth refresh; runner clients can use refresh-capable auth, but the CLI-side reader has none and only a reconnect refreshes attach headers | No direct Databricks inference path; CLI-side remote reader does not detect sign-in HTML | Reader/forwarder supervision reconnects; bridge IDs prevent cross-session reuse, but an already-running CLI reader cannot recover its static auth | `tests/test_antigravity_native_bridge.py`, `tests/test_antigravity_native_launch.py`, `tests/test_antigravity_native_reader.py` | **Unsafe, owned:** `omnigent-qfw.12` gives the CLI remote reader refresh/detection or constrains it to loopback |
+| Qwen | Qwen process `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`, or user `~/.qwen` auth; loopback bridge/relay | Provider inference; Omnigent events/policy/MCP | Provider edge for inference; loopback for Omnigent control | Managed gateway `auth_command` is executed once at process start and exported as a token; user auth is Qwen-owned | Qwen process sees the concrete gateway token in env | No Omnigent refresh after spawn; Qwen owns only its interactive/user auth | No Omnigent validation of provider `200 text/html` | Forwarder supervision retries callback transport; an expired inference token ends model calls | `tests/inner/test_qwen_executor.py`, `tests/runtime/test_provider_spawn_env.py`, `tests/test_qwen_native_forwarder.py` | **Unsafe, owned:** `omnigent-qfw.11` keeps Qwen gateway auth live for the process lifetime |
+| Copilot | Copilot SDK `github_token`, resolved from spec, dedicated secret ref, or ambient GitHub token; SDK subprocess | GitHub Copilot inference/tools | GitHub edge only; no Databricks AI gateway support | User/operator GitHub token resolved when executor/session starts; token lifetime is GitHub/operator-owned | Copilot SDK/CLI receives the token; it is not written to workspace files by this path | Operator/SDK owns rotation; a new executor session re-resolves stored/ambient auth | Not applicable to Omnigent Apps edge | SDK returns retryable turn errors; session recreation occurs when fixed session inputs change | `tests/onboarding/test_copilot_auth.py`, `tests/runtime/test_provider_spawn_env.py`, `tests/inner/test_copilot_executor.py` | **Safe within this epic:** explicit own-auth vendor credential, not an Omnigent edge bearer; include in `omnigent-qfw.7` |
 
-**Acceptance:** the table lands in this doc, and each row is either "loopback"
-or has a ticket under Workstream C.
+#### Follow-ups discovered by the audit
+
+The audit created these non-duplicative follow-up Beads from conclusive static
+source and test evidence:
+
+- **`omnigent-qfw.10` — P1: “Refresh Claude-native Bedrock auth-command credentials or reject expiring sources.”**
+  **Code path:** `omnigent/claude_native.py::_bedrock_config_for_native_claude`.
+  **Invariant:** an edge-bound inference credential must remain valid for the
+  native-session lifetime or fail visibly before launch. **Static evidence:**
+  the function executes a provider `auth_command` once, exports the result as
+  `AWS_BEARER_TOKEN_BEDROCK`, and records that Bedrock ignores `apiKeyHelper`;
+  `tests/test_claude_native.py::test_bedrock_config_for_native_claude_resolves_auth_command`
+  proves the launch snapshot. **Scope:** add a refresh-capable delivery
+  mechanism, or reject/document expiring command output. **Dependencies:**
+  child of `omnigent-qfw`; blocks `omnigent-qfw.7` and therefore
+  `omnigent-qfw.9`; it does not duplicate `omnigent-qfw.3`, which is OpenCode
+  only. Runtime reproduction is unnecessary and would require waiting for or
+  using a real expiring bearer; the one-shot subprocess and env assignment are
+  conclusive deterministic source/test evidence.
+- **`omnigent-qfw.11` — P0: “Keep Qwen-native gateway credentials live for the process lifetime.”**
+  **Code path:**
+  `omnigent/inner/qwen_executor.py::QwenExecutor._resolve_gateway_env`.
+  **Invariant:** managed gateway inference must not outlive a snapshotted bearer.
+  **Static evidence:** the function executes
+  `HARNESS_QWEN_GATEWAY_AUTH_COMMAND` once and exports the result as
+  `OPENAI_API_KEY`; its docstring explicitly says restart is the only refresh.
+  **Scope:** prefer a per-request helper/loopback shim; otherwise rotate safely
+  without exposing the bearer. **Dependencies:** child of `omnigent-qfw`;
+  blocks `omnigent-qfw.7` and `omnigent-qfw.9`; distinct from OpenCode issue
+  `omnigent-qfw.3`. Runtime reproduction is unnecessary and would expose a
+  real bearer for no additional proof; the launch-only assignment establishes
+  the lifetime mismatch deterministically.
+- **`omnigent-qfw.12` — P1: “Refresh or loopback-scope Antigravity CLI reader callbacks.”**
+  **Code path:** `omnigent/antigravity_native.py::_attach_cli` →
+  `omnigent/antigravity_native_reader.py::run_reader_with_bridge`.
+  **Invariant:** a long-running authenticated callback client must refresh and
+  validate the expected response contract, or use a session-lived loopback
+  capability. **Static evidence:** `_attach_cli` passes `auth=None`; both
+  functions document that remote headers are a static bearer for the reader's
+  lifetime and only a new attach refreshes them. **Scope:** thread a
+  refresh-capable auth flow into the CLI reader or reject remote-edge reader
+  mode, and add sign-in-HTML/fake-expiry coverage. **Dependencies:** child of
+  `omnigent-qfw`; blocks `omnigent-qfw.7` and `omnigent-qfw.9`; it does not
+  duplicate Pi callback issue `omnigent-qfw.2`. Runtime reproduction would
+  require a live remote session and expiring bearer, while the explicit
+  `auth=None` data flow is conclusive.
+
+#### Reconciliation with the CoDA diagnosis
+
+The private CoDA artifact was verified at
+`efaf919f6e2c36286bc34419bbea5c8c7bd5e9e1`:
+`docs/plans/2026-08-13-session-admission-and-secret-boundary-findings.md`.
+Its measured identifiers and credential values are intentionally not repeated
+here.
+
+| CoDA finding | Audit result and owner |
+| --- | --- |
+| Memory admission counted reclaimable page cache | Fixed by CoDA commit `c801679` with deterministic capacity tests; `omnigent-qfw.5.1` owns non-implementation ancestry/regression verification. Functional rather than a credential transport. |
+| Capacity telemetry and `/proc` parsing | Observability-only follow-ups outside this epic; no bearer or secret crosses a boundary. |
+| App resource binding / deploy provenance | Resource binding was corrected; deploy provenance is a release-process concern, not a native-harness credential transport. Do not treat Workspace sync or container edits as deploy sources. |
+| Browser-terminal secret boundary | **Unsafe, owned by `omnigent-b0y` (P0).** The terminal environment builder is deny-list based, so newly bound credential-shaped variables can reach model-controlled terminals. Exact private-repository code evidence is retained in the owning Bead rather than published here. |
+| Hand-written `[DEFAULT]` PAT and silent sync failure | The rotator-to-agent-config stale-token defect is owned by `omnigent-qfw.4`. Emergency raw PAT insertion and sync-health visibility remain operational/process follow-ups and must not be presented as a supported refresh path. |
+| CoDA global agent configs not updated after PAT rotation | **Owned:** `omnigent-qfw.4`; it must update all configured CLI consumers on every rotation without exposing the PAT to terminal env. |
+
+Required additional Bead:
+
+- **`omnigent-b0y` — P0: “Make CoDA browser-terminal environment secret-deny-by-default.”**
+  The private CoDA terminal environment builder uses copy-then-subtract rather
+  than an explicit allowlist. Exact code paths, test evidence, affected
+  credential classes, priority, dependencies, and the reason runtime
+  reproduction is inappropriate are retained in the owning Bead. The audit
+  records only the durable invariant: model-controlled terminals inherit
+  approved non-secret entries, never ambient credential-shaped variables.
+  `omnigent-qfw.9` depends on `omnigent-b0y`, so the final live/security gate
+  cannot run before this private CoDA boundary is fixed.
+
+**B2 completion rule:** each unsafe harness row maps to one implementation
+owner, while dependency-layer detection/replay/contract tasks remain separately
+linked in the Beads graph. CoDA-only findings map to exactly one CoDA follow-up.
+No live deployment or credential value is needed to establish these static
+transport findings.
 
 ## Workstream C — Refresh on a timer, not per turn (G2)
 
@@ -170,7 +272,7 @@ request (preferred — see `claude_gateway_shim.py` for prior art).
 **Acceptance:** an OpenCode native session still completes a model call after
 its original bearer's `exp` has passed.
 
-### C3. CoDA: re-run CLI auth configuration on every PAT rotation
+### C3. CoDA: re-run CLI auth configuration on every PAT rotation (`omnigent-qfw.4`)
 
 **Files (CoDA repo):** `app.py` `_configure_all_cli_auth()`, `pat_rotator.py`.
 
@@ -245,60 +347,19 @@ OpenCode configs as expired, with ages.
 | 5 | E1, E2 | Locks it all down before the pattern reappears |
 | 6 | D1, D2, B2, A3, E3 | Durability, audit, and tooling |
 
-## Evidence appendix (measured 2026-08-13, `coda-daveok`, 12 GiB container)
+## Evidence appendix
 
-All four credential stores held **the same 820-char app-SP OAuth JWT shape**
-(`iss=…/oidc`, `sub=f4b93eb4…` = the app SP), all long dead:
+The incident established three durable facts without preserving host,
+workspace, session, credential, or exact-expiry identifiers in this design:
 
-| Store | File mtime | `exp` | State |
-|---|---|---|---|
-| pi native session `c46d5958…` | 42.9 h ago | 2026-08-11 17:20:51Z | expired 41.9 h |
-| opencode native session `afd8a17e…` (`xdg-config/opencode/opencode.json`, `xdg-data/opencode/auth.json`) | 42.1 h ago | — | expired 42.1 h |
-| CoDA global opencode (`~/.local/share/opencode/auth.json`, `~/.config/opencode/opencode.json`) | 11.7 h ago | 2026-08-13 00:35:05Z | expired 10.7 h |
-| `relayToken` (same `config.json`) | — | none | non-expiring, unaffected |
+1. Pi and OpenCode session credential snapshots outlived their bearer lifetime.
+2. The Pi TUI remained healthy while authenticated chat callbacks stopped.
+3. A session-lived loopback relay capability remained valid and is the safer
+   transport pattern.
 
-Meanwhile the pi TUI process was alive and healthy the entire time (started
-Aug 11, still attached under tmux), which is exactly why the terminal kept
-working while the chat did not.
-
-### Reproduce the credential scan
-
-```bash
-python3 - <<'PY'
-import json, base64, time, pathlib, re, glob
-def exps(text):
-    for tok in set(re.findall(r"eyJ[A-Za-z0-9_\-\.]{40,}", text)):
-        p = tok.split(".")[1]; p += "=" * (-len(p) % 4)
-        try: e = json.loads(base64.urlsafe_b64decode(p)).get("exp")
-        except Exception: e = None
-        if e: yield e
-home = pathlib.Path.home()
-targets = [str(home/".omnigent/pi-native/*/config.json"),
-           str(home/".omnigent/opencode-native/*/xdg-*/**/*.json"),
-           str(home/".local/share/opencode/auth.json"),
-           str(home/".config/opencode/opencode.json")]
-for pattern in targets:
-    for f in glob.glob(pattern, recursive=True):
-        for e in exps(pathlib.Path(f).read_text()):
-            age = (time.time() - e) / 3600
-            print(f"{'EXPIRED %6.1fh' % age if age > 0 else 'valid  %6.1fh' % -age}  {f}")
-PY
-```
-
-### Reproduce the silent-failure mechanism
-
-```bash
-cd ~/.omnigent/pi-native/*/ && python3 - <<'PY'
-import json, pathlib, urllib.request
-c = json.loads(pathlib.Path("config.json").read_text())
-req = urllib.request.Request(f"{c['serverUrl']}/v1/sessions/{c['sessionId']}",
-                             headers=dict(c["authHeaders"]))
-with urllib.request.urlopen(req, timeout=20) as r:
-    body = r.read(120)
-# Expect 200 + text/html + "Databricks - Sign In": a success status for an auth failure.
-print(r.status, r.headers.get("content-type"), body[:80])
-PY
-```
+Deterministic regression tests use synthetic credentials, fake clocks, and a
+local edge simulator. Operators must not replay live bearer material or print
+credential-store contents to reproduce this contract.
 
 ## Open questions
 

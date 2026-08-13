@@ -929,6 +929,9 @@ def create_app(
     _mcp_pool = ServerMcpPool()
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
+    from omnigent.server.coda_owner_locks import CodaOwnerLockRegistry
+
+    coda_owner_locks = CodaOwnerLockRegistry()
 
     @asynccontextmanager
     async def _lifespan(
@@ -1131,6 +1134,7 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            await coda_owner_locks.close()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1236,6 +1240,7 @@ def create_app(
     from omnigent.server.managed_hosts import ManagedLaunchTracker
 
     app.state.managed_launches = ManagedLaunchTracker()
+    app.state.coda_owner_locks = coda_owner_locks
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)

@@ -111,6 +111,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.coda_owner_locks import get_coda_owner_locks
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -3200,22 +3201,44 @@ def _kick_managed_relaunch(
             "session %s: relaunch has no agent store; runner stays unclassified",
             session_id,
         )
-    relaunch_task = asyncio.create_task(
-        _run_managed_launch(
-            session_id=session_id,
-            owner=host.user_id,
-            sandbox_config=sandbox_config,
-            repo=repo,
-            tracker=tracker,
-            conversation_store=conversation_store,
-            host_store=host_store,
-            host_registry=getattr(app_state, "host_registry", None),
-            tunnel_registry=getattr(app_state, "tunnel_registry", None),
-            relaunch_host=host,
-            agent_store=agent_store,
-            agent_id=conv.agent_id,
-        )
-    )
+
+    async def _run_owner_scoped_relaunch() -> None:
+        owner_locks = get_coda_owner_locks(app_state)
+        closed_reason = "owner coordination is unavailable"
+
+        async def _fail_closed_registry() -> None:
+            tracker.fail(session_id, closed_reason)
+            _publish_sandbox_status(session_id, "failed", closed_reason)
+
+        try:
+            async with owner_locks.hold(host.user_id, on_closed=_fail_closed_registry):
+                # Release may have won the owner lock while this task was queued.
+                # Re-read the persisted App fence before allocating so a detached
+                # or rebound session cannot be reattached by a stale wake task.
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if current is None or current.host_id != host.host_id:
+                    tracker.finish(session_id)
+                    return
+                await _run_managed_launch(
+                    session_id=session_id,
+                    owner=host.user_id,
+                    sandbox_config=sandbox_config,
+                    repo=repo,
+                    tracker=tracker,
+                    conversation_store=conversation_store,
+                    host_store=host_store,
+                    host_registry=getattr(app_state, "host_registry", None),
+                    tunnel_registry=getattr(app_state, "tunnel_registry", None),
+                    relaunch_host=host,
+                    agent_store=agent_store,
+                    agent_id=conv.agent_id,
+                )
+        except RuntimeError as exc:
+            if str(exc) == "CoDA owner lock registry is closed":
+                return
+            raise
+
+    relaunch_task = asyncio.create_task(_run_owner_scoped_relaunch())
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -3287,18 +3310,44 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
-    wake_task = asyncio.create_task(
-        _run_managed_wake(
-            session_id=session_id,
-            conv=conv,
-            sandbox_config=sandbox_config,
-            tracker=tracker,
-            conversation_store=conversation_store,
-            host_store=host_store,
-            host_registry=getattr(app_state, "host_registry", None),
-            tunnel_registry=getattr(app_state, "tunnel_registry", None),
+
+    async def _run_owner_scoped_wake() -> None:
+        host_id = conv.host_id
+        host = (
+            await asyncio.to_thread(host_store.get_host, host_id) if host_id is not None else None
         )
-    )
+        if host is None:
+            tracker.fail(session_id, "managed host not found before wake")
+            return
+        owner_locks = get_coda_owner_locks(app_state)
+        closed_reason = "owner coordination is unavailable"
+
+        async def _fail_closed_registry() -> None:
+            tracker.fail(session_id, closed_reason)
+            _publish_sandbox_status(session_id, "failed", closed_reason)
+
+        try:
+            async with owner_locks.hold(host.user_id, on_closed=_fail_closed_registry):
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if current is None or current.host_id != host_id:
+                    tracker.finish(session_id)
+                    return
+                await _run_managed_wake(
+                    session_id=session_id,
+                    conv=current,
+                    sandbox_config=sandbox_config,
+                    tracker=tracker,
+                    conversation_store=conversation_store,
+                    host_store=host_store,
+                    host_registry=getattr(app_state, "host_registry", None),
+                    tunnel_registry=getattr(app_state, "tunnel_registry", None),
+                )
+        except RuntimeError as exc:
+            if str(exc) == "CoDA owner lock registry is closed":
+                return
+            raise
+
+    wake_task = asyncio.create_task(_run_owner_scoped_wake())
     _managed_launch_tasks.add(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 

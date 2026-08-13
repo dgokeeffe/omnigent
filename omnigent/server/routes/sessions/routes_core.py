@@ -72,6 +72,12 @@ from omnigent.server.auth import (
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
+from omnigent.server.coda_owner_locks import (
+    BlockingCallCompletedAfterCancellation,
+    complete_cancellation_cleanup,
+    get_coda_owner_locks,
+    run_blocking_cancellation_safe,
+)
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -191,17 +197,63 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
 
+async def _rollback_created_session(
+    session_id: str,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Remove a create that failed before it acquired a durable host binding."""
+    if permission_store is not None and user_id is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(permission_store.revoke, user_id, session_id)
+    with contextlib.suppress(Exception):
+        await conversation_store.delete_conversation(session_id)
+
+
+async def _rollback_cancelled_allocation(
+    launcher: Any,
+    sandbox_id: str,
+    session_id: str,
+    *,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Release a completed allocation, then remove its not-yet-returned create."""
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(launcher.release_workspace, sandbox_id, session_id)
+    await _rollback_created_session(
+        session_id,
+        user_id=user_id,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+    )
+
+
 async def _await_coda_owner_launch(
     launch_task: asyncio.Task[None],
     *,
     session_id: str,
+    user_id: str | None,
     conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
 ) -> None:
-    """Await a sibling launch and remove this waiter if its request is cancelled."""
+    """Await a sibling launch and roll back this waiter on any failed wait."""
     try:
         await asyncio.shield(launch_task)
-    except asyncio.CancelledError:
-        await conversation_store.delete_conversation(session_id)
+    except BaseException as exc:
+        cleanup = _rollback_created_session(
+            session_id,
+            user_id=user_id,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+        )
+        if isinstance(exc, asyncio.CancelledError):
+            await complete_cancellation_cleanup(cleanup)
+        else:
+            await cleanup
         raise
 
 
@@ -452,18 +504,29 @@ def register_core_routes(
                 # are one owner-scoped single-flight. A second create arriving
                 # before the first host registers waits for that launch, then
                 # adopts it instead of provisioning the same lease twice.
-                adoption_lock = getattr(request.app.state, "coda_adoption_lock", None)
-                if adoption_lock is None:
-                    adoption_lock = asyncio.Lock()
-                    request.app.state.coda_adoption_lock = adoption_lock
+                owner_locks = get_coda_owner_locks(request.app.state)
                 owner_launches = getattr(request.app.state, "coda_owner_launches", None)
                 if owner_launches is None:
                     owner_launches = {}
                     request.app.state.coda_owner_launches = owner_launches
+                owner_launch_sessions = getattr(
+                    request.app.state, "coda_owner_launch_sessions", None
+                )
+                if owner_launch_sessions is None:
+                    owner_launch_sessions = {}
+                    request.app.state.coda_owner_launch_sessions = owner_launch_sessions
 
                 while True:
                     wait_for_owner_launch = None
-                    async with adoption_lock:
+                    async with owner_locks.hold(
+                        owner,
+                        on_closed=lambda: _rollback_created_session(
+                            resp.id,
+                            user_id=user_id,
+                            conversation_store=conversation_store,
+                            permission_store=permission_store,
+                        ),
+                    ):
                         hosts = await asyncio.to_thread(host_store_for_managed.list_hosts, owner)
                         target_prefix = (
                             f"coda:{body.sandbox_app_id}#"
@@ -509,13 +572,13 @@ def register_core_routes(
                             workspace_allocated = False
                             try:
                                 if repo is None:
-                                    workspace = await asyncio.to_thread(
+                                    workspace = await run_blocking_cancellation_safe(
                                         launcher.allocate_workspace,
                                         adopted.sandbox_id,
                                         resp.id,
                                     )
                                 else:
-                                    workspace = await asyncio.to_thread(
+                                    workspace = await run_blocking_cancellation_safe(
                                         launcher.allocate_workspace,
                                         adopted.sandbox_id,
                                         resp.id,
@@ -530,19 +593,43 @@ def register_core_routes(
                                     adopted.host_id,
                                     workspace,
                                 )
-                            except Exception:
+                            except BlockingCallCompletedAfterCancellation as exc:
+                                workspace_allocated = True
+                                await complete_cancellation_cleanup(
+                                    _rollback_cancelled_allocation(
+                                        launcher,
+                                        adopted.sandbox_id,
+                                        resp.id,
+                                        user_id=user_id,
+                                        conversation_store=conversation_store,
+                                        permission_store=permission_store,
+                                    )
+                                )
+                                raise asyncio.CancelledError from exc
+                            except BaseException as exc:
                                 # Session creation is atomic from the caller's
                                 # perspective. Recover a successful allocation
                                 # if the durable bind fails; clone failures clean
                                 # their own partial contents inside CoDA.
+                                cleanup = _rollback_created_session(
+                                    resp.id,
+                                    user_id=user_id,
+                                    conversation_store=conversation_store,
+                                    permission_store=permission_store,
+                                )
                                 if workspace_allocated:
-                                    with contextlib.suppress(Exception):
-                                        await asyncio.to_thread(
-                                            launcher.release_workspace,
-                                            adopted.sandbox_id,
-                                            resp.id,
-                                        )
-                                await conversation_store.delete_conversation(resp.id)
+                                    cleanup = _rollback_cancelled_allocation(
+                                        launcher,
+                                        adopted.sandbox_id,
+                                        resp.id,
+                                        user_id=user_id,
+                                        conversation_store=conversation_store,
+                                        permission_store=permission_store,
+                                    )
+                                if isinstance(exc, asyncio.CancelledError):
+                                    await complete_cancellation_cleanup(cleanup)
+                                else:
+                                    await cleanup
                                 raise
                             resp.host_id = adopted.host_id
                             resp.workspace = workspace
@@ -573,14 +660,21 @@ def register_core_routes(
                                     )
                                 )
                                 owner_launches[owner] = launch_task
+                                owner_launch_sessions[owner] = resp.id
 
                                 def _clear_owner_launch(
                                     task: asyncio.Task[None],
                                     *,
                                     launch_owner: str = owner,
+                                    launch_session_id: str = resp.id,
                                 ) -> None:
                                     if owner_launches.get(launch_owner) is task:
                                         owner_launches.pop(launch_owner, None)
+                                    if (
+                                        owner_launch_sessions.get(launch_owner)
+                                        == launch_session_id
+                                    ):
+                                        owner_launch_sessions.pop(launch_owner, None)
 
                                 _managed_launch_tasks.add(launch_task)
                                 launch_task.add_done_callback(_managed_launch_tasks.discard)
@@ -592,7 +686,9 @@ def register_core_routes(
                         await _await_coda_owner_launch(
                             wait_for_owner_launch,
                             session_id=resp.id,
+                            user_id=user_id,
                             conversation_store=conversation_store,
+                            permission_store=permission_store,
                         )
 
             if adopted is None and not launch_scheduled:

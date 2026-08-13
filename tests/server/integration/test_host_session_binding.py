@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,7 @@ from omnigent.host.frames import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -45,6 +46,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -494,6 +496,113 @@ async def test_managed_session_create_end_to_end(
     del tunnels
 
 
+async def test_coda_release_waits_for_matching_background_launch(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Release cannot detach an unbound row that its launch later rebinds."""
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+    from omnigent.server.coda_owner_locks import CodaOwnerLockRegistry
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    provision_entered = threading.Event()
+    finish_provision = threading.Event()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+    host_started = threading.Event()
+    terminated: list[str] = []
+
+    class FakeCoda(CodaProvider):
+        def __init__(self) -> None:
+            super().__init__(
+                app_name="coda-main",
+                app_url="https://coda.example.com",
+                request_fn=lambda _method, _path, _body: {},
+                app_getter=lambda _: None,
+            )
+
+        def prepare(self) -> None:
+            return None
+
+        def provision(self, _name: str) -> str:
+            provision_entered.set()
+            assert finish_provision.wait(timeout=10)
+            return "coda:coda-main#release-race"
+
+        def start_host(self, _sandbox_id: str, **kwargs: object) -> str:
+            future = asyncio.run_coroutine_threadsafe(
+                _fake_sandbox_host(
+                    env.app,
+                    str(kwargs["host_id"]),
+                    str(kwargs["host_name"]),
+                    str(kwargs["token"]),
+                ),
+                loop,
+            )
+            host_futures.append(asyncio.wrap_future(future, loop=loop))
+            host_started.set()
+            return "/app/python/source_code/coda-sessions/release-race"
+
+        def terminate(self, sandbox_id: str) -> None:
+            terminated.append(sandbox_id)
+
+    lifecycle_attempted = asyncio.Event()
+
+    class RecordingRegistry(CodaOwnerLockRegistry):
+        @asynccontextmanager
+        async def hold(  # type: ignore[override]
+            self,
+            owner: str,
+            **kwargs: object,
+        ) -> AsyncIterator[None]:
+            lifecycle_attempted.set()
+            async with super().hold(owner, **kwargs):  # type: ignore[arg-type]
+                yield
+
+    registry = RecordingRegistry()
+    env.app.state.coda_owner_locks = registry
+    fake = FakeCoda()
+    env.app.state.sandbox_config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=13 * 3600,
+        provider="coda",
+        max_sessions_per_lease=10,
+    )
+    agent = await create_test_agent(env.client, name="coda-release-race-agent")
+    created = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    assert await asyncio.to_thread(provision_entered.wait, 5)
+
+    lifecycle_attempted.clear()
+    release = asyncio.create_task(env.client.post(f"/v1/sessions/{session_id}/release"))
+    await lifecycle_attempted.wait()
+    assert not release.done()
+
+    finish_provision.set()
+    assert await asyncio.to_thread(host_started.wait, 5)
+    tunnel = await host_futures[0]
+    released = await release
+    assert released.status_code == 204, released.text
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.detached_at is not None
+    assert conv.host_id is None
+    assert conv.detached_claim_host_id is None
+    assert terminated == ["coda:coda-main#release-race"]
+    assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
+    assert registry.owner_count == 0
+    del tunnel
+
+
 async def test_coda_two_sessions_adopt_one_host(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -632,6 +741,88 @@ async def test_coda_two_sessions_adopt_one_host(
     }
     assert len(env.host_store.list_hosts(RESERVED_USER_LOCAL)) == 1
 
+    # Cancellation cannot release the owner lock while the provider thread is
+    # still capable of allocating. The request waits for the controlled thread,
+    # releases its successful allocation, and rolls back its row and grant.
+    before_cancel = {session.id for session in env.conv_store.list_conversations(limit=100).data}
+    allocation_started = threading.Event()
+    finish_allocation = threading.Event()
+    released_sessions: list[str] = []
+
+    def _blocked_allocation(
+        _sandbox_id: str,
+        session_id: str,
+        **_kwargs: object,
+    ) -> str:
+        allocation_started.set()
+        assert finish_allocation.wait(timeout=10)
+        return f"/app/python/source_code/coda-sessions/{session_id}"
+
+    def _record_release(_sandbox_id: str, session_id: str) -> None:
+        released_sessions.append(session_id)
+
+    monkeypatch.setattr(fake, "allocate_workspace", _blocked_allocation)
+    monkeypatch.setattr(fake, "release_workspace", _record_release)
+    cancelled_post = asyncio.create_task(
+        env.client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_type": "managed"},
+        )
+    )
+    assert await asyncio.to_thread(allocation_started.wait, 5)
+    cancelled_post.cancel()
+    assert not cancelled_post.done()
+    finish_allocation.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_post
+    assert len(released_sessions) == 1
+    assert {
+        session.id for session in env.conv_store.list_conversations(limit=100).data
+    } == before_cancel
+    assert env.app.state.coda_owner_locks.owner_count == 0
+
+    # The lifecycle routes use the same owner lock as create. Hold it through a
+    # controlled barrier and prove a same-owner Release reaches, but cannot
+    # enter, its mutation section. Cancelling the waiter leaves the binding.
+    from omnigent.server.coda_owner_locks import CodaOwnerLockRegistry
+
+    lifecycle_attempted = asyncio.Event()
+
+    class _RecordingRegistry(CodaOwnerLockRegistry):
+        @asynccontextmanager
+        async def hold(  # type: ignore[override]
+            self,
+            owner: str,
+            **kwargs: object,
+        ) -> AsyncIterator[None]:
+            lifecycle_attempted.set()
+            async with super().hold(owner, **kwargs):  # type: ignore[arg-type]
+                yield
+
+    recording_registry = _RecordingRegistry()
+    env.app.state.coda_owner_locks = recording_registry
+    holder_entered = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def hold_owner() -> None:
+        async with recording_registry.hold(RESERVED_USER_LOCAL):
+            holder_entered.set()
+            await release_holder.wait()
+
+    holder = asyncio.create_task(hold_owner())
+    await holder_entered.wait()
+    lifecycle_attempted.clear()
+    release_request = asyncio.create_task(env.client.post(f"/v1/sessions/{second.id}/release"))
+    await lifecycle_attempted.wait()
+    assert not release_request.done()
+    release_request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await release_request
+    release_holder.set()
+    await holder
+    assert env.conv_store.get_conversation(second.id).host_id == second.host_id  # type: ignore[union-attr]
+    assert recording_registry.owner_count == 0
+
     before_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
 
     def _allocation_failure(_sandbox_id: str, _session_id: str, **_kwargs: object) -> str:
@@ -650,10 +841,190 @@ async def test_coda_two_sessions_adopt_one_host(
     after_failure = {session.id for session in env.conv_store.list_conversations(limit=100).data}
     assert after_failure == before_failure
 
-    assert (await env.client.delete(f"/v1/sessions/{first.id}")).status_code == 200
+    # Cancelling repository Release cannot let a same-owner retry overlap the
+    # still-running provider thread. The first request finishes its release and
+    # detaches before propagating cancellation; the retry is then idempotent.
+    workspace_release_started = threading.Event()
+    finish_workspace_release = threading.Event()
+    workspace_release_calls: list[str] = []
+    workspace_active = 0
+    workspace_max_active = 0
+    workspace_counter_lock = threading.Lock()
+
+    def _blocked_workspace_release(_sandbox_id: str, session_id: str) -> None:
+        nonlocal workspace_active, workspace_max_active
+        with workspace_counter_lock:
+            workspace_active += 1
+            workspace_max_active = max(workspace_max_active, workspace_active)
+            workspace_release_calls.append(session_id)
+        workspace_release_started.set()
+        assert finish_workspace_release.wait(timeout=10)
+        with workspace_counter_lock:
+            workspace_active -= 1
+
+    monkeypatch.setattr(fake, "release_workspace", _blocked_workspace_release)
+    lifecycle_attempted.clear()
+    cancelled_release = asyncio.create_task(env.client.post(f"/v1/sessions/{second.id}/release"))
+    assert await asyncio.to_thread(workspace_release_started.wait, 5)
+    cancelled_release.cancel()
+    lifecycle_attempted.clear()
+    retry_release = asyncio.create_task(env.client.post(f"/v1/sessions/{second.id}/release"))
+    await lifecycle_attempted.wait()
+    assert not cancelled_release.done()
+    assert not retry_release.done()
+    assert workspace_release_calls == [second.id]
+
+    finish_workspace_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_release
+    retried = await retry_release
+    assert retried.status_code == 204, retried.text
+    assert workspace_max_active == 1
+    detached_second = env.conv_store.get_conversation(second.id)
+    assert detached_second is not None
+    assert detached_second.detached_at is not None
+    assert detached_second.host_id is None
+    assert detached_second.detached_claim_host_id is None
     assert env.host_store.get_host(first.host_id) is not None
-    assert (await env.client.delete(f"/v1/sessions/{second.id}")).status_code == 200
+
+    # The last-session path has the same guarantee around provider terminate.
+    terminate_started = threading.Event()
+    finish_terminate = threading.Event()
+    terminate_calls: list[str] = []
+    terminate_active = 0
+    terminate_max_active = 0
+    terminate_counter_lock = threading.Lock()
+
+    def _blocked_terminate(sandbox_id: str) -> None:
+        nonlocal terminate_active, terminate_max_active
+        with terminate_counter_lock:
+            terminate_active += 1
+            terminate_max_active = max(terminate_max_active, terminate_active)
+            terminate_calls.append(sandbox_id)
+        terminate_started.set()
+        assert finish_terminate.wait(timeout=10)
+        with terminate_counter_lock:
+            terminate_active -= 1
+
+    monkeypatch.setattr(fake, "terminate", _blocked_terminate)
+    lifecycle_attempted.clear()
+    cancelled_terminate = asyncio.create_task(env.client.post(f"/v1/sessions/{first.id}/release"))
+    assert await asyncio.to_thread(terminate_started.wait, 5)
+    cancelled_terminate.cancel()
+    lifecycle_attempted.clear()
+    retry_terminate = asyncio.create_task(env.client.post(f"/v1/sessions/{first.id}/release"))
+    await lifecycle_attempted.wait()
+    assert not cancelled_terminate.done()
+    assert not retry_terminate.done()
+    assert terminate_calls == ["coda:coda-main#lease-a"]
+
+    finish_terminate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_terminate
+    terminate_retry = await retry_terminate
+    assert terminate_retry.status_code == 204, terminate_retry.text
+    assert terminate_max_active == 1
+    detached_first = env.conv_store.get_conversation(first.id)
+    assert detached_first is not None
+    assert detached_first.detached_at is not None
+    assert detached_first.host_id is None
+    assert detached_first.detached_claim_host_id is None
     assert env.host_store.get_host(first.host_id) is None
+    assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
+    assert recording_registry.owner_count == 0
+
+
+async def test_coda_different_owners_overlap_in_workspace_allocation(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The real create route does not hold a process-wide allocation lock."""
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+    del runtime_init
+    allocation_barrier = threading.Barrier(2)
+    allocation_leases: list[str] = []
+
+    def request(_method: str, path: str, body: object) -> dict[str, object]:
+        if path.endswith("/workspaces") and isinstance(body, dict):
+            allocation_leases.append(str(body["lease_id"]))
+            allocation_barrier.wait(timeout=5)
+            raise click.ClickException("controlled allocation failure")
+        return {"ready": True}
+
+    provider = CodaProvider(
+        app_name="coda-main",
+        app_url="https://coda.example.com",
+        request_fn=request,
+        app_getter=lambda _: None,
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "owner-artifacts"))
+    host_store = HostStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(
+            artifact_store=artifacts,
+            cache_dir=tmp_path / "owner-cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=permissions,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        host_store=host_store,
+        sandbox_config=ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: provider,
+            token_ttl_s=13 * 3600,
+            provider="coda",
+            max_sessions_per_lease=10,
+        ),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        agents: dict[str, dict[str, object]] = {}
+        for owner in ("alice@example.com", "bob@example.com"):
+            agents[owner] = await create_test_agent(
+                client,
+                name=f"owner-{owner.split('@', 1)[0]}",
+                user=owner,
+            )
+
+        for index, owner in enumerate(agents):
+            host_id = f"{index + 1:032x}"
+            host_store.register_managed_host(
+                host_id=host_id,
+                name=f"managed-{index}",
+                user_id=owner,
+                token=f"host-token-{index}",
+                provider="coda",
+                sandbox_id=f"coda:coda-main#lease-{index}",
+                token_expires_at=4_000_000_000,
+            )
+            host_store.upsert_on_connect(host_id, f"managed-{index}", owner)
+
+        async def create(owner: str) -> object:
+            return await client.post(
+                "/v1/sessions",
+                headers={"X-Forwarded-Email": owner},
+                json={"agent_id": agents[owner]["id"], "host_type": "managed"},
+            )
+
+        results = await asyncio.gather(
+            create("alice@example.com"),
+            create("bob@example.com"),
+            return_exceptions=True,
+        )
+
+    assert all(
+        isinstance(result, click.ClickException) and "controlled allocation failure" in str(result)
+        for result in results
+    )
+    assert sorted(allocation_leases) == ["lease-0", "lease-1"]
+    assert app.state.coda_owner_locks.owner_count == 0
 
 
 async def test_cancelled_coda_owner_launch_waiter_deletes_session() -> None:
@@ -665,17 +1036,25 @@ async def test_cancelled_coda_owner_launch_waiter_deletes_session() -> None:
         await release.wait()
 
     deleted: list[str] = []
+    revoked: list[tuple[str, str]] = []
 
     class _ConversationStore:
         async def delete_conversation(self, session_id: str) -> None:
             deleted.append(session_id)
+
+    class _PermissionStore:
+        def revoke(self, user_id: str, session_id: str) -> bool:
+            revoked.append((user_id, session_id))
+            return True
 
     launch_task = asyncio.create_task(sibling_launch())
     waiter = asyncio.create_task(
         _await_coda_owner_launch(
             launch_task,
             session_id="cancelled-session",
+            user_id="alice@example.com",
             conversation_store=_ConversationStore(),  # type: ignore[arg-type]
+            permission_store=_PermissionStore(),  # type: ignore[arg-type]
         )
     )
     await asyncio.sleep(0)
@@ -684,9 +1063,42 @@ async def test_cancelled_coda_owner_launch_waiter_deletes_session() -> None:
         await waiter
 
     assert deleted == ["cancelled-session"]
+    assert revoked == [("alice@example.com", "cancelled-session")]
     assert not launch_task.done()
     release.set()
     await launch_task
+
+
+async def test_failed_coda_owner_launch_waiter_deletes_session_and_grant() -> None:
+    from omnigent.server.routes.sessions.routes_core import _await_coda_owner_launch
+
+    deleted: list[str] = []
+    revoked: list[tuple[str, str]] = []
+
+    class _ConversationStore:
+        async def delete_conversation(self, session_id: str) -> None:
+            deleted.append(session_id)
+
+    class _PermissionStore:
+        def revoke(self, user_id: str, session_id: str) -> bool:
+            revoked.append((user_id, session_id))
+            return True
+
+    async def failed_launch() -> None:
+        raise RuntimeError("controlled sibling failure")
+
+    launch_task = asyncio.create_task(failed_launch())
+    with pytest.raises(RuntimeError, match="controlled sibling failure"):
+        await _await_coda_owner_launch(
+            launch_task,
+            session_id="waiting-session",
+            user_id="alice@example.com",
+            conversation_store=_ConversationStore(),  # type: ignore[arg-type]
+            permission_store=_PermissionStore(),  # type: ignore[arg-type]
+        )
+
+    assert deleted == ["waiting-session"]
+    assert revoked == [("alice@example.com", "waiting-session")]
 
 
 async def test_concurrent_first_coda_sessions_single_flight_one_host(

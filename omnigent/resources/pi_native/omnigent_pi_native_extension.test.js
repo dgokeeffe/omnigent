@@ -29,6 +29,18 @@ const EXT_PATH = path.resolve(__dirname, "omnigent_pi_native_extension.js");
 
 const harnesses = [];
 
+function makeResponse({ status = 200, contentType = "application/json", body = "{}" } = {}) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (name) => name.toLowerCase() === "content-type" ? contentType : null,
+    },
+    text: async () => body,
+    json: async () => JSON.parse(body),
+  };
+}
+
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
@@ -53,7 +65,7 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
           postedEvents.push(JSON.parse(opts.body));
         }
       } catch (_err) {}
-      return { ok: true, status: 204, json: async () => ({}) };
+      return makeResponse({ status: 202, body: '{"queued":false}' });
     };
   }
 
@@ -121,6 +133,233 @@ async function deliverInterrupt(h) {
 function assert(name, cond, detail) {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  -- " + detail : ""}`);
   if (!cond) process.exitCode = 1;
+}
+
+async function testOmnigentResponseContractAndDegradedStatus() {
+  delete require.cache[EXT_PATH];
+  const extension = require(EXT_PATH);
+  const {
+    validateOmnigentJsonResponse,
+    fetchOmnigentJson,
+    responseFailureClass,
+  } = extension._test;
+
+  async function classification(response) {
+    try {
+      await validateOmnigentJsonResponse(response);
+      return "success";
+    } catch (error) {
+      return responseFailureClass(error);
+    }
+  }
+
+  assert(
+    "200 text/html sign-in response is edge authentication failure",
+    (await classification(makeResponse({
+      contentType: "text/html; charset=utf-8",
+      body: "<!doctype html><title>Databricks sign in</title>",
+    }))) === "edge_auth",
+  );
+  assert(
+    "200 application/json object satisfies the response contract",
+    (await classification(makeResponse({ body: '{"queued":false}' }))) === "success",
+  );
+  assert(
+    "valid parsed JSON may contain HTML-like user content",
+    (await classification(makeResponse({
+      body: JSON.stringify({ queued: true, content: "Example: <html> is ordinary tool output" }),
+    }))) === "success",
+  );
+  assert("401 is classified as auth", (await classification(makeResponse({ status: 401 }))) === "auth");
+  assert("403 is classified as auth", (await classification(makeResponse({ status: 403 }))) === "auth");
+  assert("5xx is classified as server", (await classification(makeResponse({ status: 503 }))) === "server");
+  assert(
+    "malformed JSON is classified distinctly",
+    (await classification(makeResponse({ body: "not-json" }))) === "malformed_json",
+  );
+  assert(
+    "wrong content type is classified distinctly",
+    (await classification(makeResponse({ contentType: "text/plain", body: "not json" }))) === "content_type",
+  );
+  assert(
+    "mislabeled sign-in document remains an edge authentication failure",
+    (await classification(makeResponse({
+      contentType: "application/json",
+      body: "<html>Databricks sign in</html>",
+    }))) === "edge_auth",
+  );
+  const largeToolPayload = JSON.stringify({
+    content: [{ type: "text", text: "x".repeat(2 * 1_048_576) }],
+  });
+  let largeToolAccepted = false;
+  try {
+    await validateOmnigentJsonResponse(
+      makeResponse({ body: largeToolPayload }),
+      undefined,
+      10 * 1_048_576,
+    );
+    largeToolAccepted = true;
+  } catch (_error) {}
+  assert(
+    "tool-response contract preserves legitimate multi-megabyte output",
+    largeToolAccepted,
+  );
+
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    status: 202,
+    headers: { get: (name) => name.toLowerCase() === "content-type" ? "application/json" : null },
+    text: async () => new Promise(() => {}),
+  });
+  const stalledStartedAt = Date.now();
+  let stalledClass = "success";
+  try {
+    await fetchOmnigentJson("http://mock/events", { method: "POST" }, undefined, 20);
+  } catch (error) {
+    stalledClass = responseFailureClass(error);
+  } finally {
+    global.fetch = originalFetch;
+  }
+  assert(
+    "stalled response body is aborted within the caller budget",
+    stalledClass === "transport" && Date.now() - stalledStartedAt < 500,
+    JSON.stringify({ stalledClass, elapsedMs: Date.now() - stalledStartedAt }),
+  );
+
+  const h = makeHarness({ captureEvents: true });
+  const rendered = [];
+  const ctx = {
+    ui: {
+      setTitle() {},
+      setStatus(key, value) {
+        if (key === "omnigent") rendered.push(value);
+      },
+    },
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args);
+  const sensitive = [
+    "Bearer must-not-log",
+    "relay-token-must-not-log",
+    "Databricks sign in document must-not-log",
+  ];
+  try {
+    global.fetch = async () => {
+      throw new Error(sensitive.join(" "));
+    };
+    for (let i = 0; i < 4; i += 1) {
+      await h.handlers.input({ text: `message-${i}` }, ctx);
+    }
+    assert(
+      "transport failure remains fail-open for Pi input handling",
+      rendered.length > 0,
+      JSON.stringify(rendered),
+    );
+    assert(
+      "chat offline marker appears at the named threshold and remains stable",
+      rendered.filter((label) => String(label).includes("chat offline")).length >= 2 &&
+        String(rendered.at(-1)).includes("chat offline"),
+      JSON.stringify(rendered),
+    );
+    assert(
+      "degraded diagnostic is emitted once per failure episode",
+      warnings.length === 1,
+      JSON.stringify(warnings),
+    );
+    const diagnostic = warnings[0] && warnings[0][1];
+    assert(
+      "diagnostic contains only session id, failure class, and consecutive count",
+      diagnostic &&
+        JSON.stringify(Object.keys(diagnostic).sort()) ===
+          JSON.stringify(["consecutiveCount", "failureClass", "sessionId"]) &&
+        diagnostic.failureClass === "transport" &&
+        diagnostic.consecutiveCount === 3,
+      JSON.stringify(diagnostic),
+    );
+    const logged = JSON.stringify(warnings);
+    assert(
+      "diagnostic never logs bearer, relay token, response body, or sign-in document",
+      sensitive.every((value) => !logged.includes(value)) && !logged.toLowerCase().includes("<html"),
+      logged,
+    );
+
+    global.fetch = async () => makeResponse({
+      status: 200,
+      contentType: "text/html",
+      body: "<html>Databricks sign in document must-not-log</html>",
+    });
+    await h.handlers.input({ text: "edge-failure-1" }, ctx);
+    await h.handlers.input({ text: "edge-failure-2" }, ctx);
+    await h.handlers.input({ text: "edge-failure-3" }, ctx);
+    await h.handlers.input({ text: "edge-failure-4" }, ctx);
+    assert(
+      "a changed failure class starts one new bounded diagnostic episode",
+      warnings.length === 2 && warnings[1][1].failureClass === "edge_auth",
+      JSON.stringify(warnings),
+    );
+
+    global.fetch = async () => makeResponse({ status: 202, body: '{"queued":false}' });
+    await h.handlers.input({ text: "recovered" }, ctx);
+    assert(
+      "first validated success clears degraded status",
+      !String(rendered.at(-1)).includes("chat offline"),
+      JSON.stringify(rendered.at(-1)),
+    );
+
+    global.fetch = async () => { throw new Error("still private"); };
+    await h.handlers.input({ text: "after-success-1" }, ctx);
+    await h.handlers.input({ text: "after-success-2" }, ctx);
+    assert(
+      "validated success resets the consecutive failure streak",
+      warnings.length === 2 && !String(rendered.at(-1)).includes("chat offline"),
+      JSON.stringify({ warnings, last: rendered.at(-1) }),
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const patchHarness = makeHarness({ captureEvents: true });
+  const patchWarnings = [];
+  let patchAttempts = 0;
+  console.warn = (...args) => patchWarnings.push(args);
+  global.fetch = async (url, options) => {
+    if (options && options.method === "PATCH") {
+      patchAttempts += 1;
+      if (patchAttempts === 1) {
+        return makeResponse({
+          status: 200,
+          contentType: "text/html",
+          body: "<html>Databricks sign in private-body</html>",
+        });
+      }
+      return makeResponse({ body: '{"id":"conv_test"}' });
+    }
+    return makeResponse({ status: 202, body: '{"queued":false}' });
+  };
+  const patchCtx = {
+    sessionManager: { getSessionId: () => "native-private-id" },
+    ui: { setTitle() {}, setStatus() {}, notify() {} },
+  };
+  try {
+    await patchHarness.handlers.session_start({}, patchCtx);
+    await patchHarness.handlers.agent_start({}, patchCtx);
+    assert(
+      "external session link retries on a later lifecycle and recovers",
+      patchAttempts === 2,
+      `patchAttempts=${patchAttempts}`,
+    );
+    assert(
+      "external session link failure emits one sanitized diagnostic",
+      patchWarnings.length === 1 &&
+        patchWarnings[0][1].failureClass === "edge_auth" &&
+        !JSON.stringify(patchWarnings).includes("native-private-id") &&
+        !JSON.stringify(patchWarnings).includes("private-body"),
+      JSON.stringify(patchWarnings),
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
 }
 
 async function testIdleInterruptDoesNotPoisonNextTurn() {
@@ -475,6 +714,7 @@ async function testRunningIdleShareResponseId() {
 
 (async () => {
   try {
+    await testOmnigentResponseContractAndDegradedStatus();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();
     await testExistingTaskToolIsMirroredWithoutConflict();

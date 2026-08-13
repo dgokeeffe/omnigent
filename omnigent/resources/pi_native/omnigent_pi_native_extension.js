@@ -60,6 +60,291 @@ const _MAX_RAW_ASK_ROUNDS = 50;
 // fail_closed_hook_output(PreToolUse) → deny.
 const _FAIL_CLOSED_REASON =
   "blocked: Omnigent policy server unreachable — failing closed (PHASE_TOOL_CALL)";
+const _EVENT_DELIVERY_DEGRADED_THRESHOLD = 3;
+const _EVENT_DELIVERY_REQUEST_TIMEOUT_MS = 10_000;
+const _OMNIGENT_RESPONSE_MAX_BYTES = 1_048_576;
+const _OMNIGENT_TOOL_RESPONSE_MAX_BYTES = 10 * 1_048_576;
+
+class OmnigentResponseError extends Error {
+  constructor(classification, status = null) {
+    super(`Omnigent response rejected: ${classification}`);
+    this.name = "OmnigentResponseError";
+    this.classification = classification;
+    this.status = status;
+  }
+}
+
+function responseContentType(response) {
+  if (!response || !response.headers || typeof response.headers.get !== "function") {
+    return "";
+  }
+  return String(response.headers.get("content-type") || "").toLowerCase();
+}
+
+function isJsonContentType(contentType) {
+  const mediaType = String(contentType).split(";", 1)[0].trim();
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+function isJsonObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function looksLikeSignInDocument(text) {
+  const prefix = String(text || "").slice(0, 4096).toLowerCase();
+  return (
+    prefix.includes("<!doctype html") ||
+    prefix.includes("<html") ||
+    (prefix.includes("databricks") && prefix.includes("sign in"))
+  );
+}
+
+function responseContentLength(response) {
+  if (!response || !response.headers || typeof response.headers.get !== "function") {
+    return null;
+  }
+  const raw = response.headers.get("content-length");
+  if (raw === null || raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function textByteLength(text) {
+  if (typeof Buffer !== "undefined" && typeof Buffer.byteLength === "function") {
+    return Buffer.byteLength(text, "utf8");
+  }
+  return new TextEncoder().encode(text).byteLength;
+}
+
+async function readOmnigentResponseText(
+  response,
+  maxBytes = _OMNIGENT_RESPONSE_MAX_BYTES,
+) {
+  const declaredLength = responseContentLength(response);
+  if (declaredLength !== null && declaredLength > maxBytes) {
+    throw new OmnigentResponseError("response_too_large", Number(response.status));
+  }
+
+  if (response && response.body && typeof response.body.getReader === "function") {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let total = 0;
+    let text = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel();
+          throw new OmnigentResponseError("response_too_large", Number(response.status));
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      return text + decoder.decode();
+    } finally {
+      if (typeof reader.releaseLock === "function") reader.releaseLock();
+    }
+  }
+
+  if (!response) {
+    throw new OmnigentResponseError("malformed_json");
+  }
+  let text;
+  if (typeof response.text === "function") {
+    text = await response.text();
+  } else if (typeof response.json === "function") {
+    // Lightweight test doubles and some embedded fetch shims expose json()
+    // without text()/body. Preserve that supported contract without weakening
+    // content-type or shape validation.
+    text = JSON.stringify(await response.json());
+  } else {
+    throw new OmnigentResponseError("malformed_json", Number(response.status));
+  }
+  if (textByteLength(text) > maxBytes) {
+    throw new OmnigentResponseError("response_too_large", Number(response.status));
+  }
+  return text;
+}
+
+/** Validate the HTTP, content-type, and JSON shape contract for Omnigent. */
+async function validateOmnigentJsonResponse(
+  response,
+  expectedShape = isJsonObject,
+  maxBytes = _OMNIGENT_RESPONSE_MAX_BYTES,
+) {
+  const status = Number(response && response.status);
+  if (!Number.isInteger(status)) {
+    throw new OmnigentResponseError("invalid_response");
+  }
+  if (status === 401 || status === 403) {
+    throw new OmnigentResponseError("auth", status);
+  }
+  if (status >= 500) {
+    throw new OmnigentResponseError("server", status);
+  }
+  if (status < 200 || status >= 300) {
+    throw new OmnigentResponseError("http", status);
+  }
+
+  const contentType = responseContentType(response);
+  if (contentType.includes("text/html")) {
+    throw new OmnigentResponseError("edge_auth", status);
+  }
+
+  let text;
+  try {
+    text = await readOmnigentResponseText(response, maxBytes);
+  } catch (err) {
+    if (err instanceof OmnigentResponseError) throw err;
+    throw new OmnigentResponseError("malformed_json", status);
+  }
+  if (!isJsonContentType(contentType)) {
+    throw new OmnigentResponseError(
+      looksLikeSignInDocument(text) ? "edge_auth" : "content_type",
+      status,
+    );
+  }
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (_err) {
+    throw new OmnigentResponseError(
+      looksLikeSignInDocument(text) ? "edge_auth" : "malformed_json",
+      status,
+    );
+  }
+  if (typeof expectedShape === "function" && !expectedShape(json)) {
+    throw new OmnigentResponseError("unexpected_json", status);
+  }
+  return json;
+}
+
+async function fetchOmnigentJson(
+  url,
+  options,
+  expectedShape = isJsonObject,
+  timeoutMs = _EVENT_DELIVERY_REQUEST_TIMEOUT_MS,
+  maxBytes = _OMNIGENT_RESPONSE_MAX_BYTES,
+) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const requestOptions = controller
+    ? { ...options, signal: controller.signal }
+    : { ...options };
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (controller) controller.abort();
+      reject(new OmnigentResponseError("transport"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        const response = await fetch(url, requestOptions);
+        return validateOmnigentJsonResponse(response, expectedShape, maxBytes);
+      })(),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function responseFailureClass(error) {
+  return error instanceof OmnigentResponseError
+    ? error.classification
+    : "transport";
+}
+
+const _eventDeliveryStates = new WeakMap();
+const _eventDeliveryObservers = new WeakMap();
+const _externalSessionPatchStates = new WeakMap();
+
+function eventDeliveryState(config) {
+  let state = _eventDeliveryStates.get(config);
+  if (!state) {
+    state = {
+      consecutive: 0,
+      degraded: false,
+      failureClass: null,
+      failureClassConsecutive: 0,
+      failureClassWarned: false,
+      requestedStatus: undefined,
+    };
+    _eventDeliveryStates.set(config, state);
+  }
+  return state;
+}
+
+function recordEventDeliveryFailure(config, failureClass) {
+  if (!config || typeof config !== "object") return;
+  const state = eventDeliveryState(config);
+  state.consecutive += 1;
+  if (state.failureClass !== failureClass) {
+    state.failureClass = failureClass;
+    state.failureClassConsecutive = 0;
+    state.failureClassWarned = false;
+  }
+  state.failureClassConsecutive += 1;
+  const becameDegraded =
+    state.consecutive >= _EVENT_DELIVERY_DEGRADED_THRESHOLD && !state.degraded;
+  if (becameDegraded) state.degraded = true;
+  if (
+    state.degraded &&
+    state.failureClassConsecutive >= _EVENT_DELIVERY_DEGRADED_THRESHOLD &&
+    !state.failureClassWarned
+  ) {
+    state.failureClassWarned = true;
+    console.warn("Omnigent event delivery degraded", {
+      sessionId: typeof config.sessionId === "string" ? config.sessionId : "",
+      failureClass,
+      consecutiveCount: state.consecutive,
+    });
+  }
+  if (becameDegraded) {
+    const observer = _eventDeliveryObservers.get(config);
+    if (observer) observer();
+  }
+}
+
+function recordEventDeliverySuccess(config) {
+  if (!config || typeof config !== "object") return;
+  const state = eventDeliveryState(config);
+  const wasDegraded = state.degraded;
+  state.consecutive = 0;
+  state.degraded = false;
+  state.failureClass = null;
+  state.failureClassConsecutive = 0;
+  state.failureClassWarned = false;
+  if (wasDegraded) {
+    const observer = _eventDeliveryObservers.get(config);
+    if (observer) observer();
+  }
+}
+
+function recordExternalSessionPatchFailure(config, failureClass) {
+  if (!config || typeof config !== "object") return;
+  let state = _externalSessionPatchStates.get(config);
+  if (!state) {
+    state = { consecutive: 0, warned: false };
+    _externalSessionPatchStates.set(config, state);
+  }
+  state.consecutive += 1;
+  if (state.warned) return;
+  state.warned = true;
+  console.warn("Omnigent external session link unavailable", {
+    sessionId: typeof config.sessionId === "string" ? config.sessionId : "",
+    failureClass,
+    consecutiveCount: state.consecutive,
+  });
+}
+
+function recordExternalSessionPatchSuccess(config) {
+  if (!config || typeof config !== "object") return;
+  _externalSessionPatchStates.delete(config);
+}
 
 function failClosedVerdict() {
   return { block: true, reason: _FAIL_CLOSED_REASON };
@@ -274,11 +559,13 @@ async function evalNativePolicyHttp(config, toolName, args) {
       if (timer) clearTimeout(timer);
     }
 
-    if (!resp.ok) {
-      // 5xx is transient (retry within budget, re-attaching); 4xx is final
-      // (a bad request won't succeed on retry). Either way, an unevaluable
-      // PHASE_TOOL_CALL fails CLOSED.
-      if (resp.status >= 500) {
+    let json;
+    try {
+      json = await validateOmnigentJsonResponse(resp);
+    } catch (err) {
+      // A 5xx remains transient within the existing bounded retry budget. All
+      // other HTTP/content/shape failures are terminal and fail closed.
+      if (responseFailureClass(err) === "server") {
         if (Date.now() + transientBackoff >= transientDeadline) {
           return failClosedVerdict();
         }
@@ -289,14 +576,6 @@ async function evalNativePolicyHttp(config, toolName, args) {
         );
         continue;
       }
-      return failClosedVerdict();
-    }
-
-    let json;
-    try {
-      json = await resp.json();
-    } catch (_err) {
-      // Malformed body — not retryable, and we have no verdict. Fail CLOSED.
       return failClosedVerdict();
     }
 
@@ -441,27 +720,23 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
       },
       body,
     });
-    if (!resp.ok) {
-      return {
-        piResult: {
-          content: [
-            {
-              type: "text",
-              text: `Omnigent tool call failed: HTTP ${resp.status}`,
-            },
-          ],
-          isError: true,
-        },
-      };
-    }
-    return { json: await resp.json() };
+    return {
+      json: await validateOmnigentJsonResponse(
+        resp,
+        isJsonObject,
+        _OMNIGENT_TOOL_RESPONSE_MAX_BYTES,
+      ),
+    };
   } catch (err) {
+    // Surface only a bounded failure class. Transport exceptions and response
+    // bodies may contain bearer material or an edge sign-in document.
+    const failureClass = responseFailureClass(err);
     return {
       piResult: {
         content: [
           {
             type: "text",
-            text: `Omnigent tool call failed: ${err && err.message ? err.message : String(err)}`,
+            text: `Omnigent tool call failed: ${failureClass}`,
           },
         ],
         isError: true,
@@ -715,16 +990,24 @@ async function postEvent(config, body) {
     !config.sessionId ||
     typeof fetch !== "function"
   )
-    return;
+    return false;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(body),
-    });
-  } catch (_err) {
-    // Keep Pi responsive even if Omnigent is temporarily unavailable.
+    await fetchOmnigentJson(
+      url,
+      {
+        method: "POST",
+        headers: headers(config),
+        body: JSON.stringify(body),
+      },
+      (json) => isJsonObject(json) && typeof json.queued === "boolean",
+    );
+    recordEventDeliverySuccess(config);
+    return true;
+  } catch (err) {
+    recordEventDeliveryFailure(config, responseFailureClass(err));
+    // Event mirroring is fail-open: chat delivery must not wedge the Pi loop.
+    return false;
   }
 }
 
@@ -733,21 +1016,33 @@ async function patchExternalSessionId(config, nativeSessionId) {
     !nativeSessionId ||
     !config ||
     !config.serverUrl ||
+    !config.sessionId ||
     typeof fetch !== "function"
   )
-    return;
+    return false;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}`;
   try {
-    await fetch(url, {
-      method: "PATCH",
-      headers: headers(config),
-      body: JSON.stringify({ external_session_id: nativeSessionId }),
-    });
-  } catch (_err) {}
+    await fetchOmnigentJson(
+      url,
+      {
+        method: "PATCH",
+        headers: headers(config),
+        body: JSON.stringify({ external_session_id: nativeSessionId }),
+      },
+      (json) => isJsonObject(json) && json.id === config.sessionId,
+    );
+    recordExternalSessionPatchSuccess(config);
+    return true;
+  } catch (err) {
+    recordExternalSessionPatchFailure(config, responseFailureClass(err));
+    return false;
+  }
 }
 
-function setOmnigentStatus(config, ctx, state) {
+function renderOmnigentStatus(config, ctx) {
   if (!ctx || !ctx.ui || !config) return;
+  const delivery = eventDeliveryState(config);
+  const state = delivery.degraded ? "chat offline" : delivery.requestedStatus;
   const urlLabel = config.conversationUrl
     ? `Omnigent: ${config.conversationUrl}`
     : "Omnigent";
@@ -757,6 +1052,12 @@ function setOmnigentStatus(config, ctx, state) {
     ctx.ui.setStatus("omnigent", label);
     ctx.ui.setStatus("omnigent_state", undefined);
   } catch (_err) {}
+}
+
+function setOmnigentStatus(config, ctx, state) {
+  if (!config) return;
+  eventDeliveryState(config).requestedStatus = state;
+  renderOmnigentStatus(config, ctx);
 }
 
 function interruptActiveContext(ctx) {
@@ -1147,6 +1448,12 @@ module.exports = function (pi) {
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
   let latestContext = null;
+  let externalSessionIdPatched = false;
+  if (config && typeof config === "object") {
+    _eventDeliveryObservers.set(config, () =>
+      renderOmnigentStatus(config, latestContext),
+    );
+  }
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -1461,6 +1768,16 @@ module.exports = function (pi) {
     if (ctx) latestContext = ctx;
   }
 
+  async function ensureExternalSessionId(ctx) {
+    if (externalSessionIdPatched) return true;
+    const nativeSessionId =
+      ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
+        ? ctx.sessionManager.getSessionId()
+        : undefined;
+    externalSessionIdPatched = await patchExternalSessionId(config, nativeSessionId);
+    return externalSessionIdPatched;
+  }
+
   function newResponseId(prefix) {
     return `pi-${prefix}-${Date.now()}-${++sequence}`;
   }
@@ -1708,11 +2025,7 @@ module.exports = function (pi) {
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
     );
-    const nativeSessionId =
-      ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
-        ? ctx.sessionManager.getSessionId()
-        : undefined;
-    await patchExternalSessionId(config, nativeSessionId);
+    await ensureExternalSessionId(ctx);
     // Publish Pi's live model catalog so the Web UI picker populates from what
     // Pi actually loaded, independent of how it authenticated.
     await postModelOptions(config, ctx);
@@ -1780,6 +2093,10 @@ module.exports = function (pi) {
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
+    // A failed startup link is retried on the next real agent lifecycle without
+    // delaying or failing the turn. The diagnostic remains one-per-failure
+    // episode and contains no native id, response body, or credential.
+    await ensureExternalSessionId(ctx);
     // Pin the response_id for this agent loop. agent_end MUST emit the same id
     // so the web client can match the idle edge to the running edge and clear
     // the "streaming" status — which unblocks queued follow-up messages.
@@ -2018,4 +2335,17 @@ module.exports = function (pi) {
       await postToolResult(result, responseId);
     }
   });
+};
+
+module.exports._test = {
+  OmnigentResponseError,
+  validateOmnigentJsonResponse,
+  fetchOmnigentJson,
+  postEvent,
+  patchExternalSessionId,
+  eventDeliveryState,
+  responseFailureClass,
+  _EVENT_DELIVERY_DEGRADED_THRESHOLD,
+  _EVENT_DELIVERY_REQUEST_TIMEOUT_MS,
+  _OMNIGENT_RESPONSE_MAX_BYTES,
 };

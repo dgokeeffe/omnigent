@@ -16,6 +16,7 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { setSessionHost } from "./sessionHost";
+import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -168,6 +169,8 @@ interface SessionResponseWire {
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
+  /** Owner opt-in: view-level collaborators may browse workspace files. */
+  share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -330,6 +333,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
+    shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -393,6 +397,10 @@ export class ApiError extends Error {
  * instead, so that shape is read too — otherwise those failures reach the
  * user as a bare status line ("415 ", with statusText empty over HTTP/2)
  * rather than the reason the server actually gave.
+ *
+ * Databricks-backed stores propagate rejections as a top-level
+ * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
+ * workspace storage refuses), so that shape is read as well.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
@@ -401,12 +409,16 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
     const body = (await res.json()) as {
       error?: { code?: string; message?: string };
       detail?: unknown;
+      message?: unknown;
+      error_code?: unknown;
     };
     // FastAPI's validation errors put a list in `detail`; only a plain
     // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
+    else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
@@ -488,7 +500,11 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -516,10 +532,11 @@ export interface LocalImportResult {
 }
 
 /**
- * Import the caller's most recent local transcripts from a chosen host. The
+ * Import local transcripts from a chosen host. The
  * host reads + normalizes its own transcripts over the tunnel (they live on
  * that machine, not the server); already-imported sessions are skipped.
- * `source` is a specific harness or "all" for every harness at once.
+ * Passing `sessionId` loads that exact session from `source` without listing
+ * local history. Otherwise, `source` may be "all" for every harness at once.
  *
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
@@ -536,15 +553,20 @@ export async function importLocalSessions(
   source: ImportSourceSelector,
   limit: number,
   onSession?: (session: ImportedSessionRef) => void,
+  sessionId?: string,
 ): Promise<LocalImportResult> {
+  const body = { host_id: hostId, source, limit, session_id: sessionId };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
-    body: JSON.stringify({ host_id: hostId, source, limit }),
+    body: JSON.stringify(body),
   });
   // Older server without the streaming endpoint: fall back to the buffered
   // import so a newer client still works against it.
   if (res.status === 404) {
+    if (sessionId !== undefined) {
+      throw new Error("Direct session import is not supported by this server.");
+    }
     return importLocalSessionsBuffered(hostId, source, limit, onSession);
   }
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -676,7 +698,10 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "X-Omnigent-Client": getClientSurface(),
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: form,
   });
   if (!res.ok) {
@@ -912,8 +937,22 @@ export async function updateSession(
      * promise means the mode really changed.
      */
     claudePermissionMode?: string;
+    /**
+     * Codex-native approval mode to switch a RUNNING session to, one of
+     * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
+     * (Codex's `/permissions` presets; the set is codex-version-dependent).
+     * Rejected by the server unless the session is codex-native, and the PATCH
+     * fails unless the runner confirms Codex applied it via its `/permissions`
+     * popup — so a resolved promise means the mode really changed.
+     */
+    codexApprovalMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    /**
+     * Owner opt-in that lets people with view (read-only) access browse the
+     * workspace files. Owner-only server-side. `true`/`false` set or clear it.
+     */
+    shareWorkspaceFiles?: boolean;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -932,11 +971,17 @@ export async function updateSession(
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
   }
+  if (updates.codexApprovalMode !== undefined) {
+    body.approval_mode = updates.codexApprovalMode;
+  }
   if ("costControlModeOverride" in updates) {
     body.cost_control_mode_override = updates.costControlModeOverride ?? null;
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if (updates.shareWorkspaceFiles !== undefined) {
+    body.share_workspace_files = updates.shareWorkspaceFiles;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
@@ -1034,6 +1079,8 @@ export interface GetSessionSlimOptions {
    * refresh pierces stale server-side capability caches.
    */
   refreshState?: boolean;
+  /** Cancel this request when the owning operation ends or times out. */
+  signal?: AbortSignal;
 }
 
 export async function getSessionSlim(
@@ -1047,6 +1094,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
@@ -1140,7 +1188,10 @@ export async function postEvent(
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...backgroundSessionTitlesRequestHeaders(),
+    },
     body: JSON.stringify(event),
   });
   // Throw a typed ApiError (not the bare status line) so callers can branch

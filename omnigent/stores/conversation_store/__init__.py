@@ -33,7 +33,7 @@ FORK_SOURCE_LABEL_KEY = "omnigent.fork.source_id"
 # the (still-unbound) clone uses it to locate the source's local transcript
 # and clone it into the clone's OWN project dir under a freshly assigned
 # uuid (rewriting sessionId/cwd), then launch plain ``--resume <our_uuid>``
-# (see ``omnigent.claude_native._clone_claude_transcript`` and the
+# (see ``omnigent.harnesses.claude_native.main._clone_claude_transcript`` and the
 # fork-resume branch in ``omnigent.runner.app``), so the clone opens with
 # the prior history instead of a blank session. Once the clone captures its
 # OWN native session id (``external_session_id`` set on first launch), this
@@ -467,14 +467,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_imported_conversation(
+    def find_conversation_by_external_session_id(
         self,
-        source: str,
         external_session_id: str,
     ) -> Conversation | None:
-        """Find the original session imported from one external transcript.
+        """Find an existing conversation wrapping one external (harness) session id.
 
-        :param source: Import source key, e.g. ``"claude"``.
+        Both an imported transcript and a natively-run session record the
+        external id, so import dedup resolves against either through this one
+        lookup. When several rows share the id, the earliest-created wins.
+
         :param external_session_id: Source harness session id.
         :returns: The matching conversation, or ``None``.
         """
@@ -629,6 +631,12 @@ class ConversationStore(ABC):
         Append items to a conversation. Assigns a globally unique
         ID and timestamp to each item.
 
+        An item carrying ``stable_id`` appends idempotently: its id is the
+        stable id, and when an item with that id already exists the stored
+        item is returned in its place — flagged ``deduplicated`` — instead
+        of inserting a duplicate. The existence check rides the append's
+        own transaction, so idempotency costs no extra query.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
@@ -655,7 +663,9 @@ class ConversationStore(ABC):
         search_query: str | None = None,
         accessible_by: str | None = None,
         owned_by: str | None = None,
+        shared_only: bool = False,
         include_archived: bool = False,
+        archived_only: bool = False,
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
@@ -814,6 +824,7 @@ class ConversationStore(ABC):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
@@ -860,6 +871,9 @@ class ConversationStore(ABC):
             variant — the override is set once at session create and
             immutable thereafter (the harness process is spawned on
             the first turn).
+        :param share_workspace_files: Whether view-level collaborators may
+            browse the workspace. ``True`` stores the share, ``False``
+            clears it (edit-only again), ``None`` leaves it unchanged.
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -871,6 +885,22 @@ class ConversationStore(ABC):
             ``None`` leaves unchanged.
         :returns: The updated :class:`Conversation`, or ``None``
             if the conversation does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def clear_model_override_if_matches(
+        self,
+        conversation_id: str,
+        expected_model_override: str,
+    ) -> bool:
+        """Clear a model selection only while the stored settings still match.
+
+        :param conversation_id: Conversation to update.
+        :param expected_model_override: Model selection that must still be stored.
+        :returns: ``True`` when cleared; ``False`` when missing, mismatched,
+            or any session override changed concurrently. Other settings and
+            metadata remain unchanged.
         """
         ...
 
@@ -1296,6 +1326,20 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Atomically settle a stale running session to idle.
+
+        The update must require a bound runner, ``running``/``waiting`` live
+        status, and a missing or older ``runner_last_seen`` stamp. It must not
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param stale_before: Runner stamps at or after this epoch are fresh.
+        :returns: Whether this call performed the transition.
+        """
+        ...
+
+    @abstractmethod
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the outstanding elicitation count for one session.
@@ -1502,6 +1546,7 @@ class ConversationStore(ABC):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1540,6 +1585,9 @@ class ConversationStore(ABC):
         :param runner_id: Optional runner binding to persist at
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
+            ``workspace``. ``None`` leaves the session unbound.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such

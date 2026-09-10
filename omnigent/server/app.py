@@ -38,7 +38,11 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import ExtensionPluginState
-from omnigent.extensions.assets import ResolvedBundle, build_asset_index
+from omnigent.extensions.assets import (
+    ResolvedBundle,
+    build_asset_index,
+    parse_dev_bundle_overrides,
+)
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -55,7 +59,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -63,6 +67,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -178,7 +183,15 @@ def _resolve_extension_assets(
 ) -> tuple[dict[str, ResolvedBundle], dict[str, str]]:
     """Resolve bundle snapshots without allowing asset failures to stop the server."""
     try:
-        return build_asset_index(state)
+        overrides = None
+        raw_overrides = os.environ.get("OMNIGENT_EXTENSION_DEV_BUNDLES", "").strip()
+        if raw_overrides:
+            overrides = parse_dev_bundle_overrides(raw_overrides)
+            _logger.warning(
+                "using development extension bundle overrides for: %s",
+                ", ".join(sorted(overrides)),
+            )
+        return build_asset_index(state, overrides=overrides)
     except Exception as exc:  # noqa: BLE001
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
@@ -753,7 +766,7 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     import inspect
     import tempfile
 
-    from omnigent.native_dispatch import resolve_hook
+    from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
     materialize = resolve_hook(provider, "materialize_agent_spec")
@@ -790,7 +803,7 @@ def _ensure_default_native_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     for agent in NATIVE_CODING_AGENTS:
         provider = native_provider_for_key(agent.key)
@@ -1070,6 +1083,8 @@ def create_app(
     sandbox_config: ManagedSandboxDeployment | None = None,
     github_config: Any | None = None,  # GitHubAppConfig — GitHub App integration
     github_store: Any | None = None,  # GithubConnectionStore — GitHub App integration
+    databricks_config: Any | None = None,  # DatabricksConfig — Databricks Connect
+    databricks_store: Any | None = None,  # DatabricksConnectionStore — Databricks Connect
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
@@ -1481,9 +1496,26 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        managed_sandbox_reaper: ManagedSandboxReaper | None = None
+        if sandbox_config is not None and sandbox_config.reaper.enabled:
+            if host_store is None:
+                _logger.warning(
+                    "Managed sandbox reaper is enabled but no host store is configured; "
+                    "the reaper will not run"
+                )
+            else:
+                managed_sandbox_reaper = ManagedSandboxReaper(
+                    host_store=host_store,
+                    sandbox_config=sandbox_config,
+                )
+                app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
+                await managed_sandbox_reaper.start()
+
         try:
             yield
         finally:
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -1542,7 +1574,10 @@ def create_app(
     # enabled_connections list and the router mounting below both read these.
     from omnigent.server.connections_registry import connection_providers
 
-    _connection_inputs = {"github": (github_config, github_store)}
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
     for _provider in connection_providers():
         _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
         _on = _cfg is not None and _store is not None
@@ -1652,6 +1687,9 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Extend a managed sandbox while its runner tunnel is live (the managed-path
+    # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
+    managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -2349,7 +2387,7 @@ def create_app(
         # and its connection store are present.
         enabled_connections = [
             provider
-            for provider in ("github",)
+            for provider in ("github", "databricks")
             if getattr(app.state, f"{provider}_config", None) is not None
             and getattr(app.state, f"{provider}_store", None) is not None
         ]
@@ -2692,7 +2730,6 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
-
     # First-class projects (owner-private session containers). Mounted only
     # when a project store is wired; the endpoints self-scope to the caller.
     if project_store is not None:
@@ -3075,6 +3112,24 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        # Host-facing credential vending: a sandbox fetches its owner's
+        # per-provider credential over the launch-token-authenticated channel
+        # instead of having it injected. One generic route serves every provider
+        # that registered a credential_resolver (app.state set by the
+        # connection-provider wiring above); it 404s for a provider not
+        # configured on this server, so mounting it unconditionally is safe.
+        #
+        # Registered AFTER create_hosts_router on purpose: its ``{provider}`` path
+        # param would otherwise shadow that router's literal
+        # ``/hosts/{host_id}/credentials/detected`` (Starlette matches in
+        # registration order with no literal-over-parameter priority).
+        from omnigent.server.routes.host_credentials import create_host_credentials_router
+
+        app.include_router(
+            create_host_credentials_router(host_store),
+            prefix="/v1",
+            tags=["hosts"],
+        )
 
     # Per-user connection routes (/v1/connections/{provider}/*): connect /
     # callback / status / disconnect. One registry entry per provider; each is
@@ -3183,6 +3238,44 @@ def create_app(
                 type(auth_provider).__name__,
             )
 
+        # Client-credentials grant (RFC 6749 §4.4): a machine client mints a
+        # delegated, path-scoped token with no browser in the loop. It is a
+        # grant_type BRANCH of the one /oauth/token mounted below, never a
+        # second router on that path — FastAPI resolves first-match-wins, so a
+        # duplicate route would be shadowed with no warning. Opt-in and
+        # default-off: the factory returns None unless a machine client is
+        # configured and its principal passes the admin vetting.
+        # See designs/CLIENT_CREDENTIALS.md.
+        handle_client_credentials = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                MachineClientConfig,
+                create_client_credentials_handler,
+            )
+
+            if device_grant_store is None:
+                # Both /oauth/token mounts below need the grant store, so there
+                # is no endpoint to carry this branch. Parse the config anyway:
+                # from_env raises on a malformed one, so an operator error still
+                # surfaces at startup, and a machine client that cannot take
+                # effect is reported rather than silently dropped. Decided here
+                # rather than after building the handler, so the factory never
+                # logs the grant as enabled when nothing can answer it.
+                if MachineClientConfig.from_env() is not None:
+                    _logger.warning(
+                        "client-credentials: a machine client is configured, but no "
+                        "device-grant store was built (this deploy has no permission "
+                        "store), so /oauth/token is not mounted and the grant cannot "
+                        "answer. Configure a permission store."
+                    )
+            else:
+                handle_client_credentials = create_client_credentials_handler(
+                    auth_provider, permission_store
+                )
+
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
         # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
         # modes (both own a server-minted session cookie). Header mode has
@@ -3206,7 +3299,11 @@ def create_app(
             from omnigent.server.routes.device_auth import create_device_auth_router
 
             app.include_router(
-                create_device_auth_router(auth_provider, device_grant_store),
+                create_device_auth_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
@@ -3241,7 +3338,11 @@ def create_app(
             from omnigent.server.routes.device_auth import create_oauth_token_router
 
             app.include_router(
-                create_oauth_token_router(auth_provider, device_grant_store),
+                create_oauth_token_router(
+                    auth_provider,
+                    device_grant_store,
+                    handle_client_credentials=handle_client_credentials,
+                ),
                 tags=["oauth"],
             )
             _logger.info("login-grant: /oauth/token + /oauth/revoke enabled")

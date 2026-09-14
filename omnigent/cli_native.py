@@ -19,6 +19,7 @@ scope, from the leaf :mod:`omnigent.cli_common`.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
@@ -39,6 +40,8 @@ from omnigent.cli_common import (
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
 
+_logger = logging.getLogger(__name__)
+
 
 def _late_bound(
     getter: Callable[[], Callable[_Args, _Return]],
@@ -47,6 +50,37 @@ def _late_bound(
         return getter()(*args, **kwargs)
 
     return proxy
+
+
+def _discovered_opencode_model() -> str | None:
+    """Return the model ``omni opencode`` should launch on when none is configured.
+
+    Asks OpenCode which ``provider/model`` ids it can reach and applies the
+    shared Claude tier order, so an unconfigured launch lands on the same tier
+    pi does instead of OpenCode's own built-in default. An explicit
+    ``opencode_model`` / ``model`` config value and ``--model`` both take
+    precedence; this only fills the gap.
+
+    Best-effort by design: any failure (CLI absent, listing empty, no Claude id)
+    returns ``None``, which leaves OpenCode on its own default rather than
+    blocking a launch on model discovery.
+
+    :returns: A ``provider/model`` id, or ``None``.
+    """
+    try:
+        from omnigent.onboarding.opencode_auth import (
+            list_opencode_models,
+            reachable_provider_ids,
+        )
+        from omnigent.opencode_native_provider import preferred_opencode_model
+
+        return preferred_opencode_model(
+            list_opencode_models(),
+            reachable_providers=reachable_provider_ids(),
+        )
+    except Exception as exc:  # noqa: BLE001 - a default-model guess must never block launch
+        _logger.info("opencode default-model discovery failed: %r", exc)
+        return None
 
 
 def register_native_commands(cli: click.Group) -> None:
@@ -513,8 +547,10 @@ def register_native_commands(cli: click.Group) -> None:
             server = cfg.get("server")
         if model is None:
             # Prefer the OpenCode-specific default (set in `omni setup` → OpenCode →
-            # "Set default model"); fall back to the shared `model` key for back-compat.
-            model = cfg.get("opencode_model") or cfg.get("model")
+            # "Set default model"); fall back to the shared `model` key for back-compat,
+            # then to discovery so an unconfigured launch still lands on the same
+            # tier the rest of Omnigent routes to instead of OpenCode's own default.
+            model = cfg.get("opencode_model") or cfg.get("model") or _discovered_opencode_model()
         auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
 
         # Validate option combinations before any side effects (see the codex

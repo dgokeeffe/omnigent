@@ -3110,24 +3110,13 @@ def _list_opencode_models() -> list[str]:
     """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
 
     Best-effort: an absent CLI or a failed/empty invocation yields ``[]`` (the
-    caller then tells the user to sign a provider in first).
+    caller then tells the user to sign a provider in first). Shares the listing
+    with the launch path's default-model discovery so the menu offers exactly
+    the ids a launch can pin.
     """
-    from omnigent.onboarding.harness_install import OPENCODE_KEY, harness_install_spec
+    from omnigent.onboarding.opencode_auth import list_opencode_models
 
-    spec = harness_install_spec(OPENCODE_KEY)
-    if spec is None:
-        return []
-    try:
-        result = subprocess.run(
-            [spec.binary, "models"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return list_opencode_models()
 
 
 def _set_opencode_default_model(current: str | None) -> str | None:

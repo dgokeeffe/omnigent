@@ -1492,6 +1492,86 @@ def test_resolve_catalog_default_preserves_provider_tier_policy(
     assert resolution.source == ModelResolutionSource.CONFIGURED_DEFAULT
 
 
+def test_databricks_claude_default_prefers_flagship_tier_over_release_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway claude default follows tier order, not which tier shipped last.
+
+    pi and opencode both take their default from this call, so ranking by
+    release date alone lands them on whichever tier the workspace listed most
+    recently (a haiku or an opt-in fable id). Every listed gateway endpoint is
+    served, so the flagship tier is always reachable here.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name="databricks-claude-fable-9", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-haiku-9", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-sonnet-9", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-opus-5", provider="databricks", mode="chat"),
+        ],
+    )
+
+    resolution = resolve_catalog_model("databricks", family="claude")
+
+    assert resolution.model_id == "databricks-claude-opus-5"
+
+
+def test_databricks_claude_default_picks_newest_generation_of_the_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier order picks the tier; the newest generation in it wins the id.
+
+    Keeps the default version-agnostic: a newer opus supersedes the pin with no
+    code change, which is the whole point of not hardcoding a model id.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name="databricks-claude-opus-4-10", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-opus-5", provider="databricks", mode="chat"),
+        ],
+    )
+
+    resolution = resolve_catalog_model("databricks", family="claude")
+
+    assert resolution.model_id == "databricks-claude-opus-5"
+
+
+def test_databricks_claude_default_falls_back_when_no_opus_is_served(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workspace without the flagship tier still resolves down the order."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name="databricks-claude-fable-9", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-sonnet-4-6", provider="databricks", mode="chat"),
+        ],
+    )
+
+    resolution = resolve_catalog_model("databricks", family="claude")
+
+    assert resolution.model_id == "databricks-claude-sonnet-4-6"
+
+
+def test_databricks_openai_default_keeps_release_date_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claude tier order must not leak into the gateway's openai family."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_chat_models",
+        lambda _provider: [
+            ModelInfo(name="databricks-gpt-5-5", provider="databricks", mode="chat"),
+            ModelInfo(name="databricks-claude-opus-5", provider="databricks", mode="chat"),
+        ],
+    )
+
+    resolution = resolve_catalog_model("databricks", family="openai")
+
+    assert resolution.model_id == "databricks-gpt-5-5"
+
+
 @pytest.mark.parametrize(
     ("family", "expected_model"),
     [

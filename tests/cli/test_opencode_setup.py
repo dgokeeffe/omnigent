@@ -10,6 +10,8 @@ import pytest
 
 import omnigent.cli as cli
 import omnigent.cli_config as cli_config
+import omnigent.cli_native as cli_native
+import omnigent.onboarding.opencode_auth as opencode_auth
 from omnigent.cli import _load_global_config
 
 
@@ -25,7 +27,7 @@ def _fake_spec() -> SimpleNamespace:
     return SimpleNamespace(binary="opencode")
 
 
-# ── _list_opencode_models ───────────────────────────────────────────────────
+# ── _list_opencode_models (delegates to opencode_auth.list_opencode_models) ──
 
 
 def test_list_models_parses_nonblank_lines(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -33,7 +35,7 @@ def test_list_models_parses_nonblank_lines(monkeypatch: pytest.MonkeyPatch) -> N
         "omnigent.onboarding.harness_install.harness_install_spec", lambda _key: _fake_spec()
     )
     monkeypatch.setattr(
-        cli_config.subprocess,
+        opencode_auth.subprocess,
         "run",
         lambda *a, **k: subprocess.CompletedProcess(
             a, 0, stdout="anthropic/claude-sonnet-4-5\nopenai/gpt-5.5\n\n  \n", stderr=""
@@ -57,7 +59,7 @@ def test_list_models_empty_on_subprocess_error(monkeypatch: pytest.MonkeyPatch) 
     def _boom(*_a: object, **_k: object) -> object:
         raise OSError("no binary")
 
-    monkeypatch.setattr(cli_config.subprocess, "run", _boom)
+    monkeypatch.setattr(opencode_auth.subprocess, "run", _boom)
     assert cli_config._list_opencode_models() == []
 
 
@@ -110,3 +112,45 @@ def test_set_default_model_no_models_short_circuits(monkeypatch: pytest.MonkeyPa
     status = cli_config._set_opencode_default_model(current=None)
     assert status is not None and status.startswith("✗")
     assert called is False  # never prompts when there's nothing to pick
+
+
+# ── launch-path default discovery ───────────────────────────────────────────
+
+
+def test_discovered_default_uses_opencode_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launch fallback picks the flagship tier from OpenCode's own listing."""
+    monkeypatch.setattr(
+        opencode_auth,
+        "list_opencode_models",
+        lambda: [
+            "databricks-anthropic/system.ai.claude-sonnet-4-6",
+            "databricks-anthropic/system.ai.claude-opus-5",
+        ],
+    )
+    monkeypatch.setattr(
+        opencode_auth, "reachable_provider_ids", lambda: frozenset({"databricks-anthropic"})
+    )
+
+    assert cli_native._discovered_opencode_model() == (
+        "databricks-anthropic/system.ai.claude-opus-5"
+    )
+
+
+def test_discovered_default_is_none_when_listing_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing listed → no pin, so OpenCode keeps its own default."""
+    monkeypatch.setattr(opencode_auth, "list_opencode_models", list)
+
+    assert cli_native._discovered_opencode_model() is None
+
+
+def test_discovered_default_swallows_listing_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wedged/absent CLI must never block an ``omni opencode`` launch."""
+
+    def _boom() -> list[str]:
+        raise RuntimeError("opencode exploded")
+
+    monkeypatch.setattr(opencode_auth, "list_opencode_models", _boom)
+
+    assert cli_native._discovered_opencode_model() is None
